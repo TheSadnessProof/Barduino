@@ -9,6 +9,7 @@ mod changes;
 mod chat;
 mod claude;
 mod codex;
+mod commands;
 mod git_diff;
 mod icons;
 mod line_diff;

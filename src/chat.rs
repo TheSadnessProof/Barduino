@@ -4,6 +4,7 @@ use eframe::egui;
 
 use crate::agent::{PermissionMode, Provider};
 use crate::browser::PickedElement;
+use crate::commands::{self, CommandSource, SlashCommand};
 use crate::git_diff::LineKind;
 use crate::line_diff::FileEdit;
 use crate::models::{self, Catalog};
@@ -33,8 +34,71 @@ pub fn composer(
     agent_installed: bool,
 ) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
+    let has_focus = ui.memory(|m| m.has_focus(composer_id));
+
+    // Check if the user is currently typing a slash command (e.g. "/" or "/go" or "/compact").
+    let (in_slash, slash_query) = {
+        let trimmed = session.input.trim_start();
+        if trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace) {
+            (true, trimmed[1..].to_owned())
+        } else {
+            (false, String::new())
+        }
+    };
+
+    if in_slash {
+        if slash_query != session.slash_query {
+            session.slash_query = slash_query.clone();
+            session.slash_dismissed = false;
+            session.slash_selected = 0;
+        }
+    } else {
+        session.slash_query.clear();
+        session.slash_dismissed = false;
+        session.slash_selected = 0;
+    }
+
+    let show_slash = in_slash && !session.slash_dismissed;
+    let slash_commands = if show_slash {
+        commands::discover(session.provider, &session.project_dir)
+    } else {
+        Vec::new()
+    };
+    let slash_matches = if show_slash {
+        commands::filter(&slash_commands, &slash_query)
+    } else {
+        Vec::new()
+    };
+
+    let mut slash_completed = None;
+    if show_slash && has_focus {
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
+            session.slash_selected = (session.slash_selected + 1).min(slash_matches.len().saturating_sub(1));
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
+            session.slash_selected = session.slash_selected.saturating_sub(1);
+        }
+        if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            session.slash_dismissed = true;
+        }
+        let complete_key = ui.input_mut(|i| {
+            i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
+                || (!i.modifiers.shift && !slash_matches.is_empty() && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        });
+        if complete_key && let Some(cmd) = slash_matches.get(session.slash_selected).or_else(|| slash_matches.first()) {
+            slash_completed = Some(cmd.name.clone());
+        }
+    }
+
+    if let Some(name) = slash_completed {
+        session.input = format!("/{name} ");
+        session.slash_selected = 0;
+        session.slash_dismissed = false;
+        session.focus_composer = true;
+    }
+
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
-    let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
+    let enter_pressed = has_focus
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     let can_send = agent_installed && !session.is_running() && session.has_message() && session.has_folder();
     let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
@@ -59,6 +123,10 @@ pub fn composer(
                     session.elements.remove(index);
                 }
                 ui.add_space(4.0);
+            }
+            if show_slash {
+                slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
+                ui.add_space(6.0);
             }
             let response = ui.add(
                 egui::TextEdit::multiline(&mut session.input)
@@ -642,6 +710,149 @@ fn indented(ui: &mut egui::Ui, colour: egui::Color32, contents: impl FnOnce(&mut
     });
 }
 
+/// The autocomplete popover for slash commands (`/`), listing real-time options
+/// offered by the active provider, including built-in commands and discovered skills.
+fn slash_suggestions_ui(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    matches: &[&SlashCommand],
+    query: &str,
+) {
+    let card_bg = ui.visuals().panel_fill;
+    let border_stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let mut chosen = None;
+
+    egui::Frame::new()
+        .fill(card_bg)
+        .stroke(border_stroke)
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} Commands", session.provider.short_name()))
+                        .strong()
+                        .small(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("↑↓ navigate · Tab/Enter complete · Esc dismiss")
+                            .weak()
+                            .small(),
+                    );
+                });
+            });
+            ui.add_space(4.0);
+            ui.separator();
+            ui.add_space(2.0);
+
+            if matches.is_empty() {
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!(
+                        "No commands matching “/{query}” for {}",
+                        session.provider.short_name()
+                    ))
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(4.0);
+                return;
+            }
+
+            egui::ScrollArea::vertical()
+                .id_salt(("slash_scroll", session.id))
+                .max_height(180.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    for (index, cmd) in matches.iter().enumerate() {
+                        let is_selected = index == session.slash_selected;
+                        let item_id = egui::Id::new(("slash_row", session.id, &cmd.name));
+
+                        let row = ui.scope_builder(
+                            egui::UiBuilder::new().id_salt(item_id).sense(egui::Sense::click()),
+                            |ui| {
+                                let response = ui.response();
+                                let hovered = response.hovered();
+                                let visuals = ui.style().interact_selectable(&response, is_selected);
+                                let fill = if is_selected {
+                                    ui.visuals().selection.bg_fill.gamma_multiply(0.22)
+                                } else if hovered {
+                                    visuals.weak_bg_fill
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                };
+
+                                let mut frame = egui::Frame::new()
+                                    .fill(fill)
+                                    .corner_radius(6.0)
+                                    .inner_margin(egui::Margin::symmetric(8, 5));
+                                if is_selected {
+                                    frame = frame.stroke(egui::Stroke::new(1.0, ui.visuals().selection.bg_fill));
+                                }
+
+                                frame.show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal(|ui| {
+                                        let mut name_text = egui::RichText::new(format!("/{}", cmd.name)).strong();
+                                        if is_selected {
+                                            name_text = name_text.color(ui.visuals().selection.stroke.color);
+                                        }
+                                        ui.label(name_text);
+
+                                        let badge_bg = match cmd.source {
+                                            CommandSource::Builtin => {
+                                                ui.visuals().widgets.noninteractive.bg_fill
+                                            }
+                                            CommandSource::Skill => {
+                                                egui::Color32::from_rgb(45, 120, 110).gamma_multiply(0.4)
+                                            }
+                                            CommandSource::Project => {
+                                                egui::Color32::from_rgb(110, 70, 160).gamma_multiply(0.4)
+                                            }
+                                        };
+                                        egui::Frame::new()
+                                            .fill(badge_bg)
+                                            .corner_radius(4.0)
+                                            .inner_margin(egui::Margin::symmetric(5, 1))
+                                            .show(ui, |ui| {
+                                                ui.label(egui::RichText::new(cmd.source.badge()).small());
+                                            });
+
+                                        ui.add_space(4.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&cmd.description).weak().small(),
+                                            )
+                                            .truncate(),
+                                        );
+                                    });
+                                });
+                            },
+                        );
+
+                        if row.response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            if !is_selected {
+                                session.slash_selected = index;
+                            }
+                        }
+                        if row.response.clicked() {
+                            chosen = Some(cmd.name.clone());
+                        }
+                    }
+                });
+        });
+
+    if let Some(name) = chosen {
+        session.input = format!("/{name} ");
+        session.slash_selected = 0;
+        session.slash_dismissed = false;
+        session.focus_composer = true;
+    }
+}
+
 /// A small card for a page element attached to a message, with an × to remove
 /// it when `removable`. Returns true when the × is clicked.
 fn element_chip(ui: &mut egui::Ui, element: &PickedElement, removable: bool) -> bool {
@@ -720,5 +931,19 @@ mod tests {
         assert_eq!(job.sections.len(), 2);
         assert_eq!(job.sections[0].format.color, egui::Color32::from_rgb(220, 60, 60));
         assert_eq!(job.sections[1].format.color, egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn slash_command_trigger_detects_prompt_prefix() {
+        let is_slash = |input: &str| {
+            let trimmed = input.trim_start();
+            trimmed.starts_with('/') && !trimmed.contains(char::is_whitespace)
+        };
+        assert!(is_slash("/"), "bare slash opens suggestions");
+        assert!(is_slash("/goal"), "typing command name keeps suggestions open");
+        assert!(is_slash("/co"), "prefix query keeps suggestions open");
+        assert!(!is_slash("/goal solve this"), "space closes autocomplete for argument typing");
+        assert!(!is_slash("please look at /path/to/file"), "normal prompt with slash does not trigger autocomplete");
+        assert!(!is_slash(""), "empty input does not trigger autocomplete");
     }
 }

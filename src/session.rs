@@ -116,6 +116,13 @@ pub struct Session {
     /// Set once this turn has shown an error, so the CLI's exit doesn't repeat it.
     #[serde(skip)]
     error_shown: bool,
+    /// Ephemeral slash command autocomplete state in the composer.
+    #[serde(skip)]
+    pub slash_selected: usize,
+    #[serde(skip)]
+    pub slash_query: String,
+    #[serde(skip)]
+    pub slash_dismissed: bool,
 }
 
 impl Session {
@@ -139,6 +146,9 @@ impl Session {
             turn: None,
             stop_requested: false,
             error_shown: false,
+            slash_selected: 0,
+            slash_query: String::new(),
+            slash_dismissed: false,
         }
     }
 
