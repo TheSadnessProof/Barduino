@@ -2,8 +2,10 @@
 //! official figures, not anything Barduino works out: Claude Code sends them with
 //! every reply, and Codex writes them into the session file it keeps for each run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui;
@@ -123,11 +125,155 @@ fn codex_window_name(minutes: Option<i64>) -> String {
 /// Why a provider has no figures to show yet.
 pub fn why_missing(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "Claude Code reports its limits with every reply. Send a message and they appear here.",
-        Provider::Codex => {
-            "Codex saves its limits whenever it runs. Send a message with it, or open `codex` in a terminal."
+        Provider::Claude => "Claude Code reports its limits while it answers. Send a message, or press Check now.",
+        Provider::Codex => "Codex saves its limits whenever it runs. Press Check now once you have used it.",
+        Provider::Antigravity => "Press Check now to ask agy for your limits.",
+    }
+}
+
+/// What checking costs, since one provider has to be asked through a reply.
+pub fn check_note(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => {
+            "Sends Claude Code a one-word message, which is the only way it reports limits. \
+             It costs a fraction of a cent."
         }
-        Provider::Antigravity => "Antigravity's agy CLI doesn't report plan limits.",
+        Provider::Codex => "Reads the limits Codex saved the last time it ran. Free.",
+        Provider::Antigravity => "Asks agy for its own usage table. Free.",
+    }
+}
+
+/// Whether asking this provider costs anything. Only Claude Code has to be asked
+/// through a reply; Barduino checks the free ones by itself.
+pub fn is_free(provider: Provider) -> bool {
+    provider != Provider::Claude
+}
+
+/// Asks a provider for its figures now. Claude Code only reports them while it
+/// answers, so it gets a tiny message; the others cost nothing.
+pub fn check(provider: Provider, exe: &Path) -> Result<PlanUsage, String> {
+    match provider {
+        Provider::Claude => check_claude(exe),
+        Provider::Codex => {
+            read_codex().ok_or_else(|| "Codex has not saved any limits on this computer yet.".to_owned())
+        }
+        Provider::Antigravity => check_agy(exe),
+    }
+}
+
+/// Claude Code reports limits as an event while replying, so this asks it the
+/// shortest question it can, using its cheapest model.
+fn check_claude(exe: &Path) -> Result<PlanUsage, String> {
+    let mut child = agent::hidden_command(exe)
+        .args(["-p", "--output-format", "stream-json", "--verbose", "--model", "haiku"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| format!("Couldn't start Claude Code: {err}"))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(b"hi");
+    }
+    let stdout = child.stdout.take().ok_or("Claude Code didn't reply.")?;
+    let child = Arc::new(Mutex::new(child));
+    stop_if_stuck(Arc::clone(&child));
+
+    let mut found = None;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else { continue };
+        if message["type"] == "rate_limit_event" {
+            found = from_claude(&message["rate_limit_info"]);
+        }
+    }
+    let _ = child.lock().unwrap_or_else(PoisonError::into_inner).wait();
+    found.ok_or_else(|| "Claude Code didn't mention any limits this time.".to_owned())
+}
+
+/// agy answers `/usage` by itself, without asking a model.
+fn check_agy(exe: &Path) -> Result<PlanUsage, String> {
+    let output = agent::hidden_command(exe)
+        .args(["--output-format", "text", "--print=/usage"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|err| format!("Couldn't start agy: {err}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    from_agy(&text).ok_or_else(|| match text.lines().find(|line| !line.trim().is_empty()) {
+        Some(line) => format!("agy didn't report usage: {}", line.trim()),
+        None => "agy didn't report any usage. Open `agy` in a terminal to check you're signed in.".to_owned(),
+    })
+}
+
+/// agy's `/usage` table, whose lines look like
+/// "Gemini Models<TAB>Weekly Limit Remaining<TAB>98%<TAB>2026-09-24T13:35:53Z".
+/// The percentage is what's left rather than what's been used.
+fn from_agy(text: &str) -> Option<PlanUsage> {
+    let mut windows = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let [group, limit, remaining, rest @ ..] = &fields[..] else { continue };
+        let Ok(remaining) = remaining.trim_end_matches('%').parse::<f32>() else { continue };
+        let resets_at = rest
+            .first()
+            .and_then(|when| chrono::DateTime::parse_from_rfc3339(when).ok())
+            .map(|when| when.timestamp());
+        windows.push(Window {
+            name: format!("{group} · {}", limit.trim_end_matches(" Remaining")),
+            used: (1.0 - remaining / 100.0).clamp(0.0, 1.0),
+            resets_at,
+        });
+    }
+    (!windows.is_empty()).then(|| PlanUsage { windows, notes: Vec::new(), read_at: now() })
+}
+
+/// Ends a check that never finished, so no CLI is left running in the background.
+fn stop_if_stuck(child: Arc<Mutex<std::process::Child>>) {
+    const GIVE_UP_AFTER: std::time::Duration = std::time::Duration::from_secs(120);
+    std::thread::spawn(move || {
+        std::thread::sleep(GIVE_UP_AFTER);
+        let mut child = child.lock().unwrap_or_else(PoisonError::into_inner);
+        if matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill();
+        }
+    });
+}
+
+/// Checks running in the background, and what they came back with.
+#[derive(Default)]
+pub struct Checks {
+    inner: Arc<Mutex<Inner>>,
+}
+
+#[derive(Default)]
+struct Inner {
+    running: BTreeSet<Provider>,
+    finished: Vec<(Provider, Result<PlanUsage, String>)>,
+}
+
+impl Checks {
+    pub fn is_running(&self, provider: Provider) -> bool {
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner).running.contains(&provider)
+    }
+
+    /// Starts a check unless one is already under way for that provider.
+    pub fn start(&self, provider: Provider, exe: PathBuf, ctx: &egui::Context) {
+        if !self.inner.lock().unwrap_or_else(PoisonError::into_inner).running.insert(provider) {
+            return;
+        }
+        let (inner, ctx) = (Arc::clone(&self.inner), ctx.clone());
+        std::thread::spawn(move || {
+            let result = check(provider, &exe);
+            let mut inner = inner.lock().unwrap_or_else(PoisonError::into_inner);
+            inner.running.remove(&provider);
+            inner.finished.push((provider, result));
+            drop(inner);
+            ctx.request_repaint();
+        });
+    }
+
+    /// The results that have arrived since this was last called.
+    pub fn take_finished(&self) -> Vec<(Provider, Result<PlanUsage, String>)> {
+        std::mem::take(&mut self.inner.lock().unwrap_or_else(PoisonError::into_inner).finished)
     }
 }
 
@@ -325,6 +471,38 @@ mod tests {
         let plan = read_codex().expect("Codex should have saved limits on this computer");
         println!("read in {:?}: {plan:#?}", started.elapsed());
         assert!(!plan.windows.is_empty());
+    }
+
+    #[test]
+    fn reads_the_agy_usage_table() {
+        // Real output from `agy --print=/usage`, where the percentage is what is left.
+        let table = "Gemini Models\tWeekly Limit Remaining\t98%\t2026-09-24T13:35:53Z\n\
+                     Gemini Models\tFive Hour Limit Remaining\t80%\t2026-09-17T18:35:53Z\n\
+                     Claude and GPT models\tWeekly Limit Remaining\t96%\t2026-09-24T14:50:02Z\n";
+        let plan = from_agy(table).expect("the table should describe the plan");
+        assert_eq!(plan.windows.len(), 3);
+        assert_eq!(plan.windows[0].name, "Gemini Models · Weekly Limit");
+        assert!((plan.windows[0].used - 0.02).abs() < 0.001, "{:?}", plan.windows[0]);
+        assert!((plan.windows[1].used - 0.20).abs() < 0.001, "{:?}", plan.windows[1]);
+        assert_eq!(plan.windows[2].resets_at, Some(1_790_261_402), "2026-09-24T14:50:02Z");
+        assert!(from_agy("Signed out. Run `agy login`.").is_none());
+        assert!(from_agy("").is_none());
+    }
+
+    /// Asks the CLIs that answer for free what this account's limits are. Depends
+    /// on them being installed and signed in, so it only runs when asked for:
+    /// `cargo test -- --ignored checks_real --nocapture`
+    #[test]
+    #[ignore]
+    fn checks_real_plan_limits() {
+        for provider in [Provider::Antigravity, Provider::Codex] {
+            let exe = provider.find().expect("the CLI should be installed");
+            let started = std::time::Instant::now();
+            let plan = check(provider, &exe).expect("the CLI should report its limits");
+            println!("{} in {:?}: {plan:#?}", provider.label(), started.elapsed());
+            assert!(!plan.windows.is_empty());
+            assert!(plan.windows.iter().all(|window| (0.0..=1.0).contains(&window.used)), "{plan:?}");
+        }
     }
 
     #[test]

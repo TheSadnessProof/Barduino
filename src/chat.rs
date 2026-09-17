@@ -9,6 +9,9 @@ use crate::icons::{self, Icon};
 use crate::settings::Settings;
 use crate::voice::VoiceError;
 
+/// The colour for full access, which lets the agent run anything.
+const RISKY: egui::Color32 = egui::Color32::from_rgb(214, 158, 46);
+
 pub enum ComposerAction {
     None,
     Send,
@@ -150,15 +153,31 @@ fn provider_picker(ui: &mut egui::Ui, session: &mut Session, settings: &Settings
 }
 
 fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
+    let current = session.permission_mode;
+    let selected = if current.is_risky() {
+        egui::RichText::new(current.label()).color(RISKY)
+    } else {
+        egui::RichText::new(current.label())
+    };
     egui::ComboBox::from_id_salt(("permission_mode", session.id))
-        .selected_text(session.permission_mode.label())
+        .selected_text(selected)
         .show_ui(ui, |ui| {
             for mode in PermissionMode::ALL {
-                ui.selectable_value(&mut session.permission_mode, mode, mode.label());
+                let label = if mode.is_risky() {
+                    egui::RichText::new(mode.label()).color(RISKY)
+                } else {
+                    egui::RichText::new(mode.label())
+                };
+                ui.selectable_value(&mut session.permission_mode, mode, label).on_hover_text(mode.description());
             }
         })
         .response
-        .on_hover_text("What the agent may do without asking. Applies from the next message.");
+        .on_hover_text(format!(
+            "What the agent may do without asking. Applies from the next message.
+
+{}",
+            current.description()
+        ));
 }
 
 pub fn conversation(ui: &mut egui::Ui, session: &Session) {

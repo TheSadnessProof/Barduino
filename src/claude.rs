@@ -33,6 +33,7 @@ pub fn args(turn: &Turn) -> Vec<String> {
         // Headless mode can't ask for approval, so anything that needs it is denied.
         PermissionMode::ReadOnly => "default",
         PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Full => "bypassPermissions",
         PermissionMode::Plan => "plan",
     };
     let mut args: Vec<String> = ["-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"]
@@ -154,6 +155,19 @@ fn tool_result_text(content: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_access_bypasses_permission_prompts() {
+        let turn = Turn {
+            prompt: "run the tests".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::Full,
+        };
+        let args = args(&turn);
+        let mode = args.windows(2).find(|pair| pair[0] == "--permission-mode").map(|pair| pair[1].clone());
+        assert_eq!(mode.as_deref(), Some("bypassPermissions"), "{args:?}");
+    }
 
     #[test]
     fn parses_init() {

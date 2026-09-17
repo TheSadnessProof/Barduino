@@ -34,6 +34,9 @@ pub fn args(turn: &Turn) -> Vec<String> {
     match turn.permission_mode {
         PermissionMode::ReadOnly => {}
         PermissionMode::AcceptEdits => args.extend(["--mode".into(), "accept-edits".into()]),
+        // Without this agy asks for approval before running commands, which print mode
+        // can't answer, so it refuses them instead.
+        PermissionMode::Full => args.push("--dangerously-skip-permissions".into()),
         PermissionMode::Plan => args.extend(["--mode".into(), "plan".into()]),
     }
     if let Some(conversation_id) = &turn.resume_session {
@@ -180,6 +183,24 @@ mod tests {
         let events = events(include_str!("../testdata/agy_denied.jsonl"));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { is_error: true, text } if text.contains("denied"))));
         assert!(matches!(events.last(), Some(AgentEvent::Finished { denied_tools, error: None, .. }) if denied_tools == &["ListDir"]));
+    }
+
+    /// Full access is the only mode where agy may run commands: print mode can't
+    /// answer its approval prompt, so otherwise it refuses them.
+    #[test]
+    fn full_access_skips_approval_prompts() {
+        let args = args(&full_access_turn());
+        assert!(args.contains(&"--dangerously-skip-permissions".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg == "--mode"), "the flag covers everything: {args:?}");
+    }
+
+    fn full_access_turn() -> Turn {
+        Turn {
+            prompt: "run the tests".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::Full,
+        }
     }
 
     #[test]

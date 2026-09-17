@@ -40,6 +40,14 @@ struct SavedState {
     /// Where older versions saved the browser address. Only read, to carry it over.
     #[serde(skip_serializing)]
     browser_address: String,
+    /// True in state saved before the right panel started closed and a fifth wide,
+    /// so those settings reach people who already had the old ones.
+    #[serde(default = "saved_before_panel_defaults")]
+    apply_panel_defaults: bool,
+}
+
+fn saved_before_panel_defaults() -> bool {
+    true
 }
 
 impl Default for SavedState {
@@ -49,12 +57,13 @@ impl Default for SavedState {
             active_session: 0,
             next_session_id: 0,
             show_sessions: true,
-            show_tools: true,
+            show_tools: false,
             settings: Settings::default(),
             usage: UsageLog::default(),
             plan: std::collections::BTreeMap::new(),
             browser: BrowserState::default(),
             browser_address: String::new(),
+            apply_panel_defaults: false,
         }
     }
 }
@@ -70,6 +79,13 @@ pub struct BarduinoApp {
     dictation: Option<(u64, Dictation)>,
     voice_partial: String,
     voice_error: Option<VoiceError>,
+    /// Set until the width egui remembers for the right panel has been forgotten.
+    forget_panel_width: bool,
+    /// Set once this launch has asked the agents that answer for free.
+    checked_free_plans: bool,
+    /// Plan limit checks running in the background, and what they said.
+    plan_checks: plan::Checks,
+    plan_errors: std::collections::BTreeMap<Provider, String>,
     /// Plan limits being read from disk, for CLIs that only write them there.
     plan_from_disk: std::sync::Arc<std::sync::Mutex<Option<std::collections::BTreeMap<Provider, PlanUsage>>>>,
     /// Agent events, tagged with the ID of the session they belong to.
@@ -85,6 +101,11 @@ impl BarduinoApp {
         if state.browser.address.is_empty() {
             state.browser.address = old_address;
         }
+        // Someone who had the panel open keeps it closed from now on, at the new width.
+        let apply_panel_defaults = std::mem::take(&mut state.apply_panel_defaults);
+        if apply_panel_defaults {
+            state.show_tools = false;
+        }
         let tools = Tools::new(state.browser.clone());
         let (events_tx, events_rx) = mpsc::channel();
 
@@ -98,7 +119,11 @@ impl BarduinoApp {
             dictation: None,
             voice_partial: String::new(),
             voice_error: None,
+            checked_free_plans: false,
+            plan_checks: plan::Checks::default(),
+            plan_errors: std::collections::BTreeMap::new(),
             plan_from_disk: plan::read_in_background(&cc.egui_ctx),
+            forget_panel_width: apply_panel_defaults,
             events_tx,
             events_rx,
         };
@@ -229,6 +254,17 @@ impl BarduinoApp {
     }
 
     fn settings_area(&mut self, ui: &mut egui::Ui) {
+        // The agents that answer for free are asked once per launch, so the page
+        // has something to show without the user pressing anything.
+        if !self.checked_free_plans {
+            self.checked_free_plans = true;
+            for provider in Provider::ALL.into_iter().filter(|provider| plan::is_free(*provider)) {
+                if let Some(exe) = self.detected.get(provider).cloned() {
+                    self.plan_checks.start(provider, exe, ui.ctx());
+                }
+            }
+        }
+
         let mut session_counts = std::collections::BTreeMap::new();
         for session in &self.state.sessions {
             *session_counts.entry(session.provider).or_default() += 1;
@@ -237,6 +273,8 @@ impl BarduinoApp {
             detected: &self.detected,
             usage: &self.state.usage,
             plan: &self.state.plan,
+            plan_checks: &self.plan_checks,
+            plan_errors: &self.plan_errors,
             session_counts,
         };
         let (page, settings) = (&mut self.settings_page, &mut self.state.settings);
@@ -245,6 +283,14 @@ impl BarduinoApp {
         match action {
             SettingsAction::None => {}
             SettingsAction::Close => self.view = View::Chat,
+            SettingsAction::CheckPlan(providers) => {
+                for provider in providers {
+                    if let Some(exe) = self.detected.get(provider).cloned() {
+                        self.plan_errors.remove(&provider);
+                        self.plan_checks.start(provider, exe, ui.ctx());
+                    }
+                }
+            }
             SettingsAction::Rescan => {
                 self.detected = Detected::scan(&self.state.settings, ui.ctx());
                 self.plan_from_disk = plan::read_in_background(ui.ctx());
@@ -380,10 +426,12 @@ impl BarduinoApp {
 
     fn right_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let collapsed = egui::Panel::right(egui::Id::new("tools_rail")).resizable(false).exact_size(44.0);
+        // A fifth of the window to start with, which the user can then drag wider.
+        let default_width = (ui.ctx().viewport_rect().width() * 0.2).clamp(240.0, 900.0);
         let expanded = egui::Panel::right(egui::Id::new("tools_panel"))
             .resizable(true)
-            .default_size(560.0)
-            .size_range(300.0..=1600.0);
+            .default_size(default_width)
+            .size_range(240.0..=1600.0);
         let cwd = self.active_session_mut().project_dir.clone();
         let tools = &mut self.tools;
         let (mut collapse, mut expand) = (false, false);
@@ -417,6 +465,21 @@ impl BarduinoApp {
 
 impl eframe::App for BarduinoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if std::mem::take(&mut self.forget_panel_width) {
+            // egui remembers a panel's width, which would otherwise win over the new default.
+            ctx.data_mut(|d| d.remove::<egui::containers::PanelState>(egui::Id::new("tools_panel")));
+        }
+        for (provider, result) in self.plan_checks.take_finished() {
+            match result {
+                Ok(plan) => {
+                    self.state.plan.insert(provider, plan);
+                    self.plan_errors.remove(&provider);
+                }
+                Err(problem) => {
+                    self.plan_errors.insert(provider, problem);
+                }
+            }
+        }
         self.handle_shortcuts(ctx);
         if let Some(found) = self.plan_from_disk.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             self.state.plan.extend(found);
@@ -453,5 +516,22 @@ impl eframe::App for BarduinoApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         self.state.browser = self.tools.browser_state().clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_saved_before_the_panel_defaults_asks_for_them() {
+        let old: SavedState = ron::from_str("(show_tools: true)").expect("old state should load");
+        assert!(old.apply_panel_defaults, "an older save asks for the new panel defaults");
+        assert!(!SavedState::default().apply_panel_defaults, "a new one already has them");
+
+        let saved = ron::to_string(&SavedState::default()).expect("state should save");
+        let again: SavedState = ron::from_str(&saved).expect("saved state should load");
+        assert!(!again.apply_panel_defaults, "the defaults are only applied once");
+        assert!(!again.show_tools, "the right panel starts closed");
     }
 }

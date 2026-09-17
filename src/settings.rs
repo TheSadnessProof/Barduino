@@ -139,6 +139,8 @@ pub enum SettingsAction {
     None,
     Close,
     Rescan,
+    /// Ask these providers for their plan limits now.
+    CheckPlan(Vec<Provider>),
     /// Run the provider's CLI in a terminal tab, e.g. to sign in.
     OpenInTerminal(Provider),
     ChooseExecutable(Provider),
@@ -152,6 +154,9 @@ pub struct PageContext<'a> {
     pub usage: &'a UsageLog,
     /// What each provider last said about its own plan limits.
     pub plan: &'a BTreeMap<Provider, PlanUsage>,
+    pub plan_checks: &'a plan::Checks,
+    /// Why a provider's last check didn't work, if it didn't.
+    pub plan_errors: &'a BTreeMap<Provider, String>,
     pub session_counts: BTreeMap<Provider, usize>,
 }
 
@@ -160,13 +165,35 @@ impl SettingsPage {
         let mut action = SettingsAction::None;
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            ui.set_max_width(PAGE_WIDTH);
+            let page = ui.available_width().min(PAGE_WIDTH);
+            let margin = ((ui.available_width() - page) / 2.0).max(0.0);
+            ui.horizontal(|ui| {
+                ui.add_space(margin);
+                ui.vertical(|ui| {
+                    ui.set_width(page);
+                    self.page(ui, settings, context, &mut action);
+                });
+            });
+        });
+
+        action
+    }
+
+    /// Everything on the page, drawn inside the centred column.
+    fn page(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        context: &PageContext<'_>,
+        action: &mut SettingsAction,
+    ) {
+        {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
                 ui.heading("Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Back to chat").clicked() {
-                        action = SettingsAction::Close;
+                        *action = SettingsAction::Close;
                     }
                 });
             });
@@ -174,7 +201,7 @@ impl SettingsPage {
             ui.add_space(22.0);
             section_heading(ui, "Agents", |ui| {
                 if ui.small_button("Check again").on_hover_text("Look for newly installed or updated CLIs").clicked() {
-                    action = SettingsAction::Rescan;
+                    *action = SettingsAction::Rescan;
                 }
             });
             hint(
@@ -185,17 +212,19 @@ impl SettingsPage {
             ui.add_space(10.0);
             for provider in Provider::ALL {
                 if let Some(clicked) = provider_card(ui, settings, provider, context) {
-                    action = clicked;
+                    *action = clicked;
                 }
                 ui.add_space(10.0);
             }
 
             ui.add_space(14.0);
-            plan_section(ui, settings, context);
+            if let Some(clicked) = plan_section(ui, settings, context) {
+                *action = clicked;
+            }
 
             ui.add_space(14.0);
             if let Some(clicked) = self.usage_section(ui, context.usage) {
-                action = clicked;
+                *action = clicked;
             }
 
             ui.add_space(18.0);
@@ -216,9 +245,7 @@ impl SettingsPage {
                 });
             });
             ui.add_space(24.0);
-        });
-
-        action
+        }
     }
 
     fn usage_section(&mut self, ui: &mut egui::Ui, log: &UsageLog) -> Option<SettingsAction> {
@@ -320,8 +347,21 @@ fn provider_usage(ui: &mut egui::Ui, provider: Provider, total: &Usage, all_toke
 /// What each provider says about its own plan limits. Barduino only passes these
 /// figures on: Claude Code sends them with every reply, and Codex saves them with
 /// each run, so they also cover work done outside Barduino.
-fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_>) {
-    section_heading(ui, "Plan limits", |_ui| {});
+fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_>) -> Option<SettingsAction> {
+    let mut action = None;
+    let agents: Vec<Provider> = Provider::ALL
+        .into_iter()
+        .filter(|provider| settings.is_enabled(*provider) && context.detected.get(*provider).is_some())
+        .collect();
+    section_heading(ui, "Plan limits", |ui| {
+        let busy = agents.iter().any(|provider| context.plan_checks.is_running(*provider));
+        let check_all = ui
+            .add_enabled(!busy && !agents.is_empty(), egui::Button::new("Check all").small())
+            .on_hover_text("Ask every agent for its limits. Only Claude Code charges for this.");
+        if check_all.clicked() {
+            action = Some(SettingsAction::CheckPlan(agents.clone()));
+        }
+    });
     hint(ui, "Straight from each agent, including usage that didn't come from Barduino.");
     ui.add_space(10.0);
 
@@ -335,11 +375,28 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
                 avatar(ui, provider, 24.0, false);
                 ui.label(egui::RichText::new(provider.label()).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(plan) = reported {
-                        ui.label(egui::RichText::new(plan::read_at_text(plan.read_at)).small().weak());
+                    if context.plan_checks.is_running(provider) {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Checking…").small().weak());
+                    } else {
+                        let installed = context.detected.get(provider).is_some();
+                        let check = ui
+                            .add_enabled(installed, egui::Button::new("Check now").small())
+                            .on_hover_text(plan::check_note(provider))
+                            .on_disabled_hover_text("This agent isn't installed.");
+                        if check.clicked() {
+                            action = Some(SettingsAction::CheckPlan(vec![provider]));
+                        }
+                        if let Some(plan) = reported {
+                            ui.label(egui::RichText::new(plan::read_at_text(plan.read_at)).small().weak());
+                        }
                     }
                 });
             });
+            if let Some(problem) = context.plan_errors.get(&provider) {
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(problem).small().color(WARN));
+            }
             match reported {
                 Some(plan) => {
                     ui.add_space(8.0);
@@ -364,6 +421,7 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
         });
         ui.add_space(8.0);
     }
+    action
 }
 
 /// One limit window: what it is, how full it is, and when it starts over.

@@ -32,10 +32,12 @@ pub fn find_executable() -> Option<PathBuf> {
 /// Arguments for one headless turn. The prompt itself is sent on stdin.
 pub fn args(turn: &Turn) -> Vec<String> {
     let sandbox = match turn.permission_mode {
-        PermissionMode::ReadOnly => "read-only",
-        PermissionMode::AcceptEdits => "workspace-write",
+        PermissionMode::ReadOnly => Some("read-only"),
+        PermissionMode::AcceptEdits => Some("workspace-write"),
         // Codex has no plan mode. Keeping it read-only means a plan can't quietly change files.
-        PermissionMode::Plan => "read-only",
+        PermissionMode::Plan => Some("read-only"),
+        // Full access has its own flag, which also stops Codex asking for approval.
+        PermissionMode::Full => None,
     };
 
     let mut args: Vec<String> = vec!["exec".into()];
@@ -48,7 +50,10 @@ pub fn args(turn: &Turn) -> Vec<String> {
     // the config override that both forms accept: an unquoted value that isn't valid TOML, such
     // as "read-only", is used as a literal string. Resume reads its working root from the
     // process's own folder, which start_turn already points at turn.cwd.
-    args.extend(["-c".to_owned(), format!("sandbox_mode={sandbox}")]);
+    match sandbox {
+        Some(sandbox) => args.extend(["-c".to_owned(), format!("sandbox_mode={sandbox}")]),
+        None => args.push("--dangerously-bypass-approvals-and-sandbox".to_owned()),
+    }
     if turn.resume_session.is_none() {
         args.extend(["-C".to_owned(), turn.cwd.display().to_string()]);
     }
@@ -293,6 +298,19 @@ mod tests {
                 "-",
             ]
         );
+    }
+
+    #[test]
+    fn full_access_turns_off_the_sandbox_and_approvals() {
+        let turn = Turn {
+            prompt: "run the tests".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::Full,
+        };
+        let args = args(&turn);
+        assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()), "{args:?}");
+        assert!(!args.iter().any(|arg| arg.starts_with("sandbox_mode=")), "one or the other, not both: {args:?}");
     }
 
     #[test]

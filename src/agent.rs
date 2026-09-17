@@ -104,18 +104,36 @@ pub enum AgentEvent {
 pub enum PermissionMode {
     ReadOnly,
     AcceptEdits,
+    /// Everything the agent asks for is allowed, including running commands.
+    Full,
     Plan,
 }
 
 impl PermissionMode {
-    pub const ALL: [PermissionMode; 3] = [Self::ReadOnly, Self::AcceptEdits, Self::Plan];
+    /// In the order they appear in the picker, from least to most it may do.
+    pub const ALL: [PermissionMode; 4] = [Self::Plan, Self::ReadOnly, Self::AcceptEdits, Self::Full];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::ReadOnly => "Read only",
             Self::AcceptEdits => "Can edit files",
+            Self::Full => "Full access",
             Self::Plan => "Plan only",
         }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "The agent can read the project but not change it or run commands.",
+            Self::AcceptEdits => "The agent can edit files. Running commands still needs approval,                                   which a headless agent can't be asked for, so it gets refused.",
+            Self::Full => "The agent may edit files and run any command without asking. Use it only in                            folders you trust.",
+            Self::Plan => "The agent works out a plan and doesn't change anything.",
+        }
+    }
+
+    /// True for the mode that gives up the safety net, so the UI can say so.
+    pub fn is_risky(self) -> bool {
+        self == Self::Full
     }
 }
 
@@ -481,6 +499,41 @@ mod tests {
             let _ = Command::new("taskkill").args(["/F", "/PID", pid]).output();
         }
         assert!(left.is_empty(), "still running after Stop: {left:?}");
+    }
+
+    /// Checks that full access really lets a CLI run a command, which is what the
+    /// other modes refuse in headless mode. It spends tokens, so it only runs when
+    /// asked for: `cargo test -- --ignored full_access --nocapture`
+    #[test]
+    #[ignore]
+    fn full_access_really_runs_commands() {
+        for provider in [Provider::Antigravity, Provider::Codex] {
+            let Some(exe) = provider.find() else {
+                panic!("{} should be installed", provider.label());
+            };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let turn = Turn {
+                prompt: "Run the shell command `echo barduino-full-access` and reply with its output only.".into(),
+                cwd: std::env::temp_dir(),
+                resume_session: None,
+                permission_mode: PermissionMode::Full,
+            };
+            let _running = start_turn(provider, &exe, turn, move |event| {
+                let _ = tx.send(event);
+            })
+            .expect("the CLI should start");
+            let events: Vec<AgentEvent> = rx.iter().collect();
+            println!("=== {} ===
+{events:#?}", provider.label());
+
+            let denied: Vec<&AgentEvent> = events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::Finished { denied_tools, .. } if !denied_tools.is_empty()))
+                .collect();
+            assert!(denied.is_empty(), "{} refused something: {denied:?}", provider.label());
+            let ran = events.iter().any(|event| matches!(event, AgentEvent::ToolUse { .. }));
+            assert!(ran, "{} should have run the command", provider.label());
+        }
     }
 
     #[test]
