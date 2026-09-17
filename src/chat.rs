@@ -1,4 +1,4 @@
-//! The middle column: session header, conversation and message box.
+//! The middle column: a slim top bar, the conversation and the message box.
 
 use eframe::egui;
 
@@ -6,108 +6,118 @@ use crate::agent::{PermissionMode, Provider};
 use crate::session::{Entry, Session};
 use crate::settings::Settings;
 
-pub enum HeaderAction {
-    None,
-    ChangeFolder,
-}
-
 pub enum ComposerAction {
     None,
     Send,
     Stop,
+    ChangeFolder,
 }
 
-pub fn header(
-    ui: &mut egui::Ui,
-    session: &mut Session,
-    settings: &Settings,
-    show_sessions: &mut bool,
-    show_tools: &mut bool,
-) -> HeaderAction {
-    let mut action = HeaderAction::None;
-    ui.add_space(6.0);
+pub fn top_bar(ui: &mut egui::Ui, session: &Session, show_sessions: &mut bool, show_tools: &mut bool) {
+    ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.toggle_value(show_sessions, "Sessions").on_hover_text("Show or hide the session list");
-        ui.separator();
-        ui.label("Project:");
-        ui.add(egui::Label::new(egui::RichText::new(session.project_dir.display().to_string()).monospace()).truncate());
-        if ui.add_enabled(!session.is_running(), egui::Button::new("Change…")).clicked() {
-            action = HeaderAction::ChangeFolder;
-        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.toggle_value(show_tools, "Tools").on_hover_text("Show or hide the terminal and browser");
+            if let Some(model) = &session.model {
+                ui.label(egui::RichText::new(model).small().weak());
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(&session.title).strong()).truncate());
+            });
         });
     });
-    ui.horizontal(|ui| {
-        ui.label("Agent:");
-        let can_change = session.can_change_provider();
-        ui.add_enabled_ui(can_change, |ui| {
-            egui::ComboBox::from_id_salt(("provider", session.id))
-                .selected_text(session.provider.label())
-                .show_ui(ui, |ui| {
-                    let mut choices: Vec<Provider> = settings.enabled_providers().collect();
-                    if !choices.contains(&session.provider) {
-                        choices.push(session.provider);
-                    }
-                    for provider in choices {
-                        ui.selectable_value(&mut session.provider, provider, provider.label());
-                    }
-                });
-        })
-        .response
-        .on_disabled_hover_text("A conversation stays with one agent. Start a new session to use another.");
-        ui.separator();
-        ui.label("Permissions:");
-        egui::ComboBox::from_id_salt("permission_mode")
-            .selected_text(session.permission_mode.label())
-            .show_ui(ui, |ui| {
-                for mode in PermissionMode::ALL {
-                    ui.selectable_value(&mut session.permission_mode, mode, mode.label());
-                }
-            });
-        if let Some(model) = &session.model {
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(egui::RichText::new(model).weak());
-            });
-        }
-    });
-    ui.add_space(6.0);
-    action
+    ui.add_space(4.0);
 }
 
-pub fn composer(ui: &mut egui::Ui, session: &mut Session, agent_installed: bool) -> ComposerAction {
+/// The message box, with the agent, permission and folder pickers along its bottom edge.
+pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, agent_installed: bool) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
     let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     let can_send = agent_installed && !session.is_running() && !session.input.trim().is_empty();
-
-    ui.add_space(6.0);
-    let response = ui.add(
-        egui::TextEdit::multiline(&mut session.input)
-            .id(composer_id)
-            .desired_rows(3)
-            .desired_width(f32::INFINITY)
-            .hint_text(format!("Ask {}…  (Enter to send, Shift+Enter for a new line)", session.provider.short_name())),
-    );
-    if std::mem::take(&mut session.focus_composer) {
-        response.request_focus();
-    }
-
     let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
-    ui.horizontal(|ui| {
-        if session.is_running() {
-            ui.spinner();
-            ui.label(format!("{} is working…", session.provider.short_name()));
-            if ui.button("Stop").clicked() {
-                action = ComposerAction::Stop;
+
+    ui.add_space(8.0);
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            let response = ui.add(
+                egui::TextEdit::multiline(&mut session.input)
+                    .id(composer_id)
+                    .frame(egui::Frame::NONE)
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY)
+                    .hint_text(format!(
+                        "Ask {}…  (Enter to send, Shift+Enter for a new line)",
+                        session.provider.short_name()
+                    )),
+            );
+            if std::mem::take(&mut session.focus_composer) {
+                response.request_focus();
             }
-        } else if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
-            action = ComposerAction::Send;
-        }
-    });
-    ui.add_space(6.0);
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                provider_picker(ui, session, settings);
+                permission_picker(ui, session);
+                let folder = ui
+                    .add_enabled(!session.is_running(), egui::Button::new(format!("📁 {}", session.folder_name())).small())
+                    .on_hover_text(format!("{}\nClick to choose another folder", session.project_dir.display()));
+                if folder.clicked() {
+                    action = ComposerAction::ChangeFolder;
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if session.is_running() {
+                        if ui.button("Stop").clicked() {
+                            action = ComposerAction::Stop;
+                        }
+                        ui.label(egui::RichText::new(format!("{} is working…", session.provider.short_name())).weak());
+                        ui.spinner();
+                    } else if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
+                        action = ComposerAction::Send;
+                    }
+                });
+            });
+        });
+    ui.add_space(8.0);
     action
+}
+
+fn provider_picker(ui: &mut egui::Ui, session: &mut Session, settings: &Settings) {
+    ui.add_enabled_ui(session.can_change_provider(), |ui| {
+        egui::ComboBox::from_id_salt(("provider", session.id))
+            .selected_text(session.provider.label())
+            .show_ui(ui, |ui| {
+                let mut choices: Vec<Provider> = settings.enabled_providers().collect();
+                if !choices.contains(&session.provider) {
+                    choices.push(session.provider);
+                }
+                for provider in choices {
+                    ui.selectable_value(&mut session.provider, provider, provider.label());
+                }
+            });
+    })
+    .response
+    .on_hover_text("Which agent answers in this session")
+    .on_disabled_hover_text("A conversation stays with one agent. Start a new session to use another.");
+}
+
+fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
+    egui::ComboBox::from_id_salt(("permission_mode", session.id))
+        .selected_text(session.permission_mode.label())
+        .show_ui(ui, |ui| {
+            for mode in PermissionMode::ALL {
+                ui.selectable_value(&mut session.permission_mode, mode, mode.label());
+            }
+        })
+        .response
+        .on_hover_text("What the agent may do without asking. Applies from the next message.");
 }
 
 pub fn conversation(ui: &mut egui::Ui, session: &Session) {
@@ -121,8 +131,9 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session) {
                 ui.vertical_centered(|ui| {
                     ui.label(
                         egui::RichText::new(format!(
-                            "Pick a project folder and ask {} something.",
-                            session.provider.short_name()
+                            "Ask {} something about {}.",
+                            session.provider.short_name(),
+                            session.folder_name()
                         ))
                         .weak(),
                     );

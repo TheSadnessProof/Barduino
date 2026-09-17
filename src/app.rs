@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, PermissionMode, Provider};
 use crate::browser::Browser;
-use crate::chat::{self, ComposerAction, HeaderAction};
+use crate::chat::{self, ComposerAction};
 use crate::session::{Entry, Session};
 use crate::settings::{self, Detected, Settings, SettingsAction};
 use crate::terminal;
@@ -257,14 +257,17 @@ impl BarduinoApp {
         let session = &mut self.state.sessions[index];
         let settings = &self.state.settings;
 
-        let header_action = egui::Panel::top(egui::Id::new("chat_header"))
-            .show(ui, |ui| chat::header(ui, session, settings, show_sessions, show_tools))
-            .inner;
-        // Checked after the header, which is where the provider can change.
-        let installed = self.detected.get(session.provider).is_some();
+        egui::Panel::top(egui::Id::new("chat_top_bar"))
+            .show(ui, |ui| chat::top_bar(ui, session, show_sessions, show_tools));
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
-            .show(ui, |ui| chat::composer(ui, session, installed))
+            .show_separator_line(false)
+            .show(ui, |ui| {
+                let installed = self.detected.get(session.provider).is_some();
+                chat::composer(ui, session, settings, installed)
+            })
             .inner;
+        // Checked after the composer, which is where the provider can change.
+        let installed = self.detected.get(session.provider).is_some();
         let mut open_settings = false;
         egui::CentralPanel::default().show(ui, |ui| {
             if !installed {
@@ -282,10 +285,8 @@ impl BarduinoApp {
         match composer_action {
             ComposerAction::Send => self.send(ui.ctx()),
             ComposerAction::Stop => self.active_session_mut().stop(),
+            ComposerAction::ChangeFolder => self.change_folder(),
             ComposerAction::None => {}
-        }
-        if let HeaderAction::ChangeFolder = header_action {
-            self.change_folder();
         }
         if open_settings {
             self.view = View::Settings;

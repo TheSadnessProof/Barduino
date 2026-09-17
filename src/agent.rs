@@ -216,11 +216,10 @@ pub fn start_turn(
 
         let status = wait(&waiter);
         let stderr = stderr_reader.join().unwrap_or_default();
-        let name = provider.label();
         let error = match status {
             Ok(status) if status.success() => None,
-            Ok(status) => Some(format!("{name} exited with {status}. {}", last_lines(&stderr, 6))),
-            Err(err) => Some(format!("Lost track of {name}: {err}")),
+            Ok(status) => Some(exit_error(provider, status.code(), &stderr)),
+            Err(err) => Some(format!("Lost track of {}: {err}", provider.label())),
         };
         on_event(AgentEvent::Exited { error });
     });
@@ -239,10 +238,49 @@ fn wait(child: &Mutex<Child>) -> std::io::Result<ExitStatus> {
     }
 }
 
-/// The end of a CLI's error output, which is usually where the useful part is.
-fn last_lines(text: &str, count: usize) -> String {
-    let lines: Vec<&str> = text.trim().lines().collect();
-    lines[lines.len().saturating_sub(count)..].join("\n")
+/// Turns a failed CLI run into a message the user can act on.
+fn exit_error(provider: Provider, code: Option<i32>, stderr: &str) -> String {
+    // Gemini CLI exits with 41 when it can't authenticate.
+    const GEMINI_AUTH_FAILED: i32 = 41;
+
+    let details = error_summary(stderr);
+    if provider == Provider::Gemini && code == Some(GEMINI_AUTH_FAILED) {
+        return format!(
+            "Gemini CLI isn't signed in. Open Settings, click \"Run `gemini` in the terminal\" and choose \
+             \"Sign in with Google\". Gemini said: {details}"
+        );
+    }
+    match code {
+        Some(code) => format!("{} exited with code {code}. {details}", provider.label()),
+        None => format!("{} stopped unexpectedly. {details}", provider.label()),
+    }
+}
+
+/// The useful part of a CLI's error output: the last message lines, without
+/// stack traces or terminal color codes.
+fn error_summary(stderr: &str) -> String {
+    let mut plain = String::new();
+    let mut chars = stderr.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip an escape sequence such as "\x1b[31m".
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+
+    let lines: Vec<&str> = plain
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("at ") && !line.starts_with("exitCode"))
+        .filter(|line| !matches!(*line, "{" | "}"))
+        .collect();
+    lines[lines.len().saturating_sub(2)..].join(" ")
 }
 
 /// Looks for the first of `names` in the folders on PATH.
@@ -323,9 +361,16 @@ mod tests {
     }
 
     #[test]
-    fn last_lines_keeps_the_end() {
-        assert_eq!(last_lines("a\nb\nc\n", 2), "b\nc");
-        assert_eq!(last_lines("only", 5), "only");
-        assert_eq!(last_lines("", 3), "");
+    fn gemini_sign_in_failures_explain_the_fix() {
+        let error = exit_error(Provider::Gemini, Some(41), "Invalid auth method selected.\n");
+        assert!(error.starts_with("Gemini CLI isn't signed in."), "{error}");
+        assert!(error.ends_with("Gemini said: Invalid auth method selected."), "{error}");
+    }
+
+    #[test]
+    fn error_summary_drops_stack_traces_and_colors() {
+        let stderr = "Error authenticating: boom\n    at initOauthClient (file:///x.js:1:2)\n  exitCode: 41\n}\n\x1b[31mManual authorization is required.\x1b[0m\n";
+        assert_eq!(error_summary(stderr), "Error authenticating: boom Manual authorization is required.");
+        assert_eq!(exit_error(Provider::Claude, Some(1), ""), "Claude Code exited with code 1. ");
     }
 }
