@@ -457,6 +457,7 @@ dependencies = [
  "eframe",
  "portable-pty",
  "rfd",
+ "ron",
  "serde",
  "serde_json",
  "vt100",

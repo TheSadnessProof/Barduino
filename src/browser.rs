@@ -47,7 +47,7 @@ impl Default for BrowserState {
 }
 
 /// An element the user picked on the page.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PickedElement {
     pub url: String,
     pub selector: String,
@@ -59,7 +59,18 @@ pub struct PickedElement {
 }
 
 impl PickedElement {
-    /// How the element is described when it's added to a message for the agent.
+    /// A short name for the element, like `button.primary`.
+    pub fn short_label(&self) -> String {
+        shorten(&self.tag, 32)
+    }
+
+    /// The start of the element's text, if it has any.
+    pub fn short_text(&self) -> Option<String> {
+        let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!text.is_empty()).then(|| shorten(&text, 28))
+    }
+
+    /// How the element is described to the agent when the message is sent.
     pub fn as_prompt(&self) -> String {
         let mut prompt = format!(
             "Element on {} ({} × {} px)\nSelector: `{}`\n```html\n{}\n```",
@@ -82,14 +93,13 @@ enum PageMessage {
 
 pub enum BrowserAction {
     None,
-    /// Add this text to the message box.
-    AddToMessage(String),
+    /// Attach this element to the message being written.
+    Attach(PickedElement),
 }
 
 pub struct Browser {
     pub state: BrowserState,
     picking: bool,
-    picked: Option<PickedElement>,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
 }
@@ -99,7 +109,6 @@ impl Browser {
         Self {
             state,
             picking: false,
-            picked: None,
             #[cfg(any(windows, target_os = "macos"))]
             native: None,
         }
@@ -108,7 +117,6 @@ impl Browser {
     /// Closes the page. It opens again the next time the browser tab is shown.
     pub fn close(&mut self) {
         self.picking = false;
-        self.picked = None;
         #[cfg(any(windows, target_os = "macos"))]
         {
             self.native = None;
@@ -143,7 +151,7 @@ impl Browser {
                     // Only accept a pick the user started, not one a page sends on its own.
                     native::Message::Page(PageMessage::Picked(element)) if self.picking => {
                         self.picking = false;
-                        self.picked = Some(element);
+                        result = BrowserAction::Attach(element);
                     }
                     native::Message::Page(PageMessage::Cancelled) => self.picking = false,
                     native::Message::Page(PageMessage::Picked(_)) => {}
@@ -206,17 +214,6 @@ impl Browser {
             });
         });
 
-        if let Some(element) = self.picked.clone() {
-            match picked_card(ui, &element) {
-                CardAction::None => {}
-                CardAction::Add => {
-                    result = BrowserAction::AddToMessage(element.as_prompt());
-                    self.picked = None;
-                }
-                CardAction::Dismiss => self.picked = None,
-            }
-        }
-
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
         let (page, zoom) = page_rect(area, self.state.viewport, self.state.custom_size);
@@ -277,37 +274,14 @@ impl Browser {
     }
 }
 
-enum CardAction {
-    None,
-    Add,
-    Dismiss,
-}
-
-fn picked_card(ui: &mut egui::Ui, element: &PickedElement) -> CardAction {
-    let mut action = CardAction::None;
-    egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(&element.tag).monospace().strong());
-            ui.label(egui::RichText::new(format!("{} × {}", element.width, element.height)).small().weak());
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::Close, "Dismiss").clicked() {
-                    action = CardAction::Dismiss;
-                }
-                if ui.button("Copy selector").clicked() {
-                    ui.ctx().copy_text(element.selector.clone());
-                }
-                if ui.button("Add to message").on_hover_text("Adds the selector and HTML to your message").clicked() {
-                    action = CardAction::Add;
-                }
-            });
-        });
-        ui.add(egui::Label::new(egui::RichText::new(&element.selector).monospace().small()).truncate());
-        if !element.text.is_empty() {
-            ui.add(egui::Label::new(egui::RichText::new(format!("“{}”", element.text)).small().weak()).truncate());
-        }
-    });
-    action
+/// Cuts `text` to at most `max` characters, ending with "…" if anything was cut.
+fn shorten(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut short: String = text.chars().take(max - 1).collect();
+    short.push('…');
+    short
 }
 
 /// The page size in CSS pixels, or the area's own size for Desktop.
@@ -526,6 +500,8 @@ mod tests {
         };
         assert_eq!(element.selector, "main > button.primary");
         assert!(element.as_prompt().contains("Selector: `main > button.primary`"));
+        assert_eq!(element.short_label(), "button.primary");
+        assert_eq!(element.short_text().as_deref(), Some("Sign in"));
         assert_eq!(serde_json::from_str::<PageMessage>(r#"{"kind":"cancelled"}"#).unwrap(), PageMessage::Cancelled);
         assert!(serde_json::from_str::<PageMessage>(r#"{"kind":"steal-cookies"}"#).is_err());
     }

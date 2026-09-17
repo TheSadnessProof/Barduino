@@ -3,6 +3,7 @@
 use eframe::egui;
 
 use crate::agent::{PermissionMode, Provider};
+use crate::browser::PickedElement;
 use crate::session::{Entry, Session};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
@@ -37,7 +38,7 @@ pub fn composer(
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
     let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-    let can_send = agent_installed && !session.is_running() && !session.input.trim().is_empty();
+    let can_send = agent_installed && !session.is_running() && session.has_message();
     let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
 
     ui.add_space(8.0);
@@ -47,6 +48,20 @@ pub fn composer(
         .corner_radius(10.0)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
+            if !session.elements.is_empty() {
+                let mut remove = None;
+                ui.horizontal_wrapped(|ui| {
+                    for (index, element) in session.elements.iter().enumerate() {
+                        if element_chip(ui, element, true) {
+                            remove = Some(index);
+                        }
+                    }
+                });
+                if let Some(index) = remove {
+                    session.elements.remove(index);
+                }
+                ui.add_space(4.0);
+            }
             let response = ui.add(
                 egui::TextEdit::multiline(&mut session.input)
                     .id(composer_id)
@@ -177,14 +192,23 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session) {
 
 fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
     match entry {
-        Entry::User(text) => {
+        Entry::User(message) => {
             ui.add_space(10.0);
             egui::Frame::group(ui.style())
                 .fill(ui.visuals().faint_bg_color)
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(egui::RichText::new("You").strong());
-                    ui.label(text);
+                    if !message.text.is_empty() {
+                        ui.label(&message.text);
+                    }
+                    if !message.elements.is_empty() {
+                        ui.horizontal_wrapped(|ui| {
+                            for element in &message.elements {
+                                element_chip(ui, element, false);
+                            }
+                        });
+                    }
                 });
             ui.add_space(4.0);
         }
@@ -209,4 +233,42 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
             ui.colored_label(ui.visuals().error_fg_color, text);
         }
     }
+}
+
+/// A small card for a page element attached to a message, with an × to remove
+/// it when `removable`. Returns true when the × is clicked.
+fn element_chip(ui: &mut egui::Ui, element: &PickedElement, removable: bool) -> bool {
+    let mut removed = false;
+    let chip = egui::Frame::new()
+        .fill(ui.visuals().faint_bg_color)
+        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(6, 3))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                let (icon, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+                icons::paint(ui.painter(), icon, Icon::Pick, ui.visuals().weak_text_color());
+                ui.label(egui::RichText::new(element.short_label()).monospace().small());
+                if let Some(text) = element.short_text() {
+                    ui.label(egui::RichText::new(text).small().weak());
+                }
+                if removable {
+                    let (rect, close) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    let color = if close.hovered() {
+                        ui.visuals().strong_text_color()
+                    } else {
+                        ui.visuals().weak_text_color()
+                    };
+                    icons::paint(ui.painter(), rect.shrink(2.0), Icon::Close, color);
+                    removed = close.on_hover_text("Remove").clicked();
+                }
+            });
+        });
+    chip.response.on_hover_text(format!(
+        "{}
+{} × {} px on {}",
+        element.selector, element.width, element.height, element.url
+    ));
+    removed
 }

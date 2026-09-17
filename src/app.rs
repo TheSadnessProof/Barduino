@@ -367,12 +367,9 @@ impl BarduinoApp {
             self.tools.hide_browser();
         }
 
-        if let ToolsAction::AddToMessage(text) = action {
+        if let ToolsAction::Attach(element) = action {
             let session = self.active_session_mut();
-            if !session.input.trim().is_empty() {
-                session.input.push_str("\n\n");
-            }
-            session.input.push_str(&text);
+            session.attach(element);
             session.focus_composer = true;
             self.view = View::Chat;
         }

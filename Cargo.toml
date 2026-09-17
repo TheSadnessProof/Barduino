@@ -19,3 +19,7 @@ wry = "0.57.0"
 # Voice input (speech recognition) and stopping everything an agent started (job objects).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Foundation", "Foundation_Collections", "Globalization", "Media_SpeechRecognition", "Win32_Security", "Win32_System_JobObjects", "Win32_System_WinRT"] }
+
+[dev-dependencies]
+# The same format eframe saves app state in, to check old saves still load.
+ron = "0.12.2"

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
+use crate::browser::PickedElement;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
@@ -10,7 +11,7 @@ const UNTITLED: &str = "New session";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Entry {
-    User(String),
+    User(UserMessage),
     /// A reply from the agent. Sessions saved when only Claude was supported call it `Claude`.
     #[serde(alias = "Claude")]
     Agent(String),
@@ -18,6 +19,49 @@ pub enum Entry {
     ToolOutput { text: String, is_error: bool },
     Notice(String),
     Error(String),
+}
+
+/// What the user sent: their text and any page elements attached to it.
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(from = "SavedUserMessage")]
+pub struct UserMessage {
+    pub text: String,
+    pub elements: Vec<PickedElement>,
+}
+
+/// Messages saved before attachments existed are plain text.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SavedUserMessage {
+    Text(String),
+    Full {
+        text: String,
+        #[serde(default)]
+        elements: Vec<PickedElement>,
+    },
+}
+
+impl From<SavedUserMessage> for UserMessage {
+    fn from(saved: SavedUserMessage) -> Self {
+        match saved {
+            SavedUserMessage::Text(text) => Self { text, elements: Vec::new() },
+            SavedUserMessage::Full { text, elements } => Self { text, elements },
+        }
+    }
+}
+
+impl UserMessage {
+    /// The full prompt for the agent, with each attached element described after the text.
+    pub fn prompt(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.text.is_empty() {
+            parts.push(self.text.clone());
+        }
+        parts.extend(self.elements.iter().map(PickedElement::as_prompt));
+        parts.join("
+
+")
+    }
 }
 
 /// One conversation with an agent, tied to a project folder.
@@ -37,6 +81,9 @@ pub struct Session {
     pub entries: Vec<Entry>,
     /// Unsent text in the message box.
     pub input: String,
+    /// Page elements attached to the unsent message.
+    #[serde(default)]
+    pub elements: Vec<PickedElement>,
 
     /// Text the agent is still streaming, shown below the finished entries.
     #[serde(skip)]
@@ -64,6 +111,7 @@ impl Session {
             model: None,
             entries: Vec::new(),
             input: String::new(),
+            elements: Vec::new(),
             streaming: String::new(),
             focus_composer: true,
             turn: None,
@@ -81,6 +129,19 @@ impl Session {
         self.entries.is_empty() && !self.is_running()
     }
 
+    /// Whether there's anything to send.
+    pub fn has_message(&self) -> bool {
+        !self.input.trim().is_empty() || !self.elements.is_empty()
+    }
+
+    /// Attaches a page element to the unsent message. Picking the same element again does nothing.
+    pub fn attach(&mut self, element: PickedElement) {
+        let already = self.elements.iter().any(|e| e.url == element.url && e.selector == element.selector);
+        if !already {
+            self.elements.push(element);
+        }
+    }
+
     /// The folder's name, for showing in the session list.
     pub fn folder_name(&self) -> String {
         self.project_dir
@@ -92,13 +153,13 @@ impl Session {
     /// Sends the message box contents to the agent. `on_event` is called from a
     /// background thread for everything that happens during the turn.
     pub fn send(&mut self, exe: &Path, on_event: impl Fn(AgentEvent) + Send + 'static) {
-        let prompt = self.input.trim().to_owned();
-        if prompt.is_empty() || self.is_running() {
+        if !self.has_message() || self.is_running() {
             return;
         }
+        let message = UserMessage { text: self.input.trim().to_owned(), elements: self.elements.clone() };
 
         let turn = Turn {
-            prompt: prompt.clone(),
+            prompt: message.prompt(),
             cwd: self.project_dir.clone(),
             resume_session: self.agent_session_id.clone(),
             permission_mode: self.permission_mode,
@@ -106,10 +167,14 @@ impl Session {
         match agent::start_turn(self.provider, exe, turn, on_event) {
             Ok(running) => {
                 if self.title == UNTITLED {
-                    self.title = title_from(&prompt);
+                    self.title = match message.elements.first() {
+                        Some(element) if message.text.is_empty() => title_from(&element.short_label()),
+                        _ => title_from(&message.text),
+                    };
                 }
-                self.entries.push(Entry::User(prompt));
+                self.entries.push(Entry::User(message));
                 self.input.clear();
+                self.elements.clear();
                 self.turn = Some(running);
                 self.error_shown = false;
             }
@@ -305,11 +370,50 @@ mod tests {
         assert!(!text.contains("cut off"));
     }
 
+    fn element(selector: &str) -> PickedElement {
+        PickedElement {
+            url: "http://localhost:3000/".into(),
+            selector: selector.into(),
+            tag: "button.primary".into(),
+            text: "Sign in".into(),
+            html: "<button class=\"primary\">Sign in</button>".into(),
+            width: 120,
+            height: 36,
+        }
+    }
+
+    #[test]
+    fn attached_elements_are_described_after_the_text() {
+        let mut s = session(Provider::Claude);
+        s.attach(element("main > button"));
+        s.attach(element("main > button"));
+        assert_eq!(s.elements.len(), 1, "the same element is only attached once");
+        assert!(s.has_message(), "an element alone can be sent");
+
+        let message = UserMessage { text: "Make this blue".into(), elements: s.elements.clone() };
+        let prompt = message.prompt();
+        assert!(prompt.starts_with("Make this blue
+
+Element on http://localhost:3000/"));
+        assert!(prompt.contains("Selector: `main > button`"));
+    }
+
+    #[test]
+    fn saved_text_messages_still_load() {
+        // App state is saved as RON.
+        let old: Vec<Entry> = ron::from_str(r#"[User("hi"), Agent("hello")]"#).unwrap();
+        assert_eq!(old[0], Entry::User(UserMessage { text: "hi".into(), elements: Vec::new() }));
+
+        let new = Entry::User(UserMessage { text: "hi".into(), elements: vec![element("main > button")] });
+        let saved = ron::to_string(&new).unwrap();
+        assert_eq!(ron::from_str::<Entry>(&saved).unwrap(), new);
+    }
+
     #[test]
     fn provider_can_only_change_before_the_conversation_starts() {
         let mut s = session(Provider::Claude);
         assert!(s.can_change_provider());
-        s.entries.push(Entry::User("hi".into()));
+        s.entries.push(Entry::User(UserMessage { text: "hi".into(), elements: Vec::new() }));
         assert!(!s.can_change_provider());
     }
 }

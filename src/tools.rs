@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
-use crate::browser::{Browser, BrowserAction, BrowserState};
+use crate::browser::{Browser, BrowserAction, BrowserState, PickedElement};
 use crate::changes::{Changes, Source};
 use crate::icons::{self, Icon};
 use crate::terminal::{self, Terminal};
@@ -25,8 +25,8 @@ enum Tab {
 
 pub enum ToolsAction {
     None,
-    /// Add this text to the active session's message box.
-    AddToMessage(String),
+    /// Attach this page element to the active session's message.
+    Attach(PickedElement),
 }
 
 pub struct Tools {
@@ -204,8 +204,8 @@ impl Tools {
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.
                 let page_visible = !egui::Popup::is_any_open(ui.ctx());
-                if let BrowserAction::AddToMessage(text) = self.browser.ui(ui, frame, page_visible) {
-                    action = ToolsAction::AddToMessage(text);
+                if let BrowserAction::Attach(element) = self.browser.ui(ui, frame, page_visible) {
+                    action = ToolsAction::Attach(element);
                 }
             }
         }
