@@ -188,10 +188,14 @@ mod tests {
     #[test]
     fn the_last_provider_cannot_be_switched_off() {
         let mut settings = Settings::default();
-        settings.set_enabled(Provider::Claude, false);
-        assert!(!settings.is_enabled(Provider::Claude));
-        settings.set_enabled(Provider::Gemini, false);
-        assert!(settings.is_enabled(Provider::Gemini));
+        let (last, others) = Provider::ALL.split_last().unwrap();
+        for provider in others {
+            settings.set_enabled(*provider, false);
+            assert!(!settings.is_enabled(*provider));
+        }
+        settings.set_enabled(*last, false);
+        assert!(settings.is_enabled(*last));
+        assert_eq!(settings.default_provider, *last);
     }
 
     #[test]

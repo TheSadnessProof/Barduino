@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{claude, gemini};
+use crate::{antigravity, claude, gemini};
 
 /// An agent CLI that can act as the brain of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -20,15 +20,17 @@ pub enum Provider {
     #[default]
     Claude,
     Gemini,
+    Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Self::Claude, Self::Gemini];
+    pub const ALL: [Provider; 3] = [Self::Claude, Self::Gemini, Self::Antigravity];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
             Self::Gemini => "Gemini CLI",
+            Self::Antigravity => "Antigravity (agy)",
         }
     }
 
@@ -37,6 +39,7 @@ impl Provider {
         match self {
             Self::Claude => "Claude",
             Self::Gemini => "Gemini",
+            Self::Antigravity => "Antigravity",
         }
     }
 
@@ -45,6 +48,7 @@ impl Provider {
         match self {
             Self::Claude => "claude",
             Self::Gemini => "gemini",
+            Self::Antigravity => "agy",
         }
     }
 
@@ -52,6 +56,7 @@ impl Provider {
         match self {
             Self::Claude => "Install it from https://claude.com/claude-code",
             Self::Gemini => "Install it with: npm install -g @google/gemini-cli",
+            Self::Antigravity => "Install Google Antigravity, which includes the agy command",
         }
     }
 
@@ -60,6 +65,7 @@ impl Provider {
         match self {
             Self::Claude => claude::find_launcher(),
             Self::Gemini => gemini::find_launcher(),
+            Self::Antigravity => antigravity::find_launcher(),
         }
     }
 }
@@ -173,6 +179,10 @@ pub fn start_turn(
             cmd.args(gemini::args(&turn));
             gemini::parse_line
         }
+        Provider::Antigravity => {
+            cmd.args(antigravity::args(&turn));
+            antigravity::parse_line
+        }
     };
     cmd.current_dir(&turn.cwd)
         .stdin(Stdio::piped())
@@ -192,8 +202,8 @@ pub fn start_turn(
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let child = Arc::new(Mutex::new(child));
 
-    // The prompt goes through stdin, which avoids command-line quoting and length limits.
-    // Dropping stdin afterwards tells the CLI the prompt is complete.
+    // Claude and Gemini read the prompt from stdin, which avoids command-line quoting and
+    // length limits. Dropping stdin afterwards tells the CLI the prompt is complete.
     let prompt = turn.prompt;
     thread::spawn(move || {
         let _ = stdin.write_all(prompt.as_bytes());
@@ -358,6 +368,55 @@ mod tests {
         assert!(matches!(events.first(), Some(AgentEvent::Started { .. })), "{events:?}");
         assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })), "{events:?}");
         println!("{events:#?}");
+    }
+
+    fn run_turn(provider: Provider, turn: Turn) -> Vec<AgentEvent> {
+        let launcher = provider.find().expect("the CLI should be installed");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _running = start_turn(provider, &launcher, turn, move |event| {
+            let _ = tx.send(event);
+        })
+        .expect("the CLI should start");
+        rx.iter().take_while(|e| !matches!(e, AgentEvent::Exited { .. })).collect()
+    }
+
+    /// Runs the installed agy twice, the second time continuing the first
+    /// conversation. It uses the Antigravity account, so it only runs when asked for:
+    /// `cargo test -- --ignored antigravity --nocapture`
+    #[test]
+    #[ignore]
+    fn runs_the_real_antigravity_cli() {
+        let dir = std::env::temp_dir().join("barduino-agy-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("note.txt"), "the secret word is pineapple\n").unwrap();
+
+        let first = run_turn(
+            Provider::Antigravity,
+            Turn {
+                prompt: "Read note.txt and reply with only the secret word.".into(),
+                cwd: dir.clone(),
+                resume_session: None,
+                permission_mode: PermissionMode::ReadOnly,
+            },
+        );
+        println!("{first:#?}");
+        let Some(AgentEvent::Finished { session_id: Some(conversation), error: None, .. }) = first.last() else {
+            panic!("the first turn should finish cleanly");
+        };
+
+        let second = run_turn(
+            Provider::Antigravity,
+            Turn {
+                prompt: "What word did you just reply with? Answer in upper case, nothing else.".into(),
+                cwd: dir,
+                resume_session: Some(conversation.clone()),
+                permission_mode: PermissionMode::ReadOnly,
+            },
+        );
+        println!("{second:#?}");
+        let reply: String =
+            second.iter().filter_map(|e| if let AgentEvent::TextDelta(t) = e { Some(t.as_str()) } else { None }).collect();
+        assert!(reply.contains("PINEAPPLE"), "the second turn should remember the first: {reply:?}");
     }
 
     #[test]

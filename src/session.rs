@@ -136,7 +136,10 @@ impl Session {
         match event {
             AgentEvent::Started { session_id, model } => {
                 self.agent_session_id = Some(session_id);
-                self.model = Some(model);
+                // Not every CLI reports its model.
+                if !model.is_empty() {
+                    self.model = Some(model);
+                }
             }
             AgentEvent::TextDelta(text) => self.streaming.push_str(&text),
             AgentEvent::Text(text) => {
@@ -178,7 +181,7 @@ impl Session {
                 }
                 if !denied_tools.is_empty() {
                     self.entries.push(Entry::Notice(format!(
-                        "{} wasn't allowed to use: {}. Change \"Permissions\" at the top to allow more.",
+                        "{} wasn't allowed to use: {}. Change the permissions under the message box to allow more.",
                         self.provider.short_name(),
                         denied_tools.join(", ")
                     )));
