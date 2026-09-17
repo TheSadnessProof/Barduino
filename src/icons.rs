@@ -26,6 +26,25 @@ pub fn button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> egui::Response {
     toggle(ui, icon, tooltip, false)
 }
 
+/// A compact icon button, ideal for tab strips and inline close buttons.
+pub fn small_button(ui: &mut egui::Ui, icon: Icon, tooltip: &str) -> egui::Response {
+    button_sized(ui, icon, 18.0, 3.5, tooltip)
+}
+
+/// A button with a specific size and padding.
+pub fn button_sized(ui: &mut egui::Ui, icon: Icon, size: f32, padding: f32, tooltip: &str) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    if ui.is_rect_visible(rect) {
+        let visuals = ui.style().interact_selectable(&response, false);
+        if response.hovered() || response.has_focus() {
+            ui.painter().rect_filled(rect, 4.0, visuals.weak_bg_fill);
+        }
+        let color = if response.hovered() { visuals.fg_stroke.color } else { visuals.text_color() };
+        paint(ui.painter(), rect.shrink(padding), icon, color);
+    }
+    response.on_hover_text(tooltip)
+}
+
 /// Like [`button`], but drawn as pressed when `selected` is true.
 pub fn toggle(ui: &mut egui::Ui, icon: Icon, tooltip: &str, selected: bool) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
@@ -63,9 +82,10 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             }
         }
         Icon::Close => {
-            let d = r * 0.75;
-            painter.line_segment([c - vec2(d, d), c + vec2(d, d)], stroke);
-            painter.line_segment([c + vec2(-d, d), c + vec2(d, -d)], stroke);
+            let close_stroke = if r < 6.0 { Stroke::new(1.2, color) } else { stroke };
+            let d = r * 0.72;
+            painter.line_segment([c - vec2(d, d), c + vec2(d, d)], close_stroke);
+            painter.line_segment([c + vec2(-d, d), c + vec2(d, -d)], close_stroke);
         }
         Icon::Pick => {
             painter.circle_stroke(c, r * 0.6, stroke);

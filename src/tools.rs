@@ -173,18 +173,68 @@ impl Tools {
                     }
                     Tab::Browser => ("Browser".to_owned(), "Built-in browser".to_owned()),
                 };
-                ui.spacing_mut().item_spacing.x = 0.0;
-                if ui.selectable_label(index == self.active, title).on_hover_text(hover).clicked() {
+
+                let is_active = index == self.active;
+                let mut tab_closed = false;
+                let tab_resp = ui
+                    .scope_builder(
+                        egui::UiBuilder::new().id_salt(("tool_tab", index)).sense(egui::Sense::click()),
+                        |ui| {
+                            let response = ui.response();
+                            let hovered = response.hovered() || ui.rect_contains_pointer(ui.max_rect());
+                            let visuals = ui.style().interact_selectable(&response, is_active);
+                            let fill = if is_active {
+                                visuals.weak_bg_fill
+                            } else if hovered {
+                                ui.visuals().faint_bg_color
+                            } else {
+                                egui::Color32::TRANSPARENT
+                            };
+                            let stroke = if is_active {
+                                visuals.bg_stroke
+                            } else {
+                                egui::Stroke::NONE
+                            };
+
+                            egui::Frame::new()
+                                .fill(fill)
+                                .stroke(stroke)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::symmetric(8, 4))
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(title)
+                                                    .color(if is_active {
+                                                        visuals.fg_stroke.color
+                                                    } else {
+                                                        visuals.text_color()
+                                                    })
+                                                    .small(),
+                                            )
+                                            .selectable(false),
+                                        );
+                                        if icons::small_button(ui, Icon::Close, "Close tab").clicked() {
+                                            tab_closed = true;
+                                        }
+                                    });
+                                });
+                        },
+                    )
+                    .response;
+
+                if tab_closed || tab_resp.middle_clicked() {
+                    close = Some(index);
+                } else if tab_resp.clicked() {
                     self.active = index;
                 }
-                if icons::button(ui, Icon::Close, "Close tab").clicked() {
-                    close = Some(index);
-                }
-                ui.spacing_mut().item_spacing.x = 8.0;
+                tab_resp.on_hover_text(hover);
             }
             self.add_menu(ui, cwd);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::SidebarRight, "Hide panel").clicked() {
+                if icons::button(ui, Icon::Close, "Close panel").clicked() {
                     *collapse = true;
                 }
             });
@@ -192,6 +242,9 @@ impl Tools {
         ui.separator();
         if let Some(index) = close {
             self.close(index);
+            if self.tabs.is_empty() {
+                *collapse = true;
+            }
         }
 
         let browser_shown = matches!(self.tabs.get(self.active), Some(Tab::Browser));
@@ -225,5 +278,25 @@ impl Tools {
             }
         }
         action
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_starts_empty() {
+        let tools = Tools::new(BrowserState::default());
+        assert!(tools.tabs.is_empty());
+    }
+
+    #[test]
+    fn closing_tab_removes_it() {
+        let mut tools = Tools::new(BrowserState::default());
+        tools.open_terminal(Path::new("."), None);
+        assert_eq!(tools.tabs.len(), 1);
+        tools.close(0);
+        assert!(tools.tabs.is_empty());
     }
 }

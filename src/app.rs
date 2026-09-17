@@ -106,6 +106,8 @@ impl BarduinoApp {
         if apply_panel_defaults {
             state.show_tools = false;
         }
+        // The right tools panel starts closed by default on launch.
+        state.show_tools = false;
         let tools = Tools::new(state.browser.clone());
         let (events_tx, events_rx) = mpsc::channel();
 
@@ -417,6 +419,9 @@ impl BarduinoApp {
         self.state.show_tools = (show || expand) && !collapse;
         if !self.state.show_tools {
             self.tools.hide_browser();
+        }
+        if collapse || expand {
+            ui.ctx().request_repaint();
         }
 
         if let ToolsAction::Attach(elements) = action {
