@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{AgentEvent, PermissionMode, Provider};
 use crate::browser::{Browser, BrowserState};
 use crate::chat::{self, ComposerAction};
+use crate::commands::SlashAction;
 use crate::icons::{self, Icon};
 use crate::models::Catalog;
 use crate::plan::{self, PlanUsage};
@@ -57,7 +58,8 @@ fn keep_unreadable_save(raw: String) -> Option<String> {
     let backup = eframe::storage_dir("Barduino")?.join("app.ron.bak");
     std::fs::write(&backup, raw).ok()?;
     Some(format!(
-        "Your saved sessions couldn't be read, so Barduino has started empty. The old file was kept at {} —          keep hold of it if you want them back.",
+        "Your saved sessions couldn't be read, so Barduino has started empty. The old file was kept at {} — \
+         keep hold of it if you want them back.",
         backup.display()
     ))
 }
@@ -425,6 +427,7 @@ impl BarduinoApp {
 
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
             .show_separator_line(false)
+            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
             .show(ui, |ui| chat::composer(ui, session, models, installed))
             .inner;
         // Checked again after the composer, which is where the provider can change.
@@ -459,10 +462,45 @@ impl BarduinoApp {
         match composer_action {
             ComposerAction::Send => self.send(ui.ctx()),
             ComposerAction::Stop => self.active_session_mut().stop(),
+            ComposerAction::ChangeFolder => self.change_folder(),
+            ComposerAction::Apply(setting) => self.apply_setting(setting),
+            ComposerAction::Notice(message) => self.notice = Some(message),
             ComposerAction::None => {}
         }
         if open_settings {
             self.view = View::Settings;
+        }
+    }
+
+    /// Carries out a slash command that belongs to Barduino rather than to the CLI.
+    /// The CLIs do these from their own interactive session; a headless run has no
+    /// such session, so `/model opus` would otherwise just be words in a prompt.
+    fn apply_setting(&mut self, setting: SlashAction) {
+        let session = self.active_session_mut();
+        match setting {
+            SlashAction::Model(model) => {
+                session.chosen_model = model;
+                // An effort level the new model doesn't offer is dropped by the
+                // picker on the next frame, the same as when the model is changed there.
+            }
+            SlashAction::Effort(effort) => session.effort = effort,
+            SlashAction::Permission(mode) => session.permission_mode = mode,
+            SlashAction::Clear => {
+                let (dir, permission_mode) = (session.project_dir.clone(), session.permission_mode);
+                self.new_session(dir, permission_mode);
+            }
+            SlashAction::OpenSettings => self.view = View::Settings,
+            SlashAction::OpenTerminal(command) => {
+                let provider = session.provider;
+                let cwd = self.tool_cwd();
+                self.active_tools().open_terminal(&cwd, Some(format!("{}\r", provider.command())));
+                self.state.show_tools = true;
+                self.notice = Some(format!(
+                    "“/{command}” is one only {} itself can run, so it has been started in a terminal on the \
+                     right. Type “/{command}” there.",
+                    provider.label()
+                ));
+            }
         }
     }
 
@@ -603,6 +641,9 @@ impl eframe::App for BarduinoApp {
                 }
                 if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
                     self.state.usage.record(session.provider, *usage);
+                    // Kept per session as well as in the daily totals, because its
+                    // input side is what the composer shows as the context so far.
+                    session.last_usage = Some(*usage);
                 }
                 // The agent may have edited files, so any diff of its folder is out of date.
                 if let AgentEvent::Exited { .. } = &event {

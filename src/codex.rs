@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::{self, AgentEvent, PermissionMode, Turn, string, tool_detail};
+use crate::tool_call;
 use crate::usage::Usage;
 
 /// Finds `codex` on PATH or where the Codex installer puts it.
@@ -159,6 +160,11 @@ fn completed_item(item: &Value) -> Vec<AgentEvent> {
 fn item_detail(item: &Value) -> String {
     match item["type"].as_str().unwrap_or_default() {
         "file_change" => one_line(&changes(item).join(", ")),
+        // Codex reports the whole line it spawned, which on Windows is mostly the
+        // absolute path to PowerShell. What it was asked to run is the point.
+        "command_execution" => one_line(tool_call::bare_command(&string(&item["command"]))),
+        // Codex's plan, when it reports one, reads as a checklist rather than JSON.
+        "todo_list" => agent::checklist(&item["items"]).unwrap_or_else(|| tool_detail(item)),
         // Codex's built-in node_repl server titles each call; other servers just get their input.
         "mcp_tool_call" => match item["arguments"]["title"].as_str() {
             Some(title) => one_line(title),
@@ -268,6 +274,17 @@ mod tests {
             if name == "Edit" && detail == "update C:\\Users\\ditob\\Documents\\barduino-codex-probe\\notes.txt")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, is_error: false }
             if text.ends_with("notes.txt"))));
+
+        // The same recording runs a command, and Codex reports the whole line it
+        // spawned. Nearly all of that line is the absolute path to PowerShell, which
+        // used to be what the transcript showed instead of the command.
+        let Some(AgentEvent::ToolUse { detail, .. }) =
+            events.iter().find(|e| matches!(e, AgentEvent::ToolUse { name, .. } if name == "Shell"))
+        else {
+            panic!("the recording runs a command: {events:?}")
+        };
+        assert_eq!(detail, "Get-Content -LiteralPath notes.txt");
+
         assert!(matches!(events.last(), Some(AgentEvent::Finished { usage: Some(usage), error: None, .. })
             if usage.input > 0 && usage.output > 0));
     }

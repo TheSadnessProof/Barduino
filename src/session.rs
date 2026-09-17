@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
 use crate::browser::{BrowserState, PickedElement};
 use crate::line_diff::FileEdit;
+use crate::usage::Usage;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
@@ -94,6 +95,11 @@ pub struct Session {
     /// How hard the model should work, in the provider's own words, e.g. "high".
     #[serde(default)]
     pub effort: Option<String>,
+    /// What the last finished turn cost. The input side of it is how much context
+    /// this conversation is carrying, which is the only place that number exists —
+    /// no CLI reports the context separately.
+    #[serde(default)]
+    pub last_usage: Option<Usage>,
     /// The CLI's own session ID, used to continue the conversation.
     #[serde(alias = "claude_session_id")]
     pub agent_session_id: Option<String>,
@@ -146,6 +152,7 @@ impl Session {
             permission_mode,
             chosen_model: None,
             effort: None,
+            last_usage: None,
             agent_session_id: None,
             model: None,
             entries: Vec::new(),

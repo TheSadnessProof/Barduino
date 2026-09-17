@@ -1,19 +1,30 @@
 //! The middle column: the conversation and the message box.
 
+use std::path::Path;
+
 use eframe::egui;
 
-use crate::agent::Provider;
+use crate::agent::{PermissionMode, Provider};
 use crate::browser::PickedElement;
-use crate::commands::{self, CommandSource, SlashCommand};
+use crate::commands::{self, CommandSource, Handling, SlashAction, SlashCommand};
 use crate::git_diff::LineKind;
 use crate::line_diff::FileEdit;
-use crate::models::Catalog;
+use crate::models::{self, Catalog};
 use crate::session::{Entry, Session};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
+use crate::tool_call::{self, ToolKind};
+use crate::usage;
 
 /// The colour for full access, which lets the agent run anything.
 const RISKY: egui::Color32 = egui::Color32::from_rgb(214, 158, 46);
+/// How tall the message box may grow before it scrolls instead, in rows. Beyond
+/// this a long message would start pushing the conversation off the screen.
+const MAX_COMPOSER_ROWS: f32 = 12.0;
+/// How long a label on one of the chips under the message box may be.
+const MAX_CHIP_CHARS: usize = 18;
+/// How long a path in a tool's row may be before the front of it is cut away.
+const MAX_DETAIL_CHARS: usize = 60;
 /// Diff colours, kept close to what the Changes tab uses.
 const ADDED: egui::Color32 = egui::Color32::from_rgb(106, 176, 118);
 const REMOVED: egui::Color32 = egui::Color32::from_rgb(214, 108, 108);
@@ -22,6 +33,12 @@ pub enum ComposerAction {
     None,
     Send,
     Stop,
+    ChangeFolder,
+    /// A slash command Barduino carries out itself instead of sending, because a
+    /// headless CLI has no interactive session for it to change.
+    Apply(SlashAction),
+    /// Why a slash command couldn't be applied, in words for the banner.
+    Notice(String),
 }
 
 /// Actions returned from the conversation area (e.g. empty session controls).
@@ -39,7 +56,7 @@ const CLAUDE_CORAL: egui::Color32 = egui::Color32::from_rgb(217, 119, 87);
 pub fn composer(
     ui: &mut egui::Ui,
     session: &mut Session,
-    _catalog: &Catalog,
+    catalog: &Catalog,
     agent_installed: bool,
 ) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
@@ -110,99 +127,339 @@ pub fn composer(
     let enter_pressed = has_focus
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
     let can_send = agent_installed && !session.is_running() && session.has_message() && session.has_folder();
-    let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
+    let mut action =
+        if enter_pressed && can_send { send_or_apply(session, catalog) } else { ComposerAction::None };
 
-    let border_stroke = if has_focus {
-        egui::Stroke::new(1.5, CLAUDE_CORAL.gamma_multiply(0.85))
+    // Warm, sophisticated palette inspired by Claude's signature desktop and web interface.
+    let (card_bg, border_stroke, hint_color) = if ui.visuals().dark_mode {
+        let border = if has_focus {
+            CLAUDE_CORAL.gamma_multiply(0.85)
+        } else {
+            egui::Color32::from_rgb(58, 56, 52)
+        };
+        (
+            egui::Color32::from_rgb(36, 35, 33),
+            egui::Stroke::new(if has_focus { 1.5 } else { 1.0 }, border),
+            egui::Color32::from_rgb(148, 142, 134),
+        )
     } else {
-        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+        let border = if has_focus {
+            CLAUDE_CORAL
+        } else {
+            egui::Color32::from_rgb(222, 218, 212)
+        };
+        (
+            egui::Color32::WHITE,
+            egui::Stroke::new(if has_focus { 1.5 } else { 1.0 }, border),
+            egui::Color32::from_rgb(150, 145, 138),
+        )
     };
 
+    let available_w = ui.available_width();
+    let max_w = 820.0_f32.min((available_w - 32.0).max(280.0));
+
     ui.add_space(8.0);
-    egui::Frame::new()
-        .fill(ui.visuals().extreme_bg_color)
-        .stroke(border_stroke)
-        .corner_radius(12.0)
-        .inner_margin(egui::Margin::symmetric(14, 10))
-        .show(ui, |ui| {
-            if !session.elements.is_empty() {
-                let mut remove = None;
-                ui.horizontal_wrapped(|ui| {
-                    for (index, element) in session.elements.iter().enumerate() {
-                        if element_chip(ui, element, true) {
-                            remove = Some(index);
+    ui.vertical_centered(|ui| {
+        ui.set_max_width(max_w);
+        egui::Frame::new()
+            .fill(card_bg)
+            .stroke(border_stroke)
+            .corner_radius(16.0)
+            .inner_margin(egui::Margin { left: 16, right: 12, top: 12, bottom: 10 })
+            .show(ui, |ui| {
+                if !session.elements.is_empty() {
+                    let mut remove = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (index, element) in session.elements.iter().enumerate() {
+                            if element_chip(ui, element, true) {
+                                remove = Some(index);
+                            }
                         }
+                    });
+                    if let Some(index) = remove {
+                        session.elements.remove(index);
                     }
-                });
-                if let Some(index) = remove {
-                    session.elements.remove(index);
+                    ui.add_space(4.0);
                 }
-                ui.add_space(4.0);
-            }
-            if show_slash {
-                slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
+                if show_slash {
+                    slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
+                    ui.add_space(6.0);
+                }
+                let hint = format!("Message {}…   ·   / for commands", session.provider.short_name());
+                // The box grows with what is typed and then scrolls, rather than
+                // pushing the conversation off the top of the screen.
+                let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                let response = egui::ScrollArea::vertical()
+                    .id_salt(("composer_scroll", session.id))
+                    .max_height(row_height * MAX_COMPOSER_ROWS)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut session.input)
+                                .id(composer_id)
+                                .frame(egui::Frame::NONE)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .hint_text(egui::RichText::new(hint).color(hint_color)),
+                        )
+                    })
+                    .inner;
+                // Only when nothing else holds the keyboard. A turn finishing sets this,
+                // and it used to pull the cursor out of a terminal mid-command.
+                if std::mem::take(&mut session.focus_composer) && ui.memory(|m| m.focused().is_none()) {
+                    response.request_focus();
+                }
+
                 ui.add_space(6.0);
-            }
-            let hint = format!("Message {}…", session.provider.short_name());
-            let response = ui.add(
-                egui::TextEdit::multiline(&mut session.input)
-                    .id(composer_id)
-                    .frame(egui::Frame::NONE)
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY)
-                    .hint_text(hint),
-            );
-            // Only when nothing else holds the keyboard. A turn finishing sets this,
-            // and it used to pull the cursor out of a terminal mid-command.
-            if std::mem::take(&mut session.focus_composer) && ui.memory(|m| m.focused().is_none()) {
-                response.request_focus();
-            }
+                ui.horizontal(|ui| {
+                    // Send and the context take their width from the right first, so
+                    // a long model name crowds the chips rather than the controls.
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let running = session.is_running();
+                        if running {
+                            let stop_btn = egui::Button::new(
+                                egui::RichText::new("■").size(13.0).color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(205, 65, 65))
+                            .corner_radius(16.0)
+                            .min_size(egui::vec2(32.0, 32.0));
 
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let running = session.is_running();
-                    if running {
-                        let stop_btn = egui::Button::new(
-                            egui::RichText::new("Stop").strong().small().color(egui::Color32::WHITE),
-                        )
-                        .fill(egui::Color32::from_rgb(205, 65, 65))
-                        .corner_radius(8.0)
-                        .min_size(egui::vec2(60.0, 28.0));
-
-                        if ui.add(stop_btn).clicked() {
-                            action = ComposerAction::Stop;
-                        }
-                        ui.label(egui::RichText::new(format!("{} is working…", session.provider.short_name())).weak().small());
-                        ui.spinner();
-                    } else {
-                        let send_fill = if can_send {
-                            CLAUDE_CORAL
+                            if ui.add(stop_btn).on_hover_text("Stop generating").clicked() {
+                                action = ComposerAction::Stop;
+                            }
+                            ui.add_space(4.0);
+                            ui.label(egui::RichText::new(format!("{} is working…", session.provider.short_name())).weak().small());
+                            ui.spinner();
                         } else {
-                            ui.visuals().widgets.inactive.bg_fill
-                        };
-                        let send_text_color = if can_send {
-                            egui::Color32::WHITE
-                        } else {
-                            ui.visuals().widgets.inactive.text_color()
-                        };
+                            let (send_bg, send_fg) = if can_send {
+                                (CLAUDE_CORAL, egui::Color32::WHITE)
+                            } else if ui.visuals().dark_mode {
+                                (egui::Color32::from_rgb(48, 46, 43), egui::Color32::from_rgb(110, 105, 98))
+                            } else {
+                                (egui::Color32::from_rgb(230, 226, 220), egui::Color32::from_rgb(160, 155, 148))
+                            };
 
-                        let send_btn = egui::Button::new(
-                            egui::RichText::new("Send  ↑").strong().small().color(send_text_color),
-                        )
-                        .fill(send_fill)
-                        .corner_radius(8.0)
-                        .min_size(egui::vec2(68.0, 28.0));
+                            let send_btn = egui::Button::new(
+                                egui::RichText::new("↑").size(17.0).strong().color(send_fg),
+                            )
+                            .fill(send_bg)
+                            .corner_radius(16.0)
+                            .min_size(egui::vec2(32.0, 32.0));
 
-                        if ui.add_enabled(can_send, send_btn).clicked() {
-                            action = ComposerAction::Send;
+                            let tooltip = if !agent_installed {
+                                format!("{} is not installed on this machine", session.provider.label())
+                            } else if !session.has_folder() {
+                                "Choose a workspace folder above to start".to_owned()
+                            } else if !session.has_message() {
+                                "Type a message or command to send".to_owned()
+                            } else {
+                                "Send message (Enter, Shift+Enter for newline)".to_owned()
+                            };
+
+                            if ui.add_enabled(can_send, send_btn).on_hover_text(tooltip).clicked() {
+                                action = send_or_apply(session, catalog);
+                            }
+                            ui.add_space(4.0);
+                            context_chip(ui, session);
                         }
-                    }
+
+                        // Whatever is left over, filled from the left as usual.
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            if settings_row(ui, session, catalog) {
+                                action = ComposerAction::ChangeFolder;
+                            }
+                        });
+                    });
                 });
             });
-        });
-    ui.add_space(8.0);
+    });
+    ui.add_space(12.0);
     action
+}
+
+/// What pressing send does with what is in the box. A command Barduino owns is
+/// carried out here and never reaches the CLI; anything else is a prompt.
+fn send_or_apply(session: &mut Session, catalog: &Catalog) -> ComposerAction {
+    let models = catalog.models(session.provider);
+    let efforts = catalog.efforts(session.provider, session.chosen_model.as_deref());
+    match commands::intercept(&session.input, &models, &efforts) {
+        Some(Ok(setting)) => {
+            session.input.clear();
+            ComposerAction::Apply(setting)
+        }
+        // The words stay in the box, so a near miss can be corrected rather than retyped.
+        Some(Err(message)) => ComposerAction::Notice(message),
+        None => ComposerAction::Send,
+    }
+}
+
+/// The row under the message box: what the next turn will run as, and how much of
+/// the conversation the model is already carrying. Returns true if the folder chip
+/// was clicked.
+fn settings_row(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) -> bool {
+    // Scoped, because the restyling below would otherwise reach the send button
+    // drawn after it in the same row.
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        // Quiet chips rather than form controls, so the row stays out of the way
+        // until it is wanted. Only the fill changes, so nothing moves on hover.
+        let quiet = if ui.visuals().dark_mode {
+            egui::Color32::from_rgb(46, 44, 41)
+        } else {
+            egui::Color32::from_rgb(243, 240, 235)
+        };
+        ui.visuals_mut().widgets.inactive.weak_bg_fill = quiet;
+        ui.visuals_mut().widgets.inactive.bg_fill = quiet;
+
+        model_picker(ui, session, catalog);
+        effort_picker(ui, session, catalog);
+        permission_picker(ui, session);
+        folder_chip(ui, session)
+    })
+    .inner
+}
+
+/// A picker label short enough that four of them still fit on one row. Model names
+/// come from the CLI and can be long — "gemini-3-pro-preview-high" — and an
+/// unbounded one would push the send button off the card on a narrow window.
+fn short_label(label: &str, max: usize) -> String {
+    if label.chars().count() <= max {
+        return label.to_owned();
+    }
+    // Cut on a char boundary, not a byte one: these names are not all ASCII.
+    label.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
+}
+
+/// Which model answers in this session. The list comes from the CLI itself, so it
+/// may still be loading the first time it's opened.
+fn model_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
+    let provider = session.provider;
+    let selected = match &session.chosen_model {
+        Some(id) => short_label(&catalog.label_for(provider, id), MAX_CHIP_CHARS),
+        None => "Default model".to_owned(),
+    };
+    // "Default" doesn't say which, so the one the CLI actually answered with goes
+    // in the tooltip rather than being guessed at in the label.
+    let answering = match &session.model {
+        Some(model) if session.chosen_model.is_none() => format!("\n\nThe CLI last answered with {model}."),
+        _ => String::new(),
+    };
+    egui::ComboBox::from_id_salt(("model", session.id))
+        .selected_text(egui::RichText::new(selected).small())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut session.chosen_model, None, "Default model")
+                .on_hover_text("Whichever model the CLI is set to use");
+            let models = catalog.models(provider);
+            if models.is_empty() {
+                ui.horizontal(|ui| {
+                    if catalog.is_loading(provider) {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Reading the model list…").small().weak());
+                    } else {
+                        ui.label(egui::RichText::new("No other models reported.").small().weak());
+                    }
+                });
+            }
+            for model in models {
+                ui.selectable_value(&mut session.chosen_model, Some(model.id.clone()), &model.label)
+                    .on_hover_text(&model.id);
+            }
+        })
+        .response
+        .on_hover_text(format!("Which model this session uses. Applies from the next message.{answering}"));
+}
+
+/// How hard the model should work. The levels are the provider's own.
+fn effort_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
+    let levels = catalog.efforts(session.provider, session.chosen_model.as_deref());
+    // A level the provider no longer offers would otherwise be stuck in the session.
+    if let Some(effort) = &session.effort
+        && !levels.iter().any(|level| level == effort)
+    {
+        session.effort = None;
+    }
+    let selected = match &session.effort {
+        Some(effort) => models::effort_label(effort),
+        None => "Default effort".to_owned(),
+    };
+    egui::ComboBox::from_id_salt(("effort", session.id))
+        .selected_text(egui::RichText::new(selected).small())
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut session.effort, None, "Default effort");
+            for level in levels {
+                let label = models::effort_label(&level);
+                ui.selectable_value(&mut session.effort, Some(level), label);
+            }
+        })
+        .response
+        .on_hover_text(
+            "How much thinking the model puts in. More effort means slower, more thorough \
+             answers that use more of your plan.",
+        );
+}
+
+/// The colour each mode is marked with, from the most cautious to the one that
+/// gives up the safety net.
+fn mode_dot(mode: PermissionMode) -> egui::Color32 {
+    match mode {
+        PermissionMode::Plan => egui::Color32::from_rgb(150, 110, 210),
+        PermissionMode::ReadOnly => egui::Color32::from_rgb(140, 160, 180),
+        PermissionMode::AcceptEdits => egui::Color32::from_rgb(70, 165, 120),
+        PermissionMode::Full => RISKY,
+    }
+}
+
+/// What the agent may do without being asked.
+fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
+    let current = session.permission_mode;
+    let label = egui::RichText::new(format!("● {}", current.label())).small().color(mode_dot(current));
+    egui::ComboBox::from_id_salt(("permission_mode", session.id))
+        .selected_text(label)
+        .show_ui(ui, |ui| {
+            for mode in PermissionMode::ALL {
+                let label = egui::RichText::new(format!("● {}", mode.label())).color(mode_dot(mode));
+                ui.selectable_value(&mut session.permission_mode, mode, label).on_hover_text(mode.description());
+            }
+        })
+        .response
+        .on_hover_text(format!(
+            "What the agent may do without asking. Applies from the next message.\n\n{}",
+            current.description()
+        ));
+}
+
+/// The folder this session works in, and a way to change it without leaving the
+/// message box. Returns true when it is clicked.
+fn folder_chip(ui: &mut egui::Ui, session: &Session) -> bool {
+    if !session.has_folder() {
+        return false;
+    }
+    let name = short_label(&session.folder_name(), MAX_CHIP_CHARS);
+    let chip = egui::Button::new(egui::RichText::new(format!("📁 {name}")).small().weak())
+        .fill(egui::Color32::TRANSPARENT)
+        .corner_radius(6.0);
+    ui.add(chip)
+        .on_hover_text(format!("Working in {}\nClick to choose another folder", session.project_dir.display()))
+        .clicked()
+}
+
+/// How much of the conversation the model is carrying, once a turn has finished
+/// and said so. No CLI reports the size of its context window, so this is the
+/// count on its own rather than a share of a number we'd have to invent.
+fn context_chip(ui: &mut egui::Ui, session: &Session) {
+    let Some(last) = session.last_usage else { return };
+    let tokens = last.context_tokens();
+    if tokens == 0 {
+        return;
+    }
+    ui.label(egui::RichText::new(format!("{} context", usage::short_count(tokens))).small().weak()).on_hover_text(
+        format!(
+            "The conversation so far, as the model read it on the last turn: {} tokens in, {} out.\n\
+             /clear starts a fresh session in the same folder.",
+            usage::short_count(tokens),
+            usage::short_count(last.output)
+        ),
+    );
 }
 
 pub fn conversation(
@@ -228,7 +485,7 @@ pub fn conversation(
         .stick_to_bottom(true)
         .show(ui, |ui| {
             for (index, entry) in session.entries.iter().enumerate() {
-                show_entry(ui, (session.id, index), entry, markdown);
+                show_entry(ui, (session.id, index), entry, markdown, &session.project_dir);
             }
             // Text still arriving is left plain: half-written markdown would jump about
             // as the rest of it comes in.
@@ -293,17 +550,21 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                                 let fill = if selected {
                                     CLAUDE_CORAL.gamma_multiply(0.15)
                                 } else if hovered {
-                                    ui.visuals().faint_bg_color
+                                    if ui.visuals().dark_mode { egui::Color32::from_rgb(46, 44, 41) } else { ui.visuals().faint_bg_color }
+                                } else if ui.visuals().dark_mode {
+                                    egui::Color32::from_rgb(36, 35, 33)
                                 } else {
-                                    ui.visuals().extreme_bg_color
+                                    egui::Color32::WHITE
                                 };
 
                                 let stroke = if selected {
                                     egui::Stroke::new(1.5, CLAUDE_CORAL)
                                 } else if hovered {
                                     egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
+                                } else if ui.visuals().dark_mode {
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 56, 52))
                                 } else {
-                                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
                                 };
 
                                 egui::Frame::new()
@@ -361,11 +622,17 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                             (fill, stroke)
                         } else {
                             let fill = if hovered {
-                                ui.visuals().faint_bg_color
+                                if ui.visuals().dark_mode { egui::Color32::from_rgb(46, 44, 41) } else { ui.visuals().faint_bg_color }
+                            } else if ui.visuals().dark_mode {
+                                egui::Color32::from_rgb(36, 35, 33)
                             } else {
-                                ui.visuals().extreme_bg_color
+                                egui::Color32::WHITE
                             };
-                            let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                            let stroke = if ui.visuals().dark_mode {
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 56, 52))
+                            } else {
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
+                            };
                             (fill, stroke)
                         };
 
@@ -411,7 +678,13 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
     action
 }
 
-fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut egui_commonmark::CommonMarkCache) {
+fn show_entry(
+    ui: &mut egui::Ui,
+    id: (u64, usize),
+    entry: &Entry,
+    markdown: &mut egui_commonmark::CommonMarkCache,
+    project_dir: &Path,
+) {
     match entry {
         Entry::User(message) => {
             ui.add_space(10.0);
@@ -438,7 +711,7 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut
             egui_commonmark::CommonMarkViewer::new().show(ui, markdown, text);
         }
         Entry::Tool { name, detail, edit } => {
-            tool_row(ui, name, detail);
+            tool_row(ui, name, detail, project_dir);
             if let Some(edit) = edit {
                 edit_view(ui, id, edit);
             }
@@ -454,6 +727,9 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut
             indented(ui, colour, |ui| {
                 egui::CollapsingHeader::new(egui::RichText::new(header).small().color(colour))
                     .id_salt(("tool_output", id))
+                    // What failed is the thing you came to read. Ordinary output
+                    // stays folded away so the transcript reads as a conversation.
+                    .default_open(*is_error)
                     .show(ui, |ui| output_text(ui, text));
             });
         }
@@ -466,20 +742,71 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut
     }
 }
 
-/// What a tool is doing: its name, then what it is working on.
-fn tool_row(ui: &mut egui::Ui, name: &str, detail: &str) {
+/// The colour each family of tool is marked with: cool for the ones that only
+/// look, warmer for the ones that change something or reach outside the project.
+fn kind_colour(kind: ToolKind) -> egui::Color32 {
+    match kind {
+        ToolKind::Read => egui::Color32::from_rgb(120, 145, 175),
+        ToolKind::Edit => ADDED,
+        ToolKind::Run => egui::Color32::from_rgb(158, 124, 208),
+        ToolKind::Search => egui::Color32::from_rgb(92, 163, 158),
+        ToolKind::Web => egui::Color32::from_rgb(96, 142, 200),
+        ToolKind::Plan => RISKY,
+        ToolKind::Delegate => CLAUDE_CORAL,
+    }
+}
+
+/// A tool's detail with the project's own paths shortened.
+///
+/// Only the families whose detail holds a path are touched, and `short_path`
+/// leaves anything that isn't one alone — so a command is shown exactly as it was
+/// run, and a regex keeps its backslashes.
+fn readable_detail(kind: Option<ToolKind>, detail: &str, project_dir: &Path) -> String {
+    if !matches!(kind, Some(ToolKind::Read | ToolKind::Edit | ToolKind::Search)) {
+        return detail.to_owned();
+    }
+    // A detail can carry more than one part — "src/app.rs · lines 40–90" — and the
+    // path is not always the first of them.
+    detail
+        .split(" · ")
+        .map(|part| tool_call::short_path(part, project_dir, MAX_DETAIL_CHARS))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// What a tool did: the verb it did it with, then what it worked on. A tool that
+/// reported a list — a plan, a to-do list — has it underneath.
+fn tool_row(ui: &mut egui::Ui, name: &str, detail: &str, project_dir: &Path) {
+    let described = tool_call::describe(name);
+    // An unrecognised tool keeps its own name. A wrong verb would be worse than
+    // the CLI's own word for it, and MCP servers bring names nobody can predict.
+    let (label, colour) = match described {
+        Some((kind, verb)) => (verb, kind_colour(kind)),
+        None => (name, ui.visuals().weak_text_color()),
+    };
+    let (phrase, body) = tool_call::split_detail(detail);
+    let phrase = readable_detail(described.map(|(kind, _)| kind), phrase, project_dir);
+
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         egui::Frame::new()
-            .fill(ui.visuals().widgets.inactive.bg_fill)
+            .fill(colour.gamma_multiply(0.22))
             .corner_radius(4.0)
             .inner_margin(egui::Margin::symmetric(6, 1))
             .show(ui, |ui| {
-                ui.label(egui::RichText::new(name).small().strong());
+                ui.label(egui::RichText::new(label).small().strong().color(colour));
             });
-        ui.add(egui::Label::new(egui::RichText::new(detail).monospace().small().weak()).truncate());
+        ui.add(egui::Label::new(egui::RichText::new(&phrase).monospace().small().weak()).truncate())
+            .on_hover_text(&phrase);
     });
+    if !body.is_empty() {
+        indented(ui, colour.gamma_multiply(0.5), |ui| {
+            for line in body {
+                ui.add(egui::Label::new(egui::RichText::new(line).small().weak()).truncate());
+            }
+        });
+    }
 }
 
 /// The change an editing tool is about to make, as a diff.
@@ -936,14 +1263,17 @@ fn slash_suggestions_ui(
     matches: &[&SlashCommand],
     query: &str,
 ) {
-    let card_bg = ui.visuals().panel_fill;
-    let border_stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+    let (card_bg, border_stroke) = if ui.visuals().dark_mode {
+        (egui::Color32::from_rgb(40, 38, 35), egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 58, 53)))
+    } else {
+        (egui::Color32::from_rgb(252, 250, 247), egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 216, 210)))
+    };
     let mut chosen = None;
 
     egui::Frame::new()
         .fill(card_bg)
         .stroke(border_stroke)
-        .corner_radius(8.0)
+        .corner_radius(12.0)
         .inner_margin(egui::Margin::symmetric(10, 8))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1033,6 +1363,7 @@ fn slash_suggestions_ui(
                                             CommandSource::Project => {
                                                 egui::Color32::from_rgb(110, 70, 160).gamma_multiply(0.4)
                                             }
+                                            CommandSource::Barduino => CLAUDE_CORAL.gamma_multiply(0.35),
                                         };
                                         egui::Frame::new()
                                             .fill(badge_bg)
@@ -1041,6 +1372,7 @@ fn slash_suggestions_ui(
                                             .show(ui, |ui| {
                                                 ui.label(egui::RichText::new(cmd.source.badge()).small());
                                             });
+                                        handling_badge(ui, cmd);
 
                                         ui.add_space(4.0);
                                         ui.add(
@@ -1078,6 +1410,17 @@ fn slash_suggestions_ui(
         session.slash_dismissed = false;
         session.focus_composer = true;
     }
+}
+
+/// Warns about a command the CLI can only run from its own interface. Nothing is
+/// said about the others: the "Barduino" badge already means it takes effect here,
+/// and everything else is a prompt, which is what the menu implies anyway.
+fn handling_badge(ui: &mut egui::Ui, cmd: &SlashCommand) {
+    if commands::handling(&cmd.name, cmd.source) != Handling::Terminal {
+        return;
+    }
+    ui.label(egui::RichText::new("opens a terminal").small().color(RISKY.gamma_multiply(0.9)))
+        .on_hover_text("Only the CLI's own interface can run this, so Barduino will start it in a terminal for you.");
 }
 
 /// A small card for a page element attached to a message, with an × to remove
@@ -1276,6 +1619,44 @@ mod tests {
         assert_eq!(job.sections.len(), 2);
         assert_eq!(job.sections[0].format.color, egui::Color32::from_rgb(220, 60, 60));
         assert_eq!(job.sections[1].format.color, egui::Color32::WHITE);
+    }
+
+    #[test]
+    fn only_the_details_that_hold_a_path_get_shortened() {
+        let project = Path::new(r"C:\work\barduino");
+        let shorten = |kind, detail| readable_detail(kind, detail, project);
+
+        assert_eq!(shorten(Some(ToolKind::Read), r"C:\work\barduino\src\app.rs"), "src/app.rs");
+        // A read of part of a file carries the range alongside the path.
+        assert_eq!(
+            shorten(Some(ToolKind::Read), r"C:\work\barduino\src\app.rs · lines 40–90"),
+            "src/app.rs · lines 40–90"
+        );
+        // A search carries the pattern first and the folder second.
+        assert_eq!(shorten(Some(ToolKind::Search), r"note.txt · C:\work\barduino\src"), "note.txt · src");
+
+        // A command is never touched: backslashes in it are the command's own, and
+        // rewriting them would change what the row says was run.
+        let command = r"cargo run -- --path C:\work\barduino\src";
+        assert_eq!(shorten(Some(ToolKind::Run), command), command);
+        // Nor is a tool we don't recognise, whose detail could be anything.
+        assert_eq!(shorten(None, command), command);
+        // And a regex keeps its escapes even in a family that does hold paths.
+        assert_eq!(shorten(Some(ToolKind::Search), r"\bfn\s+main\b"), r"\bfn\s+main\b");
+    }
+
+    #[test]
+    fn a_chip_label_is_cut_to_fit_the_row() {
+        // Claude's own names are short enough to leave alone.
+        assert_eq!(short_label("Opus", MAX_CHIP_CHARS), "Opus");
+        // A model name read from a CLI can be far longer than the row has space for.
+        assert_eq!(short_label("gemini-3-pro-preview-high", 12), "gemini-3-pr…");
+        // Exactly the limit is still left alone, so nothing is cut for one character.
+        assert_eq!(short_label("123456789012", 12), "123456789012");
+        // Cut on characters, not bytes: a folder name is not always ASCII. The
+        // ellipsis counts towards the limit, so what comes back is never wider.
+        assert_eq!(short_label("ბარდუინოს-საქაღალდე", 6), "ბარდუ…");
+        assert_eq!(short_label("gemini-3-pro-preview-high", 12).chars().count(), 12);
     }
 
     #[test]

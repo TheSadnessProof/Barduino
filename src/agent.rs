@@ -136,9 +136,21 @@ impl PermissionMode {
     pub fn description(self) -> &'static str {
         match self {
             Self::ReadOnly => "The agent can read the project but not change it or run commands.",
-            Self::AcceptEdits => "The agent can edit files. Running commands still needs approval,                                   which a headless agent can't be asked for, so it gets refused.",
-            Self::Full => "The agent may edit files and run any command without asking. Use it only in                            folders you trust.",
+            Self::AcceptEdits => "The agent can edit files. Running commands still needs approval, \
+                                  which a headless agent can't be asked for, so it gets refused.",
+            Self::Full => "The agent may edit files and run any command without asking. Use it only \
+                           in folders you trust.",
             Self::Plan => "The agent works out a plan and doesn't change anything.",
+        }
+    }
+
+    /// The word this mode is asked for by in `/permission full` and the like.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read",
+            Self::AcceptEdits => "edit",
+            Self::Full => "full",
+            Self::Plan => "plan",
         }
     }
 
@@ -397,17 +409,68 @@ pub fn string(value: &Value) -> String {
 
 /// A one-line summary of a tool call, such as the command or file it touches.
 pub fn tool_detail(input: &Value) -> String {
-    const KEYS: [&str; 9] =
-        ["command", "file_path", "absolute_path", "path", "dir_path", "pattern", "url", "query", "description"];
+    const KEYS: [&str; 10] = [
+        "command", "file_path", "absolute_path", "path", "dir_path", "pattern", "url", "query", "description",
+        "plan",
+    ];
     let raw = KEYS
         .iter()
         .find_map(|key| input[*key].as_str())
-        .map(str::to_owned)
-        .unwrap_or_else(|| input.to_string());
+        // Any string it does have, rather than the object printed as JSON. A tool
+        // with none of these keys used to fill the row with `{"todos":[{"content…`.
+        .or_else(|| input.as_object()?.values().find_map(Value::as_str))
+        .unwrap_or_default();
+    first_line(raw, 160)
+}
 
-    let first_line = raw.lines().next().unwrap_or_default();
-    let mut detail: String = first_line.chars().take(160).collect();
-    if detail.len() < raw.trim_end().len() {
+/// A to-do list or plan, as the checklist it is rather than the JSON it arrives in.
+/// The first line says how far along the work is; the rest is the list.
+///
+/// Deliberately tolerant about which keys carry the text and the state, because
+/// all three CLIs report a plan and none of them agrees on the shape. Anything it
+/// can't make sense of returns `None`, so the caller falls back rather than showing
+/// something wrong.
+pub fn checklist(items: &Value) -> Option<String> {
+    const LABELS: [&str; 5] = ["content", "text", "title", "step", "description"];
+    const STATES: [&str; 3] = ["status", "state", "stage"];
+
+    let items = items.as_array().filter(|items| !items.is_empty())?;
+    let state = |item: &Value| {
+        STATES.iter().find_map(|key| item[*key].as_str()).unwrap_or_default().to_lowercase()
+    };
+    let label = |item: &Value| {
+        LABELS.iter().find_map(|key| item[*key].as_str()).map(str::to_owned)
+            // A plain list of strings is a plan too.
+            .or_else(|| item.as_str().map(str::to_owned))
+    };
+    // If none of them carries text, this isn't a checklist and guessing would only
+    // produce a column of empty bullets.
+    let labelled: Vec<String> = items.iter().filter_map(label).collect();
+    if labelled.len() != items.len() {
+        return None;
+    }
+
+    let done = items.iter().filter(|item| state(item).starts_with("complet")).count();
+    let mut lines = vec![format!("{done} of {} done", items.len())];
+    lines.extend(items.iter().zip(labelled).map(|(item, text)| {
+        let state = state(item);
+        let mark = if state.starts_with("complet") {
+            "✓"
+        } else if state.contains("progress") || state.starts_with("active") || state.starts_with("running") {
+            "▸"
+        } else {
+            "·"
+        };
+        format!("{mark} {}", first_line(&text, 120))
+    }));
+    Some(lines.join("\n"))
+}
+
+/// The first line of some text, cut to `max` characters, with an ellipsis when
+/// anything was left out.
+fn first_line(raw: &str, max: usize) -> String {
+    let mut detail: String = raw.lines().next().unwrap_or_default().trim_end().chars().take(max).collect();
+    if detail.chars().count() < raw.trim_end().chars().count() {
         detail.push('…');
     }
     detail
@@ -422,7 +485,40 @@ mod tests {
         let input = serde_json::json!({"command": "ls -la\ncd src", "description": "List files"});
         assert_eq!(tool_detail(&input), "ls -la…");
         assert_eq!(tool_detail(&serde_json::json!({"dir_path": "src"})), "src");
-        assert_eq!(tool_detail(&serde_json::json!({"x": 1})), r#"{"x":1}"#);
+        // A tool with none of the expected keys used to print its whole input as
+        // JSON into the transcript. Any string it does carry is worth more, and
+        // nothing at all is worth more than a brace.
+        assert_eq!(tool_detail(&serde_json::json!({"shell_id": "bash_3"})), "bash_3");
+        assert_eq!(tool_detail(&serde_json::json!({"x": 1})), "");
+        // Long input is cut on a character, not in the middle of one.
+        let wide = serde_json::json!({"command": "é".repeat(200)});
+        assert_eq!(tool_detail(&wide).chars().count(), 161, "160 characters and the ellipsis");
+    }
+
+    #[test]
+    fn a_plan_reads_as_a_checklist_whichever_cli_sent_it() {
+        // Claude's shape.
+        let claude = serde_json::json!([
+            {"content": "Restore the pickers", "status": "completed", "activeForm": "Restoring the pickers"},
+            {"content": "Add the context readout", "status": "in_progress"},
+            {"content": "Write it up", "status": "pending"},
+        ]);
+        let lines: Vec<String> = checklist(&claude).expect("a checklist").lines().map(str::to_owned).collect();
+        assert_eq!(lines[0], "1 of 3 done");
+        assert_eq!(lines[1], "✓ Restore the pickers");
+        assert_eq!(lines[2], "▸ Add the context readout");
+        assert_eq!(lines[3], "· Write it up");
+
+        // A CLI that calls the same things something else still reads right.
+        let other = serde_json::json!([{"text": "One", "state": "COMPLETED"}, {"text": "Two", "state": "active"}]);
+        assert_eq!(checklist(&other).expect("a checklist"), "1 of 2 done\n✓ One\n▸ Two");
+        // And a plain list of strings is a plan too.
+        assert_eq!(checklist(&serde_json::json!(["One", "Two"])).expect("a list"), "0 of 2 done\n· One\n· Two");
+
+        // Shapes it can't read fall back rather than showing a column of bullets.
+        assert_eq!(checklist(&serde_json::json!([])), None, "an empty list is not a plan");
+        assert_eq!(checklist(&serde_json::json!([{"id": 1}])), None, "nothing to label the row with");
+        assert_eq!(checklist(&serde_json::json!({"todos": []})), None, "not a list at all");
     }
 
     fn run_turn(provider: Provider, turn: Turn) -> Vec<AgentEvent> {

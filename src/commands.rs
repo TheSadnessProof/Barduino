@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::agent::{self, Provider};
+use crate::agent::{self, PermissionMode, Provider};
+use crate::models::Model;
 
 /// How long a scan is reused before the folders are read again: long enough that
 /// typing doesn't re-read the disk on every frame, short enough that a skill added
@@ -34,6 +35,10 @@ pub enum CommandSource {
     Skill,
     /// A custom command defined in `.claude/commands` or workspace config.
     Project,
+    /// Barduino's own. These change how the next turn runs, which is the CLIs' own
+    /// job in their interactive interfaces — but Barduino runs them headless, so it
+    /// carries them out itself, the same way for every provider.
+    Barduino,
 }
 
 impl CommandSource {
@@ -42,9 +47,24 @@ impl CommandSource {
             Self::Builtin => "Built-in",
             Self::Skill => "Skill",
             Self::Project => "Project",
+            Self::Barduino => "Barduino",
         }
     }
 }
+
+/// Barduino's own commands, offered whichever CLI is answering. They are the same
+/// settings the row under the message box shows.
+const BARDUINO_COMMANDS: &[(&str, &str)] = &[
+    ("model", "Choose the model for this session, e.g. /model opus"),
+    ("effort", "Choose how hard the model works, e.g. /effort high"),
+    ("permission", "Choose what the agent may do without asking, e.g. /permission full"),
+    ("clear", "Start a fresh session in the same folder"),
+    ("settings", "Open Barduino's settings"),
+];
+
+/// The other spellings the CLIs use for those same commands. They work when typed,
+/// but they don't each get a row of their own in the menu.
+const ALSO_OURS: &[&str] = &["permissions", "mode", "config"];
 
 /// One slash command that can be suggested when typing `/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +211,19 @@ pub fn discover(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
 fn scan_everything(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
+
+    // 0. Barduino's own, first so that where a CLI has a command of the same name
+    // these are the ones offered — they are the ones that actually take effect here.
+    for &(name, desc) in BARDUINO_COMMANDS {
+        if seen.insert(name.to_lowercase()) {
+            commands.push(SlashCommand {
+                name: name.to_owned(),
+                description: desc.to_owned(),
+                source: CommandSource::Barduino,
+            });
+        }
+    }
+    seen.extend(ALSO_OURS.iter().map(|alias| (*alias).to_owned()));
 
     // 1. Built-in provider commands.
     for &(name, desc) in builtin_commands(provider) {
@@ -400,6 +433,155 @@ pub fn filter<'a>(commands: &'a [SlashCommand], query: &str) -> Vec<&'a SlashCom
     prefix_matches
 }
 
+/// What sending a slash command actually does.
+///
+/// The CLIs' built-in commands belong to their own interactive session. Barduino
+/// runs them headless, where there is no such session — so a command that changes
+/// how the next turn runs has to be carried out here, and a few can't be reached
+/// at all without a real terminal. Saying which is which is the difference between
+/// a menu that works and a menu that quietly does nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handling {
+    /// Barduino applies it to this session itself.
+    Here,
+    /// Goes to the CLI as the prompt it is: a skill, a project command, or one of
+    /// the CLI's own commands that expands into a prompt.
+    Cli,
+    /// Only the CLI's own terminal can do it — signing in, themes, key bindings.
+    Terminal,
+}
+
+/// Commands that need the CLI running in a terminal, because they change how its
+/// own interface behaves or ask something a one-shot run can't be asked.
+const NEEDS_TERMINAL: &[&str] =
+    &["login", "logout", "terminal-setup", "theme", "tui", "voice", "keymap", "ide", "exit", "raw", "resume"];
+
+/// What happens when this command is sent, so the menu can say so before it is.
+pub fn handling(name: &str, source: CommandSource) -> Handling {
+    match source {
+        CommandSource::Barduino => Handling::Here,
+        // A skill or a project command is a prompt expansion whoever runs it.
+        CommandSource::Skill | CommandSource::Project => Handling::Cli,
+        CommandSource::Builtin if NEEDS_TERMINAL.contains(&name) => Handling::Terminal,
+        CommandSource::Builtin => Handling::Cli,
+    }
+}
+
+/// A change to the session that a slash command is asking for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlashAction {
+    /// `None` hands the choice back to whatever the CLI defaults to.
+    Model(Option<String>),
+    Effort(Option<String>),
+    Permission(PermissionMode),
+    /// A fresh session in the same folder, which is what the CLIs' `/clear` does.
+    Clear,
+    OpenSettings,
+    /// Start the CLI in a terminal, for a command only its own interface can run.
+    /// Carries the command name so the user can be told what to type there.
+    OpenTerminal(String),
+}
+
+/// What the CLIs themselves call these modes, so a habit picked up in one of them
+/// works here too. The labels already cover "read only", "full access" and
+/// "plan only", which is why those aren't repeated.
+const PERMISSION_ALIASES: &[(&str, PermissionMode)] =
+    &[("acceptedits", PermissionMode::AcceptEdits), ("bypasspermissions", PermissionMode::Full)];
+
+/// Reads a typed message as a command Barduino should carry out rather than send.
+///
+/// Returns `None` when it isn't one of ours and should go to the CLI as written,
+/// and `Err` with a sentence for the user when it is ours but the argument isn't.
+/// Nothing here reaches the CLI, which matters: a turn spent asking an agent to
+/// change its own model is a turn the user pays for and gets nothing from.
+pub fn intercept(input: &str, models: &[Model], efforts: &[String]) -> Option<Result<SlashAction, String>> {
+    let rest = input.trim().strip_prefix('/')?;
+    let (name, argument) = match rest.split_once(char::is_whitespace) {
+        Some((name, argument)) => (name, argument.trim()),
+        None => (rest, ""),
+    };
+    match name.to_lowercase().as_str() {
+        "model" => Some(pick_model(argument, models)),
+        "effort" => Some(pick_effort(argument, efforts)),
+        "permission" | "permissions" | "mode" => Some(pick_permission(argument)),
+        "clear" => Some(Ok(SlashAction::Clear)),
+        "config" | "settings" => Some(Ok(SlashAction::OpenSettings)),
+        // Signing in, themes and key bindings belong to the CLI's own interface.
+        // Sent as a message they would just be words in front of the model, so the
+        // CLI is started in a terminal where the command actually works instead.
+        other if NEEDS_TERMINAL.contains(&other) => Some(Ok(SlashAction::OpenTerminal(other.to_owned()))),
+        _ => None,
+    }
+}
+
+fn pick_model(argument: &str, models: &[Model]) -> Result<SlashAction, String> {
+    if models.is_empty() {
+        return Err("The model list is still being read from the CLI. Try again in a moment.".to_owned());
+    }
+    let offered = choices(models.iter().map(|model| model.id.as_str()));
+    if argument.is_empty() {
+        return Err(format!("Which model? Try {offered}, or “default” — or pick one from the row under the message box."));
+    }
+    if means_default(argument) {
+        return Ok(SlashAction::Model(None));
+    }
+    // Matched on the label as well, since that is the name the picker shows.
+    let wanted = argument.to_lowercase();
+    match models.iter().find(|m| m.id.to_lowercase() == wanted || m.label.to_lowercase() == wanted) {
+        Some(model) => Ok(SlashAction::Model(Some(model.id.clone()))),
+        None => Err(format!("There's no model called “{argument}”. Try {offered}.")),
+    }
+}
+
+fn pick_effort(argument: &str, efforts: &[String]) -> Result<SlashAction, String> {
+    let offered = choices(efforts.iter().map(String::as_str));
+    if argument.is_empty() {
+        return Err(format!("How much effort? Try {offered}, or “default” — or pick one from the row under the message box."));
+    }
+    if means_default(argument) {
+        return Ok(SlashAction::Effort(None));
+    }
+    match efforts.iter().find(|level| level.eq_ignore_ascii_case(argument)) {
+        Some(level) => Ok(SlashAction::Effort(Some(level.clone()))),
+        None => Err(format!("There's no effort level called “{argument}”. Try {offered}.")),
+    }
+}
+
+fn pick_permission(argument: &str) -> Result<SlashAction, String> {
+    let offered = choices(PermissionMode::ALL.iter().map(|mode| mode.keyword()));
+    if argument.is_empty() {
+        return Err(format!("Which mode? Try {offered} — or pick one from the row under the message box."));
+    }
+    // So that "edit", "Can edit files" and "accept-edits" all reach the same mode.
+    let wanted: String = argument.to_lowercase().chars().filter(|ch| ch.is_alphanumeric()).collect();
+    let by_name = PermissionMode::ALL.into_iter().find(|mode| {
+        let label: String = mode.label().to_lowercase().chars().filter(|ch| ch.is_alphanumeric()).collect();
+        wanted == mode.keyword() || wanted == label
+    });
+    let found = by_name.or_else(|| {
+        PERMISSION_ALIASES.iter().find(|(alias, _)| *alias == wanted).map(|(_, mode)| *mode)
+    });
+    match found {
+        Some(mode) => Ok(SlashAction::Permission(mode)),
+        None => Err(format!("There's no mode called “{argument}”. Try {offered}.")),
+    }
+}
+
+/// True for the words that mean "stop choosing and let the CLI decide".
+fn means_default(argument: &str) -> bool {
+    matches!(argument.to_lowercase().as_str(), "default" | "auto" | "none" | "reset")
+}
+
+/// The options in a sentence: "low, medium or high".
+fn choices<'a>(options: impl Iterator<Item = &'a str>) -> String {
+    let options: Vec<&str> = options.collect();
+    match options.split_last() {
+        None => "one of the CLI's own".to_owned(),
+        Some((last, [])) => format!("“{last}”"),
+        Some((last, rest)) => format!("{} or “{last}”", rest.iter().map(|o| format!("“{o}”")).collect::<Vec<_>>().join(", ")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -514,6 +696,102 @@ mod tests {
         ];
         assert_eq!(filter(&commands, "").len(), 2);
         assert_eq!(filter(&commands, "   ").len(), 2);
+    }
+
+    /// Three models, as the catalogue would hand them over.
+    fn catalogue() -> Vec<Model> {
+        ["Opus", "Sonnet", "Haiku"]
+            .into_iter()
+            .map(|label| Model {
+                id: label.to_lowercase(),
+                label: label.to_owned(),
+                efforts: vec!["low".to_owned(), "high".to_owned()],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_provider_gets_barduinos_own_commands() {
+        // Codex's own list has no /effort or /permission, but Barduino sets both on
+        // the spawn, so they have to be offered whichever CLI is answering.
+        for &provider in &Provider::ALL {
+            let commands = discover(provider, Path::new("no such folder"));
+            for wanted in ["model", "effort", "permission", "clear", "settings"] {
+                let found = commands.iter().find(|c| c.name == wanted);
+                let found = found.unwrap_or_else(|| panic!("{provider:?} should offer /{wanted}"));
+                assert_eq!(found.source, CommandSource::Barduino, "/{wanted} is ours, not the CLI's");
+            }
+            // The CLI's own spelling of the same thing doesn't get a second row.
+            for alias in ALSO_OURS {
+                assert!(!commands.iter().any(|c| c.name == *alias), "{provider:?} lists /{alias} twice");
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_says_where_it_will_run_before_it_is_sent() {
+        // Ours, so the menu can promise it takes effect.
+        assert_eq!(handling("model", CommandSource::Barduino), Handling::Here);
+        // Signing in needs the CLI's own terminal; nothing headless can do it.
+        assert_eq!(handling("login", CommandSource::Builtin), Handling::Terminal);
+        assert_eq!(handling("theme", CommandSource::Builtin), Handling::Terminal);
+        // A skill or a project command is a prompt, and prompts work fine headless.
+        assert_eq!(handling("verifying-a-ui-change", CommandSource::Skill), Handling::Cli);
+        assert_eq!(handling("test-all", CommandSource::Project), Handling::Cli);
+        // Anything else goes to the CLI, because we can't know that it won't work.
+        assert_eq!(handling("review", CommandSource::Builtin), Handling::Cli);
+    }
+
+    #[test]
+    fn the_settings_commands_read_their_arguments() {
+        let models = catalogue();
+        let efforts = vec!["low".to_owned(), "high".to_owned()];
+        let read = |input: &str| intercept(input, &models, &efforts).map(|result| result.expect(input));
+
+        assert_eq!(read("/model opus"), Some(SlashAction::Model(Some("opus".to_owned()))));
+        // The picker shows labels, so the label has to work as well as the id.
+        assert_eq!(read("/model Sonnet"), Some(SlashAction::Model(Some("sonnet".to_owned()))));
+        assert_eq!(read("/model default"), Some(SlashAction::Model(None)));
+        assert_eq!(read("/effort high"), Some(SlashAction::Effort(Some("high".to_owned()))));
+        assert_eq!(read("/clear"), Some(SlashAction::Clear));
+        assert_eq!(read("/settings"), Some(SlashAction::OpenSettings));
+
+        // Each CLI names these modes differently; all of the spellings land right.
+        for spelling in ["/permission full", "/mode Full access", "/permissions bypassPermissions"] {
+            assert_eq!(read(spelling), Some(SlashAction::Permission(PermissionMode::Full)), "{spelling}");
+        }
+        assert_eq!(read("/mode accept-edits"), Some(SlashAction::Permission(PermissionMode::AcceptEdits)));
+
+        // Signing in can't be done by sending words to a headless run, so it opens a
+        // terminal instead of spending a paid turn on a prompt that can't work.
+        assert_eq!(read("/login"), Some(SlashAction::OpenTerminal("login".to_owned())));
+
+        // Not ours: it goes to the CLI as the prompt it is.
+        assert_eq!(read("/review this branch"), None);
+        assert_eq!(read("not a command at all"), None);
+        assert_eq!(read(""), None);
+    }
+
+    #[test]
+    fn a_setting_that_cant_be_applied_says_what_would_work() {
+        let models = catalogue();
+        let efforts = vec!["low".to_owned(), "high".to_owned()];
+        let fails = |input: &str| {
+            intercept(input, &models, &efforts).unwrap_or_else(|| panic!("{input} is ours")).expect_err(input)
+        };
+
+        // Naming nothing lists what there is, rather than silently doing nothing.
+        let no_argument = fails("/model");
+        assert!(no_argument.contains("opus") && no_argument.contains("haiku"), "{no_argument}");
+        let wrong = fails("/model gpt-5");
+        assert!(wrong.contains("gpt-5") && wrong.contains("sonnet"), "{wrong}");
+        assert!(fails("/effort ludicrous").contains("high"));
+        assert!(fails("/mode whatever").contains("plan"));
+
+        // While the CLI is still being asked for its models, say so rather than
+        // listing an empty set.
+        let loading = intercept("/model opus", &[], &efforts).expect("ours").expect_err("no models yet");
+        assert!(loading.contains("still being read"), "{loading}");
     }
 
     #[test]

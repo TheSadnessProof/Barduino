@@ -86,7 +86,7 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 "text" => Some(AgentEvent::Text(string(&block["text"]))),
                 "tool_use" => Some(AgentEvent::ToolUse {
                     name: string(&block["name"]),
-                    detail: tool_detail(&block["input"]),
+                    detail: detail_for(block["name"].as_str().unwrap_or_default(), &block["input"]),
                     edit: file_edit(block["name"].as_str().unwrap_or_default(), &block["input"]),
                 }),
                 _ => None,
@@ -131,6 +131,34 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
 
 /// The change an editing tool is about to make. Claude sends the text on both
 /// sides, so the chat can show a diff without reading the file.
+/// What a tool is working on, for the tools whose own shape says it better than a
+/// single field can. Everything else falls through to the shared `tool_detail`.
+fn detail_for(tool: &str, input: &Value) -> String {
+    match tool {
+        "TodoWrite" => agent::checklist(&input["todos"]).unwrap_or_else(|| tool_detail(input)),
+        // A pattern on its own doesn't say where it was looked for, and "in the
+        // whole project" and "in src/" are different enough to be worth the words.
+        "Grep" | "Glob" => {
+            let pattern = string(&input["pattern"]);
+            let filter = input["glob"].as_str().or_else(|| input["type"].as_str()).unwrap_or_default();
+            let mut detail = match filter {
+                "" => pattern,
+                filter => format!("{pattern} in {filter} files"),
+            };
+            if let Some(path) = input["path"].as_str() {
+                detail.push_str(&format!(" · {path}"));
+            }
+            detail
+        }
+        // A read of part of a file is not a read of the file.
+        "Read" => match (input["offset"].as_u64(), input["limit"].as_u64()) {
+            (Some(offset), Some(limit)) => format!("{} · lines {}–{}", string(&input["file_path"]), offset, offset + limit),
+            _ => tool_detail(input),
+        },
+        _ => tool_detail(input),
+    }
+}
+
 fn file_edit(tool: &str, input: &Value) -> Option<FileEdit> {
     let path = input["file_path"].as_str()?.to_owned();
     match tool {
@@ -311,6 +339,38 @@ mod tests {
             panic!("expected one Finished event");
         };
         assert_eq!(error.as_deref(), Some("Claude stopped with an error (error_max_turns)."));
+    }
+
+    #[test]
+    fn a_tools_own_shape_says_more_than_one_field_can() {
+        let detail = |tool: &str, input: serde_json::Value| detail_for(tool, &input);
+
+        // A to-do list used to arrive as `{"todos":[{"content":"Fix the…` in the
+        // transcript. It is a list, so it reads as one.
+        let todos = detail(
+            "TodoWrite",
+            serde_json::json!({"todos": [
+                {"content": "Restore the pickers", "status": "completed"},
+                {"content": "Add the context readout", "status": "in_progress"},
+            ]}),
+        );
+        assert_eq!(todos, "1 of 2 done\n✓ Restore the pickers\n▸ Add the context readout");
+
+        // A pattern on its own doesn't say where it was looked for, and "everywhere"
+        // and "in src" are different enough to be worth the words.
+        let grep = detail("Grep", serde_json::json!({"pattern": "fn parse", "glob": "*.rs", "path": "src"}));
+        assert_eq!(grep, "fn parse in *.rs files · src");
+        assert_eq!(detail("Grep", serde_json::json!({"pattern": "fn parse"})), "fn parse");
+
+        // Reading part of a file is not the same as reading the file.
+        let part = detail("Read", serde_json::json!({"file_path": "src/app.rs", "offset": 40, "limit": 50}));
+        assert_eq!(part, "src/app.rs · lines 40–90");
+        assert_eq!(detail("Read", serde_json::json!({"file_path": "src/app.rs"})), "src/app.rs");
+
+        // A shape that isn't what we expect falls back rather than showing nonsense:
+        // these formats change between releases and a wrong list is worse than none.
+        assert_eq!(detail("TodoWrite", serde_json::json!({"todos": "not a list"})), "not a list");
+        assert_eq!(detail("TodoWrite", serde_json::json!({})), "");
     }
 
     #[test]

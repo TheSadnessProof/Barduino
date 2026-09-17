@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::{self, AgentEvent, PermissionMode, Turn, string};
+use crate::tool_call;
 use crate::usage::Usage;
 
 /// Finds `agy` on PATH or where the Antigravity installer puts it.
@@ -146,14 +147,26 @@ fn parse_step(step: &Value) -> Vec<AgentEvent> {
 
 /// A one-line summary of a tool call. agy names its parameters in PascalCase.
 fn tool_detail(parameters: &Value) -> String {
-    const KEYS: [&str; 8] =
-        ["CommandLine", "AbsolutePath", "TargetFile", "DirectoryPath", "SearchDirectory", "Url", "Query", "Pattern"];
+    // What it was looking for comes first. A search carries both a pattern and the
+    // folder to search, and listing the folder alone — which is what happened while
+    // SearchDirectory sat above Pattern in the list below — says nothing about what
+    // the agent was after.
+    if let Some(pattern) = parameters["Pattern"].as_str().or_else(|| parameters["Query"].as_str()) {
+        let detail = match parameters["SearchDirectory"].as_str() {
+            Some(directory) => format!("{pattern} · {directory}"),
+            None => pattern.to_owned(),
+        };
+        return agent::tool_detail(&serde_json::json!({ "command": detail }));
+    }
+    const KEYS: [&str; 6] =
+        ["CommandLine", "AbsolutePath", "TargetFile", "DirectoryPath", "SearchDirectory", "Url"];
     let value = KEYS
         .iter()
         .find_map(|key| parameters[*key].as_str())
         .or_else(|| parameters.as_object()?.values().find_map(Value::as_str));
     match value {
-        Some(text) => agent::tool_detail(&serde_json::json!({ "command": text })),
+        // A command arrives as the whole line the shell was given, wrapper and all.
+        Some(text) => agent::tool_detail(&serde_json::json!({ "command": tool_call::bare_command(text) })),
         None => agent::tool_detail(parameters),
     }
 }
@@ -177,6 +190,19 @@ mod tests {
         assert!(events.contains(&AgentEvent::ToolResult { text: "note.txt".into(), is_error: false }));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
             if name == "view_file" && detail.ends_with("note.txt"))));
+
+        // The same recording's search used to show only the folder it looked in:
+        // SearchDirectory sat above Pattern in the key list, so the row said
+        // "C:\…\agytest" and never said the agent was looking for note.txt.
+        let Some(AgentEvent::ToolUse { detail, .. }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ToolUse { name, .. } if name == "find_by_name"))
+        else {
+            panic!("the recording searches for a file: {events:?}")
+        };
+        let (pattern, directory) = detail.split_once(" · ").unwrap_or_else(|| panic!("{detail}"));
+        assert_eq!(pattern, "note.txt", "what it was looking for comes first");
+        assert!(directory.ends_with("agytest"), "and where it looked is still there: {directory}");
         let text: String = events
             .iter()
             .filter_map(|e| if let AgentEvent::TextDelta(t) = e { Some(t.as_str()) } else { None })

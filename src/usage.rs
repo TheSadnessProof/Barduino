@@ -25,6 +25,28 @@ impl Usage {
     pub fn total_tokens(&self) -> u64 {
         self.input + self.output + self.cache_read + self.cache_write
     }
+
+    /// Everything the model was given to read this turn: the new message plus the
+    /// conversation behind it, whether that was sent again or read from the CLI's
+    /// cache. For the most recent turn, that is the context the session is
+    /// carrying — which is why it climbs turn after turn until a `/clear`.
+    pub fn context_tokens(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write
+    }
+}
+
+/// A token count in the short form a status line has room for: "980", "1.5k",
+/// "32k", "1.2M".
+pub fn short_count(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        // Rounded to a tenth first, so 9,999 reads as "10k" rather than "10.0k".
+        let thousands = (tokens as f64 / 100.0).round() / 10.0;
+        if thousands >= 10.0 { format!("{thousands:.0}k") } else { format!("{thousands:.1}k") }
+    } else {
+        tokens.to_string()
+    }
 }
 
 impl AddAssign for Usage {
@@ -175,5 +197,26 @@ mod tests {
         assert_eq!(format_cost(None), "—");
         assert_eq!(format_cost(Some(0.004)), "< $0.01");
         assert_eq!(format_cost(Some(3.456)), "$3.46");
+    }
+
+    #[test]
+    fn the_context_is_everything_the_model_was_given_to_read() {
+        // Real shape of a Claude turn: almost all of the conversation comes back
+        // from the cache, so counting only `input` would report 2 tokens of context.
+        let turn = Usage { turns: 1, input: 2, output: 4, cache_read: 0, cache_write: 31_984, cost_usd: None };
+        assert_eq!(turn.context_tokens(), 31_986);
+        // The reply doesn't count: it is what came out, not what went in.
+        assert_ne!(turn.context_tokens(), turn.total_tokens());
+    }
+
+    #[test]
+    fn a_token_count_is_shortened_to_fit_a_status_line() {
+        assert_eq!(short_count(0), "0");
+        assert_eq!(short_count(980), "980");
+        assert_eq!(short_count(1_500), "1.5k");
+        // Rounding up to four figures still reads as thousands, not "10.0k".
+        assert_eq!(short_count(9_999), "10k");
+        assert_eq!(short_count(31_986), "32k");
+        assert_eq!(short_count(1_200_000), "1.2M");
     }
 }

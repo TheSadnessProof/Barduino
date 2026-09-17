@@ -20,6 +20,7 @@ mod session;
 mod settings;
 mod sidebar;
 mod terminal;
+mod tool_call;
 mod tools;
 mod usage;
 
