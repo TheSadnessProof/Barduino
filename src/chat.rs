@@ -2,8 +2,9 @@
 
 use eframe::egui;
 
-use crate::claude::PermissionMode;
+use crate::agent::{PermissionMode, Provider};
 use crate::session::{Entry, Session};
+use crate::settings::Settings;
 
 pub enum HeaderAction {
     None,
@@ -16,7 +17,13 @@ pub enum ComposerAction {
     Stop,
 }
 
-pub fn header(ui: &mut egui::Ui, session: &mut Session, show_sessions: &mut bool, show_tools: &mut bool) -> HeaderAction {
+pub fn header(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    settings: &Settings,
+    show_sessions: &mut bool,
+    show_tools: &mut bool,
+) -> HeaderAction {
     let mut action = HeaderAction::None;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -32,6 +39,24 @@ pub fn header(ui: &mut egui::Ui, session: &mut Session, show_sessions: &mut bool
         });
     });
     ui.horizontal(|ui| {
+        ui.label("Agent:");
+        let can_change = session.can_change_provider();
+        ui.add_enabled_ui(can_change, |ui| {
+            egui::ComboBox::from_id_salt(("provider", session.id))
+                .selected_text(session.provider.label())
+                .show_ui(ui, |ui| {
+                    let mut choices: Vec<Provider> = settings.enabled_providers().collect();
+                    if !choices.contains(&session.provider) {
+                        choices.push(session.provider);
+                    }
+                    for provider in choices {
+                        ui.selectable_value(&mut session.provider, provider, provider.label());
+                    }
+                });
+        })
+        .response
+        .on_disabled_hover_text("A conversation stays with one agent. Start a new session to use another.");
+        ui.separator();
         ui.label("Permissions:");
         egui::ComboBox::from_id_salt("permission_mode")
             .selected_text(session.permission_mode.label())
@@ -50,12 +75,12 @@ pub fn header(ui: &mut egui::Ui, session: &mut Session, show_sessions: &mut bool
     action
 }
 
-pub fn composer(ui: &mut egui::Ui, session: &mut Session, claude_available: bool) -> ComposerAction {
+pub fn composer(ui: &mut egui::Ui, session: &mut Session, agent_installed: bool) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
     let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-    let can_send = claude_available && !session.is_running() && !session.input.trim().is_empty();
+    let can_send = agent_installed && !session.is_running() && !session.input.trim().is_empty();
 
     ui.add_space(6.0);
     let response = ui.add(
@@ -63,7 +88,7 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, claude_available: bool
             .id(composer_id)
             .desired_rows(3)
             .desired_width(f32::INFINITY)
-            .hint_text("Ask Claude…  (Enter to send, Shift+Enter for a new line)"),
+            .hint_text(format!("Ask {}…  (Enter to send, Shift+Enter for a new line)", session.provider.short_name())),
     );
     if std::mem::take(&mut session.focus_composer) {
         response.request_focus();
@@ -73,7 +98,7 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, claude_available: bool
     ui.horizontal(|ui| {
         if session.is_running() {
             ui.spinner();
-            ui.label("Claude is working…");
+            ui.label(format!("{} is working…", session.provider.short_name()));
             if ui.button("Stop").clicked() {
                 action = ComposerAction::Stop;
             }
@@ -94,7 +119,13 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session) {
             if session.entries.is_empty() && session.streaming.is_empty() {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("Pick a project folder and ask Claude something.").weak());
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Pick a project folder and ask {} something.",
+                            session.provider.short_name()
+                        ))
+                        .weak(),
+                    );
                 });
             }
             for (index, entry) in session.entries.iter().enumerate() {
@@ -120,7 +151,7 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
                 });
             ui.add_space(4.0);
         }
-        Entry::Claude(text) => {
+        Entry::Agent(text) => {
             ui.label(text);
         }
         Entry::Tool { name, detail } => {

@@ -1,11 +1,14 @@
 // Release builds on Windows open without a console window behind the app.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod app;
 mod browser;
 mod chat;
 mod claude;
+mod gemini;
 mod session;
+mod settings;
 mod terminal;
 
 use eframe::egui;

@@ -255,11 +255,18 @@ impl Drop for Terminal {
     }
 }
 
-/// Shows the terminal for a session, starting it the first time.
-pub fn show(ui: &mut egui::Ui, slot: &mut Option<Result<Terminal, String>>, cwd: &Path) {
+/// Shows the terminal for a session, starting it the first time. `typed` is
+/// text to send to the shell as if the user had typed it.
+pub fn show(ui: &mut egui::Ui, slot: &mut Option<Result<Terminal, String>>, cwd: &Path, typed: Option<String>) {
     let terminal = slot.get_or_insert_with(|| Terminal::start(cwd, ui.ctx().clone()));
     let restart = match terminal {
-        Ok(terminal) => terminal.ui(ui),
+        Ok(terminal) => {
+            if let Some(text) = typed {
+                terminal.parser().screen_mut().set_scrollback(0);
+                write_all(&terminal.writer, text.as_bytes());
+            }
+            terminal.ui(ui)
+        }
         Err(error) => {
             ui.colored_label(ui.visuals().error_fg_color, error.as_str());
             ui.button("Try again").clicked()
