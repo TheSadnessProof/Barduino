@@ -2,7 +2,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod browser;
+mod chat;
 mod claude;
+mod session;
+mod terminal;
 
 use eframe::egui;
 
@@ -10,13 +14,13 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Barduino")
-            .with_inner_size([960.0, 720.0])
-            .with_min_inner_size([520.0, 400.0]),
+            .with_inner_size([1400.0, 850.0])
+            .with_min_inner_size([900.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(
         "Barduino",
         options,
-        Box::new(|_cc| Ok(Box::new(app::BarduinoApp::new()))),
+        Box::new(|cc| Ok(Box::new(app::BarduinoApp::new(cc)))),
     )
 }

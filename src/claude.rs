@@ -4,11 +4,11 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Something that happened during a turn, in a form the UI can display.
@@ -33,7 +33,7 @@ pub enum AgentEvent {
 }
 
 /// What Claude is allowed to do without asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PermissionMode {
     ReadOnly,
     AcceptEdits,
@@ -80,6 +80,13 @@ impl RunningTurn {
     }
 }
 
+impl Drop for RunningTurn {
+    // Deleting a session or closing the app shouldn't leave Claude running in the background.
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Finds the `claude` executable on PATH or in the usual install locations.
 pub fn find_executable() -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) {
@@ -109,13 +116,12 @@ pub fn find_executable() -> Option<PathBuf> {
     fallbacks.into_iter().find(|candidate| candidate.is_file())
 }
 
-/// Starts one turn of the conversation. Events are sent to `events`, and
-/// `notify` is called after each one so the UI can redraw.
+/// Starts one turn of the conversation. `on_event` is called from a background
+/// thread for each event.
 pub fn start_turn(
     exe: &Path,
     turn: Turn,
-    events: Sender<AgentEvent>,
-    notify: impl Fn() + Send + 'static,
+    on_event: impl Fn(AgentEvent) + Send + 'static,
 ) -> std::io::Result<RunningTurn> {
     let mut cmd = Command::new(exe);
     cmd.args(["-p", "--verbose", "--output-format", "stream-json", "--include-partial-messages"])
@@ -155,15 +161,10 @@ pub fn start_turn(
 
     let waiter = Arc::clone(&child);
     thread::spawn(move || {
-        let send = |event: AgentEvent| {
-            let _ = events.send(event);
-            notify();
-        };
-
         for line in BufReader::new(stdout).split(b'\n') {
             let Ok(line) = line else { break };
             for event in parse_line(&String::from_utf8_lossy(&line)) {
-                send(event);
+                on_event(event);
             }
         }
 
@@ -174,7 +175,7 @@ pub fn start_turn(
             Ok(status) => Some(format!("The Claude CLI exited with {status}. {}", stderr.trim())),
             Err(err) => Some(format!("Lost track of the Claude CLI: {err}")),
         };
-        send(AgentEvent::Exited { error });
+        on_event(AgentEvent::Exited { error });
     });
 
     Ok(RunningTurn { child })
