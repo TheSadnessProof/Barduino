@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy --all-targets --message-format short",
+            "statusMessage": "Checking the build and lints",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}

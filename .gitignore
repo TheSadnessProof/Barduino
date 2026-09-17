@@ -1,1 +1,5 @@
 /target
+
+# Machine-local agent settings; the shared ones are committed.
+.claude/settings.local.json
+.gemini/settings.local.json

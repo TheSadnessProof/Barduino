@@ -1,0 +1,6 @@
+# Fitted to the existing code, which is wider and more compact than rustfmt
+# defaults. This is damage control, not a mandate: see rule 3.3 in AGENTS.md —
+# do not run `cargo fmt` over this repo, it still rewrites ~456 lines it has no
+# business touching. Match the surrounding style by hand.
+max_width = 120
+use_small_heuristics = "Max"

@@ -1,0 +1,4 @@
+# Keep line endings stable so touched files do not show up as whole-file diffs.
+* text=auto eol=lf
+*.png binary
+*.ico binary
