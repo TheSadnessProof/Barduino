@@ -39,16 +39,19 @@ pub struct Tools {
     tabs: Vec<Tab>,
     active: usize,
     next_terminal_number: u64,
-    browser: Browser,
+}
+
+impl Default for Tools {
+    fn default() -> Self {
+        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1 }
+    }
 }
 
 impl Tools {
-    pub fn new(browser_state: BrowserState) -> Self {
-        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1, browser: Browser::new(browser_state) }
-    }
 
-    pub fn browser_state(&self) -> &BrowserState {
-        &self.browser.state
+    /// Whether this panel is the one showing the shared WebView.
+    pub fn shows_browser(&self) -> bool {
+        matches!(self.tabs.get(self.active), Some(Tab::Browser))
     }
 
     /// Opens a new terminal in `cwd`, optionally typing a command into it.
@@ -111,23 +114,15 @@ impl Tools {
         }
     }
 
-    fn close(&mut self, index: usize) {
+    /// Closes tab `index`. `browser` is given up when it was the browser tab.
+    fn close(&mut self, index: usize, browser: &mut Browser) {
         // Dropping a terminal tab stops its shell.
         if let Tab::Browser = self.tabs.remove(index) {
-            self.browser.close();
+            browser.close();
         }
         if self.active >= index && self.active > 0 {
             self.active -= 1;
         }
-    }
-
-    /// Hides the browser page; call this whenever the panel itself isn't shown.
-    pub fn hide_browser(&mut self) {
-        self.browser.hide();
-    }
-
-    pub fn release_focus_on_click(&self, ctx: &egui::Context) {
-        self.browser.release_focus_on_click(ctx);
     }
 
     /// The "+" menu. `cwd` is where a new terminal starts. Returns true when a tab was opened.
@@ -155,8 +150,18 @@ impl Tools {
         opened
     }
 
-    /// Draws the expanded panel. `collapse` is set when the user hides it.
-    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, cwd: &Path, collapse: &mut bool) -> ToolsAction {
+    /// Draws the expanded panel. `browser` is the one WebView every session shares,
+    /// and `page` is what this session wants shown in it. `collapse` is set when the
+    /// user hides the panel.
+    pub fn ui(
+        &mut self,
+        browser: &mut Browser,
+        page: &mut BrowserState,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        cwd: &Path,
+        collapse: &mut bool,
+    ) -> ToolsAction {
         let mut close = None;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
@@ -183,7 +188,10 @@ impl Tools {
                         egui::UiBuilder::new().id_salt(("tool_tab", index)).sense(egui::Sense::click()),
                         |ui| {
                             let response = ui.response();
-                            let hovered = response.hovered() || ui.rect_contains_pointer(ui.max_rect());
+                            // `ui.response()` already reports the tab's own rect from the last
+                            // pass. Falling back to `max_rect` would cover the rest of the strip,
+                            // so hovering one tab lit up every tab before it.
+                            let hovered = response.hovered();
                             let visuals = ui.style().interact_selectable(&response, is_active);
                             let fill = if is_active {
                                 visuals.weak_bg_fill
@@ -192,11 +200,17 @@ impl Tools {
                             } else {
                                 egui::Color32::TRANSPARENT
                             };
-                            let stroke = if is_active {
-                                visuals.bg_stroke
-                            } else {
-                                egui::Stroke::NONE
-                            };
+                            // A Frame counts its stroke width as margin, so a stroke that
+                            // appeared on hover would resize this tab and shift every tab
+                            // after it. The width stays fixed; only the colour changes.
+                            let stroke = egui::Stroke::new(
+                                1.0,
+                                if is_active {
+                                    ui.visuals().selection.stroke.color
+                                } else {
+                                    egui::Color32::TRANSPARENT
+                                },
+                            );
 
                             egui::Frame::new()
                                 .fill(fill)
@@ -243,15 +257,14 @@ impl Tools {
         });
         ui.separator();
         if let Some(index) = close {
-            self.close(index);
+            self.close(index, browser);
             if self.tabs.is_empty() {
                 *collapse = true;
             }
         }
 
-        let browser_shown = matches!(self.tabs.get(self.active), Some(Tab::Browser));
-        if !browser_shown {
-            self.browser.hide();
+        if !self.shows_browser() {
+            browser.hide();
         }
 
         let mut action = ToolsAction::None;
@@ -274,7 +287,7 @@ impl Tools {
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.
                 let page_visible = !egui::Popup::is_any_open(ui.ctx());
-                match self.browser.ui(ui, frame, page_visible) {
+                match browser.ui(page, ui, frame, page_visible) {
                     BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
                     BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
                     BrowserAction::None => {}
@@ -291,16 +304,37 @@ mod tests {
 
     #[test]
     fn tools_starts_empty() {
-        let tools = Tools::new(BrowserState::default());
-        assert!(tools.tabs.is_empty());
+        assert!(Tools::default().tabs.is_empty());
     }
 
     #[test]
     fn closing_tab_removes_it() {
-        let mut tools = Tools::new(BrowserState::default());
+        let mut tools = Tools::default();
         tools.open_terminal(Path::new("."), None);
         assert_eq!(tools.tabs.len(), 1);
-        tools.close(0);
+        tools.close(0, &mut Browser::default());
         assert!(tools.tabs.is_empty());
+    }
+
+    #[test]
+    fn each_session_keeps_its_own_tabs() {
+        // What app.rs does: one panel per session, looked up by session id.
+        let mut panels: std::collections::BTreeMap<u64, Tools> = std::collections::BTreeMap::new();
+        panels.entry(1).or_default().open_terminal(Path::new("."), None);
+        panels.entry(1).or_default().open_browser();
+        panels.entry(2).or_default().open_terminal(Path::new("."), None);
+
+        assert_eq!(panels[&1].tabs.len(), 2, "the first session kept both of its tabs");
+        assert_eq!(panels[&2].tabs.len(), 1, "the second session started fresh");
+        assert!(panels[&1].shows_browser(), "the browser is the tab the first session is on");
+        assert!(!panels[&2].shows_browser(), "so the second session isn't showing the page");
+
+        // Terminal numbering is per session, so both call their first one "Terminal".
+        let numbers: Vec<u64> = panels
+            .values()
+            .flat_map(|panel| panel.tabs.iter())
+            .filter_map(|tab| if let Tab::Terminal { number, .. } = tab { Some(*number) } else { None })
+            .collect();
+        assert_eq!(numbers, [1, 1]);
     }
 }

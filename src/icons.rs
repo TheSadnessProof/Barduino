@@ -17,6 +17,16 @@ pub enum Icon {
     /// A speech bubble, for leaving a comment on a web page.
     Comment,
     Settings,
+    /// A monitor on a stand, for showing a page at the panel's own size.
+    Desktop,
+    /// A portrait screen with a button, for the tablet page size.
+    Tablet,
+    /// A narrow portrait screen with a speaker slot, for the phone page size.
+    Mobile,
+    /// Points at a folded group of sessions.
+    ChevronRight,
+    /// Points at an open group of sessions.
+    ChevronDown,
 }
 
 const SIZE: f32 = 26.0;
@@ -108,6 +118,37 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 stroke,
             ));
+        }
+        // The three page sizes have to be told apart at about 14px, so they lean on
+        // shape rather than detail: wide, portrait, and narrow portrait.
+        Icon::Desktop => {
+            let screen = Rect::from_center_size(c - vec2(0.0, r * 0.18), vec2(r * 1.9, r * 1.3));
+            painter.rect_stroke(screen, 1.5, stroke, egui::StrokeKind::Inside);
+            let foot = screen.bottom() + r * 0.5;
+            painter.line_segment([pos2(c.x, screen.bottom()), pos2(c.x, foot)], stroke);
+            painter.line_segment([pos2(c.x - r * 0.5, foot), pos2(c.x + r * 0.5, foot)], stroke);
+        }
+        Icon::Tablet => {
+            let body = Rect::from_center_size(c, vec2(r * 1.4, r * 1.9));
+            painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.circle_filled(pos2(c.x, body.bottom() - r * 0.24), 1.0, color);
+        }
+        Icon::Mobile => {
+            let body = Rect::from_center_size(c, vec2(r * 0.95, r * 1.9));
+            painter.rect_stroke(body, 2.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [pos2(c.x - r * 0.2, body.top() + r * 0.28), pos2(c.x + r * 0.2, body.top() + r * 0.28)],
+                stroke,
+            );
+        }
+        Icon::ChevronRight | Icon::ChevronDown => {
+            let d = r * 0.5;
+            let arm = if matches!(icon, Icon::ChevronRight) {
+                [vec2(-d * 0.6, -d), vec2(d * 0.6, 0.0), vec2(-d * 0.6, d)]
+            } else {
+                [vec2(-d, -d * 0.6), vec2(0.0, d * 0.6), vec2(d, -d * 0.6)]
+            };
+            painter.add(egui::Shape::line(arm.iter().map(|offset| c + *offset).collect(), stroke));
         }
         Icon::Settings => {
             painter.circle_stroke(c, r * 0.4, stroke);

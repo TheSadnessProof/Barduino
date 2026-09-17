@@ -35,7 +35,7 @@ read the neighbours  →  edit  →  cargo check  →  cargo test  →  cargo cl
 | Command | Time | What it is for |
 | --- | --- | --- |
 | `cargo check` | **0.7s** warm | After *every* edit. No excuse to skip it. |
-| `cargo test` | **~2s**, 87 tests | Before you claim anything works. |
+| `cargo test` | **~2s** | Before you claim anything works. |
 | `cargo clippy --all-targets` | **~1s** | Currently **zero warnings**. Keep it there. |
 
 Clippy being at zero is a real invariant, not an aspiration. If your change adds
@@ -369,7 +369,7 @@ file yourself before starting that kind of change** — they are plain Markdown:
 Do not report a change as complete until all of these are true:
 
 - [ ] `cargo check` passes.
-- [ ] `cargo test` passes — 87 tests, none newly ignored.
+- [ ] `cargo test` passes, with nothing newly ignored.
 - [ ] `cargo clippy --all-targets` is still at **zero** warnings.
 - [ ] New behaviour has a test, named as a sentence.
 - [ ] Touched a parser? A `testdata/` fixture covers it, and junk input still

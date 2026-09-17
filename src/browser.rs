@@ -6,43 +6,77 @@ use serde::{Deserialize, Serialize};
 
 use crate::icons::{self, Icon};
 
+/// The sizes the device buttons set, in CSS pixels.
+pub const TABLET_SIZE: [u32; 2] = [768, 1024];
+pub const MOBILE_SIZE: [u32; 2] = [375, 812];
+
 /// The page size to show the site at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Viewport {
     /// Fill the panel.
     #[default]
     Desktop,
-    Tablet,
-    Mobile,
-    Custom,
-}
-
-impl Viewport {
-    const ALL: [Viewport; 4] = [Self::Desktop, Self::Tablet, Self::Mobile, Self::Custom];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Desktop => "Desktop",
-            Self::Tablet => "Tablet",
-            Self::Mobile => "Mobile",
-            Self::Custom => "Custom",
-        }
-    }
+    /// The size in the pixel boxes, which the device buttons preset.
+    Fixed,
 }
 
 /// Browser choices that are saved between launches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(from = "SavedBrowserState")]
 pub struct BrowserState {
     pub address: String,
     pub viewport: Viewport,
-    /// Width and height used by the Custom viewport, in CSS pixels.
-    pub custom_size: [u32; 2],
+    /// The size the `Fixed` viewport shows the page at, in CSS pixels.
+    pub size: [u32; 2],
 }
 
 impl Default for BrowserState {
     fn default() -> Self {
-        Self { address: String::new(), viewport: Viewport::Desktop, custom_size: [1280, 800] }
+        Self { address: String::new(), viewport: Viewport::Desktop, size: [1280, 800] }
+    }
+}
+
+/// Saves written before the device buttons replaced the Tablet, Mobile and Custom
+/// presets still name them, and still call the size `custom_size`.
+#[derive(Deserialize)]
+#[serde(default)]
+struct SavedBrowserState {
+    address: String,
+    viewport: SavedViewport,
+    /// The size the old Custom preset used.
+    custom_size: [u32; 2],
+    /// The size the pixel boxes chose. Zeroes mean the save predates them, and
+    /// zeroes rather than an `Option` because RON insists on `Some(…)` for those.
+    size: [u32; 2],
+}
+
+impl Default for SavedBrowserState {
+    fn default() -> Self {
+        let BrowserState { address, size, .. } = BrowserState::default();
+        Self { address, viewport: SavedViewport::Desktop, custom_size: size, size: [0, 0] }
+    }
+}
+
+#[derive(Clone, Copy, Default, Deserialize)]
+enum SavedViewport {
+    #[default]
+    Desktop,
+    Tablet,
+    Mobile,
+    Custom,
+    Fixed,
+}
+
+impl From<SavedBrowserState> for BrowserState {
+    fn from(saved: SavedBrowserState) -> Self {
+        let chosen = if saved.size == [0, 0] { saved.custom_size } else { saved.size };
+        let (viewport, size) = match saved.viewport {
+            SavedViewport::Desktop => (Viewport::Desktop, chosen),
+            SavedViewport::Tablet => (Viewport::Fixed, TABLET_SIZE),
+            SavedViewport::Mobile => (Viewport::Fixed, MOBILE_SIZE),
+            SavedViewport::Custom | SavedViewport::Fixed => (Viewport::Fixed, chosen),
+        };
+        Self { address: saved.address, viewport, size }
     }
 }
 
@@ -133,34 +167,45 @@ pub enum BrowserAction {
     Send(Vec<PickedElement>),
 }
 
+/// The single system WebView, which every session takes turns showing. What each
+/// session wants shown in it lives in its own [`BrowserState`].
 pub struct Browser {
-    pub state: BrowserState,
     mode: Mode,
     /// Comments waiting to be sent, in the order they were left.
     comments: Vec<Comment>,
     /// The comment whose note should take the keyboard next time it's drawn.
     focus_note: Option<u32>,
+    /// The page's size last frame, so the pixel boxes can report what filling the
+    /// panel actually works out to.
+    page_size: [u32; 2],
+    /// The address the WebView is actually showing, which is how switching session
+    /// is noticed: the session's own address no longer matches it.
+    loaded: String,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
 }
 
-impl Browser {
-    pub fn new(state: BrowserState) -> Self {
+impl Default for Browser {
+    fn default() -> Self {
         Self {
-            state,
             mode: Mode::Off,
             comments: Vec::new(),
             focus_note: None,
+            page_size: BrowserState::default().size,
+            loaded: String::new(),
             #[cfg(any(windows, target_os = "macos"))]
             native: None,
         }
     }
+}
 
+impl Browser {
     /// Closes the page. It opens again the next time the browser tab is shown.
     pub fn close(&mut self) {
         self.mode = Mode::Off;
         self.comments.clear();
         self.focus_note = None;
+        self.loaded.clear();
         #[cfg(any(windows, target_os = "macos"))]
         {
             self.native = None;
@@ -168,7 +213,13 @@ impl Browser {
     }
 
     #[cfg(not(any(windows, target_os = "macos")))]
-    pub fn ui(&mut self, ui: &mut egui::Ui, _frame: &eframe::Frame, _page_visible: bool) -> BrowserAction {
+    pub fn ui(
+        &mut self,
+        _state: &mut BrowserState,
+        ui: &mut egui::Ui,
+        _frame: &eframe::Frame,
+        _page_visible: bool,
+    ) -> BrowserAction {
         ui.label("The built-in browser isn't available on this platform yet.");
         BrowserAction::None
     }
@@ -182,11 +233,27 @@ impl Browser {
     /// Draws the browser. `page_visible` is false while something (such as an
     /// open menu) needs to draw over the area where the page would be.
     #[cfg(any(windows, target_os = "macos"))]
-    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, page_visible: bool) -> BrowserAction {
+    pub fn ui(
+        &mut self,
+        state: &mut BrowserState,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        page_visible: bool,
+    ) -> BrowserAction {
         use native::Command;
 
         let mut commands = Vec::new();
         let mut result = BrowserAction::None;
+
+        // A different session's page belongs in the WebView now, and the comments
+        // left on the last one aren't about this page.
+        let wanted = normalize_url(&state.address);
+        if !self.loaded.is_empty() && self.loaded != wanted {
+            commands.push(Command::Load(wanted));
+            self.mode = Mode::Off;
+            self.comments.clear();
+            self.focus_note = None;
+        }
 
         // Messages from the page arrive between frames.
         if let Some(Ok(browser)) = &self.native {
@@ -226,28 +293,48 @@ impl Browser {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let go = ui.button("Go").clicked();
                 let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.state.address)
+                    egui::TextEdit::singleline(&mut state.address)
                         .desired_width(f32::INFINITY)
                         .hint_text("Enter a URL, e.g. localhost:3000"),
                 );
                 address_focused = field.has_focus();
                 let submitted = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if submitted || go {
-                    self.state.address = normalize_url(&self.state.address);
-                    commands.push(Command::Load(self.state.address.clone()));
+                    state.address = normalize_url(&state.address);
+                    commands.push(Command::Load(state.address.clone()));
                 }
             });
         });
 
         ui.horizontal(|ui| {
-            for viewport in Viewport::ALL {
-                ui.selectable_value(&mut self.state.viewport, viewport, viewport.label());
+            // Desktop means "fill the panel"; the other two are shortcuts for the
+            // pixel boxes beside them, which are what actually decide the size.
+            let fitting = state.viewport == Viewport::Desktop;
+            if icons::toggle(ui, Icon::Desktop, "Fit the panel", fitting).clicked() {
+                state.viewport = Viewport::Desktop;
             }
-            if self.state.viewport == Viewport::Custom {
-                let [width, height] = &mut self.state.custom_size;
-                ui.add(egui::DragValue::new(width).range(200..=3840).suffix(" px"));
-                ui.label("×");
-                ui.add(egui::DragValue::new(height).range(200..=2400).suffix(" px"));
+            for (icon, name, preset) in
+                [(Icon::Tablet, "Tablet", TABLET_SIZE), (Icon::Mobile, "Mobile", MOBILE_SIZE)]
+            {
+                let [width, height] = preset;
+                let tip = format!("{name} — {width} × {height}");
+                let chosen = !fitting && state.size == preset;
+                if icons::toggle(ui, icon, &tip, chosen).clicked() {
+                    state.viewport = Viewport::Fixed;
+                    state.size = preset;
+                }
+            }
+
+            // While the page fills the panel the boxes report the size that comes out
+            // of that, and typing in one switches to that size instead.
+            let mut size = if fitting { self.page_size } else { state.size };
+            let [width, height] = &mut size;
+            let mut retyped = ui.add(egui::DragValue::new(width).range(200..=3840).suffix(" px")).changed();
+            ui.label("×");
+            retyped |= ui.add(egui::DragValue::new(height).range(200..=2400).suffix(" px")).changed();
+            if retyped {
+                state.viewport = Viewport::Fixed;
+                state.size = size;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let commenting = self.mode == Mode::Commenting;
@@ -296,10 +383,13 @@ impl Browser {
 
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
-        let (page, zoom) = page_rect(area, self.state.viewport, self.state.custom_size);
-        if self.state.viewport != Viewport::Desktop {
+        let (page, zoom) = page_rect(area, state.viewport, state.size);
+        if state.viewport == Viewport::Desktop {
+            // Filling the panel has no size of its own, so remember what it came to.
+            self.page_size = [page.width().max(0.0) as u32, page.height().max(0.0) as u32];
+        } else {
             ui.painter().rect_filled(area, 0.0, ui.visuals().extreme_bg_color);
-            let [width, height] = viewport_size(self.state.viewport, self.state.custom_size);
+            let [width, height] = viewport_size(state.viewport, state.size);
             ui.painter().text(
                 egui::pos2(area.center().x, page.bottom() + 12.0),
                 egui::Align2::CENTER_CENTER,
@@ -309,7 +399,7 @@ impl Browser {
             );
         }
 
-        let url = normalize_url(&self.state.address);
+        let url = normalize_url(&state.address);
         let native = self.native.get_or_insert_with(|| native::NativeBrowser::create(ui.ctx(), frame, &url));
         match native {
             Ok(browser) => {
@@ -323,13 +413,16 @@ impl Browser {
                 }
                 // Follow links clicked inside the page, unless the user is typing an address.
                 if !address_focused && let Some(url) = browser.url() {
-                    self.state.address = url;
+                    state.address = url;
                 }
             }
             Err(error) => {
                 ui.colored_label(ui.visuals().error_fg_color, error.as_str());
             }
         }
+        // Recorded last, so an address the user typed or a link they followed counts
+        // as already loaded rather than as a switch to undo next frame.
+        self.loaded = normalize_url(&state.address);
         result
     }
 
@@ -493,25 +586,24 @@ fn shorten(text: &str, max: usize) -> String {
     short
 }
 
-/// The page size in CSS pixels, or the area's own size for Desktop.
-fn viewport_size(viewport: Viewport, custom_size: [u32; 2]) -> [u32; 2] {
+/// The page size in CSS pixels, or zeroes for Desktop, which has no size of its
+/// own because it takes the panel's.
+fn viewport_size(viewport: Viewport, size: [u32; 2]) -> [u32; 2] {
     match viewport {
         Viewport::Desktop => [0, 0],
-        Viewport::Tablet => [768, 1024],
-        Viewport::Mobile => [375, 812],
-        Viewport::Custom => custom_size,
+        Viewport::Fixed => size,
     }
 }
 
 /// Where to put the page inside `area`, and how far to zoom it out so a device
 /// size that is bigger than the panel still fits while keeping its CSS width.
-fn page_rect(area: egui::Rect, viewport: Viewport, custom_size: [u32; 2]) -> (egui::Rect, f32) {
+fn page_rect(area: egui::Rect, viewport: Viewport, size: [u32; 2]) -> (egui::Rect, f32) {
     if viewport == Viewport::Desktop {
         return (area, 1.0);
     }
     const MARGIN: f32 = 12.0;
     const CAPTION: f32 = 24.0;
-    let [width, height] = viewport_size(viewport, custom_size).map(|v| v.max(1) as f32);
+    let [width, height] = viewport_size(viewport, size).map(|v| v.max(1) as f32);
     let room = egui::vec2((area.width() - 2.0 * MARGIN).max(50.0), (area.height() - MARGIN - CAPTION).max(50.0));
     let zoom = (room.x / width).min(room.y / height).min(1.0);
     let size = egui::vec2(width, height) * zoom;
@@ -707,15 +799,45 @@ mod tests {
         let (desktop, zoom) = page_rect(area, Viewport::Desktop, [0, 0]);
         assert_eq!((desktop, zoom), (area, 1.0));
 
-        let (mobile, zoom) = page_rect(area, Viewport::Mobile, [0, 0]);
+        let (mobile, zoom) = page_rect(area, Viewport::Fixed, MOBILE_SIZE);
         assert!(zoom < 1.0, "812 px tall doesn't fit in 600");
         assert!((mobile.width() / mobile.height() - 375.0 / 812.0).abs() < 0.001, "keeps the phone's shape");
         assert!(area.contains_rect(mobile));
 
         let big = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(2000.0, 2000.0));
-        let (tablet, zoom) = page_rect(big, Viewport::Tablet, [0, 0]);
+        let (tablet, zoom) = page_rect(big, Viewport::Fixed, TABLET_SIZE);
         assert_eq!(zoom, 1.0);
         assert_eq!(tablet.size(), egui::vec2(768.0, 1024.0));
+    }
+
+    #[test]
+    fn saved_device_presets_become_a_fixed_size() {
+        let load = |json: &str| serde_json::from_str::<BrowserState>(json).expect(json);
+
+        // The presets were named before the pixel boxes replaced them.
+        let tablet = load(r#"{"address":"localhost:3000","viewport":"Tablet","custom_size":[1280,800]}"#);
+        assert_eq!((tablet.viewport, tablet.size), (Viewport::Fixed, TABLET_SIZE));
+        assert_eq!(tablet.address, "localhost:3000", "the address survives the move");
+        let mobile = load(r#"{"viewport":"Mobile","custom_size":[1280,800]}"#);
+        assert_eq!((mobile.viewport, mobile.size), (Viewport::Fixed, MOBILE_SIZE));
+
+        // Custom carried its size in a field of its own.
+        let custom = load(r#"{"viewport":"Custom","custom_size":[900,1400]}"#);
+        assert_eq!((custom.viewport, custom.size), (Viewport::Fixed, [900, 1400]));
+
+        // Desktop still fills the panel, and saves written since read straight through.
+        assert_eq!(load(r#"{"viewport":"Desktop"}"#).viewport, Viewport::Desktop);
+        let fixed = load(r#"{"viewport":"Fixed","size":[430,932]}"#);
+        assert_eq!((fixed.viewport, fixed.size), (Viewport::Fixed, [430, 932]));
+        assert_eq!(load("{}").size, BrowserState::default().size, "an empty save is the default");
+
+        // The app saves in RON, which is stricter than JSON, so the round trip is
+        // what actually has to hold.
+        let chosen = BrowserState { address: "x".into(), viewport: Viewport::Fixed, size: [430, 932] };
+        let written = ron::to_string(&chosen).expect("should save");
+        assert_eq!(ron::from_str::<BrowserState>(&written).expect(&written), chosen);
+        let old = "(address: \"x\", viewport: Mobile, custom_size: (1280, 800))";
+        assert_eq!(ron::from_str::<BrowserState>(old).expect(old).size, MOBILE_SIZE);
     }
 
     #[test]

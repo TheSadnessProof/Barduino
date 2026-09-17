@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
-use crate::browser::PickedElement;
+use crate::browser::{BrowserState, PickedElement};
 use crate::line_diff::FileEdit;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
@@ -99,6 +99,10 @@ pub struct Session {
     /// Page elements attached to the unsent message.
     #[serde(default)]
     pub elements: Vec<PickedElement>,
+    /// What this session wants shown in the shared browser. Each session has its
+    /// own, so switching session changes the page rather than keeping the last one.
+    #[serde(default)]
+    pub browser: BrowserState,
 
     /// Text the agent is still streaming, shown below the finished entries.
     #[serde(skip)]
@@ -129,6 +133,7 @@ impl Session {
             entries: Vec::new(),
             input: String::new(),
             elements: Vec::new(),
+            browser: BrowserState::default(),
             streaming: String::new(),
             focus_composer: true,
             turn: None,

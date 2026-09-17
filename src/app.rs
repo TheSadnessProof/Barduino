@@ -5,7 +5,7 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, PermissionMode, Provider};
-use crate::browser::BrowserState;
+use crate::browser::{Browser, BrowserState};
 use crate::chat::{self, ComposerAction};
 use crate::icons::{self, Icon};
 use crate::models::Catalog;
@@ -50,6 +50,17 @@ fn saved_before_panel_defaults() -> bool {
     true
 }
 
+/// Sessions saved before each of them had its own browser take the one address
+/// that used to be saved for the whole app, so nobody loses the page they had open.
+fn carry_browser_over(sessions: &mut [Session], saved: BrowserState) {
+    if saved == BrowserState::default() {
+        return;
+    }
+    for session in sessions.iter_mut().filter(|s| s.browser == BrowserState::default()) {
+        session.browser = saved.clone();
+    }
+}
+
 impl Default for SavedState {
     fn default() -> Self {
         Self {
@@ -74,7 +85,12 @@ pub struct BarduinoApp {
     view: View,
     settings_page: SettingsPage,
     sidebar: Sidebar,
-    tools: Tools,
+    /// The right-hand panel for each session, kept by session ID so switching
+    /// session swaps the tabs instead of carrying one project's into the next.
+    /// Terminals stay alive in here while their session is hidden.
+    tools: std::collections::BTreeMap<u64, Tools>,
+    /// The system WebView, which all the panels take turns showing.
+    browser: Browser,
     /// Set until the width egui remembers for the right panel has been forgotten.
     forget_panel_width: bool,
     /// Markdown the conversation has already laid out, kept so it isn't redone each frame.
@@ -108,7 +124,7 @@ impl BarduinoApp {
         }
         // The right tools panel starts closed by default on launch.
         state.show_tools = false;
-        let tools = Tools::new(state.browser.clone());
+        carry_browser_over(&mut state.sessions, std::mem::take(&mut state.browser));
         let (events_tx, events_rx) = mpsc::channel();
 
         let mut app = Self {
@@ -117,7 +133,8 @@ impl BarduinoApp {
             view: View::Chat,
             settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
-            tools,
+            tools: std::collections::BTreeMap::new(),
+            browser: Browser::default(),
             markdown: egui_commonmark::CommonMarkCache::default(),
             models: Catalog::default(),
             checked_free_plans: false,
@@ -154,6 +171,11 @@ impl BarduinoApp {
         }
     }
 
+    /// The right-hand panel belonging to the active session, started on first use.
+    fn active_tools(&mut self) -> &mut Tools {
+        self.tools.entry(self.state.active_session).or_default()
+    }
+
     fn active_session_mut(&mut self) -> &mut Session {
         let index = self.active_index();
         &mut self.state.sessions[index]
@@ -171,8 +193,14 @@ impl BarduinoApp {
 
     fn delete_session(&mut self, id: u64) {
         let Some(index) = self.state.sessions.iter().position(|s| s.id == id) else { return };
-        // Dropping the session stops its agent if it's still working.
+        // Dropping the session stops its agent if it's still working, and dropping
+        // its panel stops any shell it had open.
         let removed = self.state.sessions.remove(index);
+        if let Some(panel) = self.tools.remove(&id)
+            && panel.shows_browser()
+        {
+            self.browser.close();
+        }
 
         if self.state.sessions.is_empty() {
             self.new_session(removed.project_dir, removed.permission_mode);
@@ -212,10 +240,10 @@ impl BarduinoApp {
         }
         let cwd = self.tool_cwd();
         if terminal {
-            self.tools.show_terminal(&cwd);
+            self.active_tools().show_terminal(&cwd);
         }
         if browser {
-            self.tools.open_browser();
+            self.active_tools().open_browser();
         }
         self.state.show_tools = true;
     }
@@ -237,7 +265,7 @@ impl BarduinoApp {
         }
     }
 
-    fn handle_sidebar(&mut self, action: SidebarAction) {
+    fn handle_sidebar(&mut self, action: SidebarAction, ctx: &egui::Context) {
         match action {
             SidebarAction::None => {}
             SidebarAction::Select(id) => {
@@ -261,6 +289,15 @@ impl BarduinoApp {
             }
             SidebarAction::Collapse => self.state.show_sessions = false,
             SidebarAction::Expand => self.state.show_sessions = true,
+            SidebarAction::NewSessionIn(dir) => {
+                // Started from a project heading, so the folder is already settled.
+                let permission_mode = self.active_session_mut().permission_mode;
+                self.new_session(dir, permission_mode);
+            }
+            SidebarAction::OpenChanges(dir) => {
+                self.active_tools().open_changes(&dir, ctx);
+                self.state.show_tools = true;
+            }
         }
     }
 
@@ -323,7 +360,7 @@ impl BarduinoApp {
             SettingsAction::ResetUsage => self.state.usage.clear(),
             SettingsAction::OpenInTerminal(provider) => {
                 let cwd = self.tool_cwd();
-                self.tools.open_terminal(&cwd, Some(format!("{}\r", provider.command())));
+                self.active_tools().open_terminal(&cwd, Some(format!("{}\r", provider.command())));
                 self.state.show_tools = true;
             }
         }
@@ -384,11 +421,11 @@ impl BarduinoApp {
         let settings_open = self.view == View::Settings;
         let mut show = self.state.show_sessions;
         let action = egui::Panel::show_switched(ui, &mut show, collapsed, expanded, |ui, expanded| {
-            if expanded { sidebar.ui(ui, sessions, active, settings_open) } else { sidebar.rail(ui) }
+            if expanded { sidebar.ui(ui, sessions, active, settings_open) } else { sidebar.rail(ui, sessions) }
         })
         .inner;
         self.state.show_sessions = show;
-        self.handle_sidebar(action);
+        self.handle_sidebar(action, ui.ctx());
     }
 
     fn right_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
@@ -400,14 +437,20 @@ impl BarduinoApp {
             .default_size(default_width)
             .size_range(240.0..=1600.0);
         let cwd = self.tool_cwd();
-        let tools = &mut self.tools;
+        let index = self.active_index();
+        let id = self.state.active_session;
         let (mut collapse, mut expand) = (false, false);
         let mut show = self.state.show_tools;
+        // Three separate fields: this session's panel, the shared WebView, and the
+        // page this session wants in it.
+        let tools = self.tools.entry(id).or_default();
+        let browser = &mut self.browser;
+        let page = &mut self.state.sessions[index].browser;
         let action = egui::Panel::show_switched(ui, &mut show, collapsed, expanded, |ui, expanded| {
             if expanded {
-                return tools.ui(ui, frame, &cwd, &mut collapse);
+                return tools.ui(browser, page, ui, frame, &cwd, &mut collapse);
             }
-            tools.hide_browser();
+            browser.hide();
             ui.add_space(6.0);
             ui.vertical_centered(|ui| {
                 expand |= icons::button(ui, Icon::SidebarRight, "Show terminal and browser").clicked();
@@ -418,7 +461,7 @@ impl BarduinoApp {
         .inner;
         self.state.show_tools = (show || expand) && !collapse;
         if !self.state.show_tools {
-            self.tools.hide_browser();
+            self.browser.hide();
         }
         if collapse || expand {
             ui.ctx().request_repaint();
@@ -478,7 +521,11 @@ impl eframe::App for BarduinoApp {
                 }
                 // The agent may have edited files, so any diff of its folder is out of date.
                 if let AgentEvent::Exited { .. } = &event {
-                    self.tools.refresh_changes(&session.project_dir, ctx);
+                    for panel in self.tools.values_mut() {
+                        panel.refresh_changes(&session.project_dir, ctx);
+                    }
+                    // The project heading's changed count is out of date too.
+                    self.sidebar.invalidate(&session.project_dir);
                 }
                 session.handle_event(event);
             }
@@ -486,7 +533,7 @@ impl eframe::App for BarduinoApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        self.tools.release_focus_on_click(ui.ctx());
+        self.browser.release_focus_on_click(ui.ctx());
         self.left_panel(ui);
         self.right_panel(ui, frame);
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| match self.view {
@@ -496,7 +543,6 @@ impl eframe::App for BarduinoApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        self.state.browser = self.tools.browser_state().clone();
         eframe::set_value(storage, eframe::APP_KEY, &self.state);
     }
 }
@@ -504,6 +550,24 @@ impl eframe::App for BarduinoApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_one_saved_browser_address_reaches_every_old_session() {
+        let session = |id: u64| Session::new(id, PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
+        let mut sessions = vec![session(1), session(2)];
+        // One session had already chosen its own page and keeps it.
+        sessions[1].browser.address = "localhost:5173".into();
+
+        let saved = BrowserState { address: "localhost:3000".into(), ..BrowserState::default() };
+        carry_browser_over(&mut sessions, saved);
+        assert_eq!(sessions[0].browser.address, "localhost:3000", "the old address carries over");
+        assert_eq!(sessions[1].browser.address, "localhost:5173", "a session's own page wins");
+
+        // Nothing saved means nothing to carry, so new sessions stay on their default.
+        let mut fresh = vec![session(3)];
+        carry_browser_over(&mut fresh, BrowserState::default());
+        assert_eq!(fresh[0].browser, BrowserState::default());
+    }
 
     #[test]
     fn state_saved_before_the_panel_defaults_asks_for_them() {

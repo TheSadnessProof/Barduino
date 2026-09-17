@@ -115,6 +115,35 @@ pub fn working_tree_changes(dir: &Path) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
+/// A project at a glance, for the heading above its sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoSummary {
+    /// The branch name, or "detached" when HEAD isn't on one.
+    pub branch: String,
+    /// How many files differ from the last commit, untracked ones included.
+    pub changed: usize,
+}
+
+/// Reads the branch and changed-file count of the repository containing `dir`.
+/// This shells out to git twice, so it belongs on a background thread.
+pub fn summary(dir: &Path) -> Result<RepoSummary, String> {
+    let git = git_executable().ok_or("Git isn't installed.")?;
+    run_git(&git, dir, &["rev-parse", "--is-inside-work-tree"])
+        .map_err(|_| format!("{} isn't inside a git repository.", dir.display()))?;
+    let branch = run_git(&git, dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
+    let status = run_git(&git, dir, &["status", "--porcelain"])?;
+    Ok(parse_summary(&branch, &status))
+}
+
+/// Splits the two git answers into a summary. Separate so it can be tested
+/// without a repository on disk.
+fn parse_summary(branch: &str, status: &str) -> RepoSummary {
+    let branch = branch.trim();
+    // A detached HEAD answers "HEAD", which says nothing useful on its own.
+    let branch = if branch.is_empty() || branch == "HEAD" { "detached" } else { branch };
+    RepoSummary { branch: branch.to_owned(), changed: status.lines().filter(|line| !line.trim().is_empty()).count() }
+}
+
 /// The differences between two files anywhere on disk.
 pub fn compare_files(old: &Path, new: &Path) -> Result<Vec<FileDiff>, String> {
     let git = git_executable().ok_or("Git isn't installed, so files can't be compared.")?;
@@ -292,6 +321,27 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
     };
     let ((old_start, old_len), (new_start, new_len)) = (range(old)?, range(new)?);
     Some((old_start, old_len, new_start, new_len))
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    #[test]
+    fn a_summary_counts_changed_files_and_names_the_branch() {
+        let status = " M src/app.rs\n?? notes.txt\nA  src/new.rs\n";
+        assert_eq!(parse_summary("prod\n", status), RepoSummary { branch: "prod".into(), changed: 3 });
+
+        let clean = parse_summary("feature/icons\n", "");
+        assert_eq!(clean, RepoSummary { branch: "feature/icons".into(), changed: 0 });
+
+        // A detached HEAD answers with the word HEAD, which is no use as a label.
+        assert_eq!(parse_summary("HEAD\n", "").branch, "detached");
+        assert_eq!(parse_summary("", "").branch, "detached", "and so is no answer at all");
+
+        // Trailing blank lines in git's output aren't files.
+        assert_eq!(parse_summary("prod", " M a\n\n").changed, 1);
+    }
 }
 
 #[cfg(test)]
