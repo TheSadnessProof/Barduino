@@ -155,7 +155,7 @@ impl Session {
                 }
                 self.entries.push(Entry::ToolOutput { text, is_error });
             }
-            AgentEvent::Finished { session_id, error, denied_tools } => {
+            AgentEvent::Finished { session_id, error, denied_tools, .. } => {
                 self.keep_streamed_text();
                 // Resuming can hand back a new session ID; always continue from the latest one.
                 if session_id.is_some() {
@@ -242,7 +242,7 @@ mod tests {
         s.handle_event(AgentEvent::TextDelta("Let me look.".into()));
         s.handle_event(AgentEvent::ToolUse { name: "read_file".into(), detail: "a.txt".into() });
         s.handle_event(AgentEvent::TextDelta("Done.".into()));
-        s.handle_event(AgentEvent::Finished { session_id: None, error: None, denied_tools: Vec::new() });
+        s.handle_event(AgentEvent::Finished { session_id: None, error: None, denied_tools: Vec::new(), usage: None });
         assert_eq!(
             s.entries,
             vec![
@@ -269,6 +269,7 @@ mod tests {
             session_id: None,
             error: Some("API key not valid".into()),
             denied_tools: Vec::new(),
+            usage: None,
         });
         s.handle_event(AgentEvent::Exited { error: Some("Antigravity (agy) exited with code 1.".into()) });
         assert_eq!(s.entries, vec![Entry::Error("API key not valid".into())]);
@@ -282,6 +283,7 @@ mod tests {
             session_id: Some("second".into()),
             error: None,
             denied_tools: vec!["Bash".into(), "Write".into()],
+            usage: None,
         });
         assert_eq!(s.agent_session_id.as_deref(), Some("second"));
         assert!(matches!(&s.entries[..], [Entry::Notice(text)] if text.starts_with("Claude wasn't allowed to use: Bash, Write")));

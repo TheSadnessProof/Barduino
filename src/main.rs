@@ -13,6 +13,7 @@ mod settings;
 mod sidebar;
 mod terminal;
 mod tools;
+mod usage;
 
 use eframe::egui;
 

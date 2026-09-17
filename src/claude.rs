@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::{self, AgentEvent, PermissionMode, Turn, string, tool_detail};
+use crate::usage::Usage;
 
 /// Finds the `claude` executable on PATH or in the usual install locations.
 pub fn find_executable() -> Option<PathBuf> {
@@ -108,9 +109,25 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 session_id: msg["session_id"].as_str().map(str::to_owned),
                 error,
                 denied_tools,
+                usage: Some(result_usage(&msg)),
             }]
         }
         _ => Vec::new(),
+    }
+}
+
+/// Token counts from a `result` message. Claude reports cache reads and writes
+/// separately from the rest of the input.
+fn result_usage(msg: &Value) -> Usage {
+    let usage = &msg["usage"];
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    Usage {
+        turns: 1,
+        input: count("input_tokens"),
+        output: count("output_tokens"),
+        cache_read: count("cache_read_input_tokens"),
+        cache_write: count("cache_creation_input_tokens"),
+        cost_usd: msg["total_cost_usd"].as_f64(),
     }
 }
 
@@ -174,7 +191,22 @@ mod tests {
                 session_id: Some("abc".into()),
                 error: None,
                 denied_tools: vec!["Bash".into(), "Write".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
             }]
+        );
+    }
+
+    /// Real output from Claude Code 2.1.271 answering "hi".
+    #[test]
+    fn reads_usage_from_a_recorded_reply() {
+        let events: Vec<AgentEvent> =
+            include_str!("../testdata/claude_reply_hi.jsonl").lines().flat_map(parse_line).collect();
+        let Some(AgentEvent::Finished { usage: Some(usage), error: None, .. }) = events.last() else {
+            panic!("expected the turn to finish with usage: {events:?}");
+        };
+        assert_eq!(
+            *usage,
+            Usage { turns: 1, input: 2, output: 4, cache_read: 0, cache_write: 31984, cost_usd: Some(0.31995) }
         );
     }
 

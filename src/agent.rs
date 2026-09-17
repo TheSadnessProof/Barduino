@@ -11,10 +11,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::usage::Usage;
 use crate::{antigravity, claude};
 
 /// An agent CLI that can act as the brain of a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum Provider {
     #[default]
     Claude,
@@ -81,6 +82,8 @@ pub enum AgentEvent {
         session_id: Option<String>,
         error: Option<String>,
         denied_tools: Vec<String>,
+        /// Tokens the turn used, if the CLI reported them.
+        usage: Option<Usage>,
     },
     /// The CLI process ended. `error` is set if it didn't exit cleanly.
     Exited { error: Option<String> },
@@ -327,9 +330,12 @@ mod tests {
             },
         );
         println!("{first:#?}");
-        let Some(AgentEvent::Finished { session_id: Some(conversation), error: None, .. }) = first.last() else {
-            panic!("the first turn should finish cleanly");
+        let Some(AgentEvent::Finished { session_id: Some(conversation), error: None, usage: Some(usage), .. }) =
+            first.last()
+        else {
+            panic!("the first turn should finish cleanly and report usage");
         };
+        assert!(usage.input > 0 && usage.output > 0, "{usage:?}");
 
         let second = run_turn(
             Provider::Antigravity,

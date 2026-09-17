@@ -9,9 +9,10 @@ use crate::browser::BrowserState;
 use crate::chat::{self, ComposerAction};
 use crate::icons::{self, Icon};
 use crate::session::Session;
-use crate::settings::{self, Detected, Settings, SettingsAction};
+use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarAction};
 use crate::tools::{Tools, ToolsAction};
+use crate::usage::UsageLog;
 
 /// What the middle column shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -30,6 +31,7 @@ struct SavedState {
     show_sessions: bool,
     show_tools: bool,
     settings: Settings,
+    usage: UsageLog,
     browser: BrowserState,
     /// Where older versions saved the browser address. Only read, to carry it over.
     #[serde(skip_serializing)]
@@ -45,6 +47,7 @@ impl Default for SavedState {
             show_sessions: true,
             show_tools: true,
             settings: Settings::default(),
+            usage: UsageLog::default(),
             browser: BrowserState::default(),
             browser_address: String::new(),
         }
@@ -55,6 +58,7 @@ pub struct BarduinoApp {
     detected: Detected,
     state: SavedState,
     view: View,
+    settings_page: SettingsPage,
     sidebar: Sidebar,
     tools: Tools,
     /// Agent events, tagged with the ID of the session they belong to.
@@ -74,9 +78,10 @@ impl BarduinoApp {
         let (events_tx, events_rx) = mpsc::channel();
 
         let mut app = Self {
-            detected: Detected::scan(),
+            detected: Detected::scan(&state.settings, &cc.egui_ctx),
             state,
             view: View::Chat,
+            settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
             tools,
             events_tx,
@@ -185,13 +190,33 @@ impl BarduinoApp {
     }
 
     fn settings_area(&mut self, ui: &mut egui::Ui) {
-        let action = egui::CentralPanel::default()
-            .show(ui, |ui| settings::page(ui, &mut self.state.settings, &self.detected))
-            .inner;
+        let mut session_counts = std::collections::BTreeMap::new();
+        for session in &self.state.sessions {
+            *session_counts.entry(session.provider).or_default() += 1;
+        }
+        let context = PageContext { detected: &self.detected, usage: &self.state.usage, session_counts };
+        let (page, settings) = (&mut self.settings_page, &mut self.state.settings);
+        let action = egui::CentralPanel::default().show(ui, |ui| page.ui(ui, settings, &context)).inner;
+
         match action {
             SettingsAction::None => {}
             SettingsAction::Close => self.view = View::Chat,
-            SettingsAction::Rescan => self.detected = Detected::scan(),
+            SettingsAction::Rescan => self.detected = Detected::scan(&self.state.settings, ui.ctx()),
+            SettingsAction::ChooseExecutable(provider) => {
+                let mut dialog = rfd::FileDialog::new().set_title(format!("Choose the {} executable", provider.label()));
+                if let Some(dir) = self.detected.get(provider).and_then(|exe| exe.parent()) {
+                    dialog = dialog.set_directory(dir);
+                }
+                if let Some(exe) = dialog.pick_file() {
+                    self.state.settings.custom_executables.insert(provider, exe);
+                    self.detected = Detected::scan(&self.state.settings, ui.ctx());
+                }
+            }
+            SettingsAction::UseDetectedExecutable(provider) => {
+                self.state.settings.custom_executables.remove(&provider);
+                self.detected = Detected::scan(&self.state.settings, ui.ctx());
+            }
+            SettingsAction::ResetUsage => self.state.usage.clear(),
             SettingsAction::OpenInTerminal(provider) => {
                 let cwd = self.active_session_mut().project_dir.clone();
                 self.tools.open_terminal(&cwd, Some(format!("{}\r", provider.command())));
@@ -300,6 +325,9 @@ impl eframe::App for BarduinoApp {
         while let Ok((id, event)) = self.events_rx.try_recv() {
             // Events for a deleted session are dropped.
             if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
+                if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
+                    self.state.usage.record(session.provider, *usage);
+                }
                 session.handle_event(event);
             }
         }

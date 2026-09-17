@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::{self, AgentEvent, PermissionMode, Turn, string};
+use crate::usage::Usage;
 
 /// Finds `agy` on PATH or where the Antigravity installer puts it.
 pub fn find_executable() -> Option<PathBuf> {
@@ -77,9 +78,26 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 session_id: result["conversation_id"].as_str().map(str::to_owned),
                 error,
                 denied_tools,
+                usage: Some(result_usage(&result["usage"])),
             }]
         }
         _ => Vec::new(),
+    }
+}
+
+/// Token counts from a `result` message. agy follows the Gemini API, where the
+/// input count already includes cached tokens, so those are taken out of it here.
+/// Thinking tokens are part of the output count.
+fn result_usage(usage: &Value) -> Usage {
+    let count = |key: &str| usage[key].as_u64().unwrap_or(0);
+    let cache_read = count("cache_read_tokens");
+    Usage {
+        turns: 1,
+        input: count("input_tokens").saturating_sub(cache_read),
+        output: count("output_tokens"),
+        cache_read,
+        cache_write: 0,
+        cost_usd: None,
     }
 }
 
@@ -151,6 +169,7 @@ mod tests {
                 session_id: Some("b1752c20-bb81-4047-b2e1-480c12c67d6e".into()),
                 error: None,
                 denied_tools: Vec::new(),
+                usage: Some(Usage { turns: 1, input: 40709, output: 415, ..Default::default() }),
             })
         );
     }
