@@ -2,13 +2,12 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::Provider;
+use crate::agent::{Provider, hidden_command};
 use crate::usage::{self, Period, Usage, UsageLog};
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -109,15 +108,7 @@ impl Detected {
 
 /// Runs `<exe> --version` and keeps the first line, e.g. "2.1.271 (Claude Code)".
 fn read_version(exe: &Path) -> Option<String> {
-    let mut cmd = Command::new(exe);
-    cmd.arg("--version");
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = cmd.output().ok()?;
+    let output = hidden_command(exe).arg("--version").output().ok()?;
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines().map(str::trim).find(|line| !line.is_empty()).map(str::to_owned)
 }

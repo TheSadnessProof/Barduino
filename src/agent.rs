@@ -143,7 +143,7 @@ pub fn start_turn(
     turn: Turn,
     on_event: impl Fn(AgentEvent) + Send + 'static,
 ) -> std::io::Result<RunningTurn> {
-    let mut cmd = Command::new(exe);
+    let mut cmd = hidden_command(exe);
     let parse_line: fn(&str) -> Vec<AgentEvent> = match provider {
         Provider::Claude => {
             cmd.args(claude::args(&turn));
@@ -158,13 +158,6 @@ pub fn start_turn(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // Stops a console window from flashing up for the CLI.
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
 
     let mut child = cmd.spawn()?;
     let mut stdin = child.stdin.take().expect("stdin is piped");
@@ -205,6 +198,18 @@ pub fn start_turn(
     });
 
     Ok(RunningTurn { child })
+}
+
+/// A command for a background program that doesn't flash a console window on Windows.
+pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }
 
 fn wait(child: &Mutex<Child>) -> std::io::Result<ExitStatus> {

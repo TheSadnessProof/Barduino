@@ -5,8 +5,10 @@ mod agent;
 mod antigravity;
 mod app;
 mod browser;
+mod changes;
 mod chat;
 mod claude;
+mod git_diff;
 mod icons;
 mod session;
 mod settings;
@@ -14,6 +16,7 @@ mod sidebar;
 mod terminal;
 mod tools;
 mod usage;
+mod voice;
 
 use eframe::egui;
 

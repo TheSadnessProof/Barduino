@@ -1,10 +1,11 @@
-//! The right-hand panel: tabs for terminals and the browser, opened with "+".
+//! The right-hand panel: tabs for terminals, code changes and the browser, opened with "+".
 
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::browser::{Browser, BrowserAction, BrowserState};
+use crate::changes::{Changes, Source};
 use crate::icons::{self, Icon};
 use crate::terminal::{self, Terminal};
 
@@ -17,6 +18,7 @@ enum Tab {
         /// Typed into the shell once it has started.
         typed: Option<String>,
     },
+    Changes(Changes),
     /// There is at most one, because it shares the single browser window.
     Browser,
 }
@@ -49,6 +51,39 @@ impl Tools {
         self.next_terminal_number += 1;
         self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed });
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Shows the uncommitted changes in `dir`, reusing a tab that already does.
+    pub fn open_changes(&mut self, dir: &Path, ctx: &egui::Context) {
+        let existing = self.tabs.iter().position(|tab| matches!(tab, Tab::Changes(changes) if changes.watches(dir)));
+        match existing {
+            Some(index) => self.active = index,
+            None => {
+                self.tabs.push(Tab::Changes(Changes::new(Source::Project(dir.to_owned()), ctx)));
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// Asks for two files and shows how they differ. Returns false if the user cancelled.
+    fn compare_files(&mut self, dir: &Path, ctx: &egui::Context) -> bool {
+        let pick = |title: &str| rfd::FileDialog::new().set_title(title).set_directory(dir).pick_file();
+        let Some(old) = pick("Choose the original file") else { return false };
+        let Some(new) = pick("Choose the file to compare it with") else { return false };
+        self.tabs.push(Tab::Changes(Changes::new(Source::Files { old, new }, ctx)));
+        self.active = self.tabs.len() - 1;
+        true
+    }
+
+    /// Reloads Changes tabs for `dir`, e.g. after an agent finished working there.
+    pub fn refresh_changes(&mut self, dir: &Path, ctx: &egui::Context) {
+        for tab in &mut self.tabs {
+            if let Tab::Changes(changes) = tab
+                && changes.watches(dir)
+            {
+                changes.refresh(ctx);
+            }
+        }
     }
 
     /// Shows the browser tab, opening it if needed.
@@ -84,11 +119,19 @@ impl Tools {
     /// The "+" menu. `cwd` is where a new terminal starts. Returns true when a tab was opened.
     pub fn add_menu(&mut self, ui: &mut egui::Ui, cwd: &Path) -> bool {
         let mut opened = false;
-        let response = icons::button(ui, Icon::Plus, "Open a terminal or the browser");
+        let response = icons::button(ui, Icon::Plus, "Open a terminal, changes or the browser");
         egui::Popup::menu(&response).show(|ui| {
             if ui.button("Terminal").clicked() {
                 self.open_terminal(cwd, None);
                 opened = true;
+            }
+            if ui.button("Changes").on_hover_text("Uncommitted changes in this project").clicked() {
+                self.open_changes(cwd, ui.ctx());
+                opened = true;
+            }
+            if ui.button("Compare two files…").clicked() {
+                ui.close();
+                opened |= self.compare_files(cwd, ui.ctx());
             }
             if ui.button("Browser").clicked() {
                 self.open_browser();
@@ -108,6 +151,13 @@ impl Tools {
                     Tab::Terminal { number, cwd, .. } => {
                         let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
                         (title, cwd.display().to_string())
+                    }
+                    Tab::Changes(changes) => {
+                        let hover = match &changes.source {
+                            Source::Project(dir) => format!("Uncommitted changes in {}", dir.display()),
+                            Source::Files { old, new } => format!("{}\n→ {}", old.display(), new.display()),
+                        };
+                        (changes.title(), hover)
                     }
                     Tab::Browser => ("Browser".to_owned(), "Built-in browser".to_owned()),
                 };
@@ -143,12 +193,13 @@ impl Tools {
                 ui.add_space(40.0);
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("Nothing open").weak());
-                    ui.label(egui::RichText::new("Click + to open a terminal or the browser.").small().weak());
+                    ui.label(egui::RichText::new("Click + to open a terminal, changes or the browser.").small().weak());
                 });
             }
             Some(Tab::Terminal { number, cwd, terminal, typed }) => {
                 ui.push_id(("terminal", *number), |ui| terminal::show(ui, terminal, cwd, typed.take()));
             }
+            Some(Tab::Changes(changes)) => changes.ui(ui),
             Some(Tab::Browser) => {
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.

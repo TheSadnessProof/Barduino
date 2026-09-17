@@ -4,17 +4,35 @@ use eframe::egui;
 
 use crate::agent::{PermissionMode, Provider};
 use crate::session::{Entry, Session};
+use crate::icons::{self, Icon};
 use crate::settings::Settings;
+use crate::voice::VoiceError;
 
 pub enum ComposerAction {
     None,
     Send,
     Stop,
     ChangeFolder,
+    ToggleVoice,
+    OpenSpeechSettings,
+}
+
+/// Voice input state for the message box.
+pub struct Voice<'a> {
+    pub listening: bool,
+    /// Words heard so far that aren't final yet.
+    pub partial: &'a str,
+    pub error: Option<&'a VoiceError>,
 }
 
 /// The message box, with the agent, permission and folder pickers along its bottom edge.
-pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, agent_installed: bool) -> ComposerAction {
+pub fn composer(
+    ui: &mut egui::Ui,
+    session: &mut Session,
+    settings: &Settings,
+    agent_installed: bool,
+    voice: Voice<'_>,
+) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
     let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
@@ -43,6 +61,18 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, a
             if std::mem::take(&mut session.focus_composer) {
                 response.request_focus();
             }
+            if voice.listening {
+                let heard = if voice.partial.is_empty() { "Listening…" } else { voice.partial };
+                ui.add(egui::Label::new(egui::RichText::new(heard).italics().weak()).truncate());
+            }
+            if let Some(error) = voice.error {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(error.message()).small().color(ui.visuals().warn_fg_color));
+                    if *error == VoiceError::SpeechPrivacyOff && ui.link("Open speech settings").clicked() {
+                        action = ComposerAction::OpenSpeechSettings;
+                    }
+                });
+            }
 
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -65,6 +95,15 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, a
                         ui.spinner();
                     } else if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
                         action = ComposerAction::Send;
+                    }
+                    let mic_tip = if voice.listening { "Stop voice input" } else { "Voice input: speak to type" };
+                    let mic = icons::toggle(ui, Icon::Microphone, mic_tip, voice.listening);
+                    if voice.listening {
+                        // A red ring while the microphone is on.
+                        ui.painter().circle_stroke(mic.rect.center(), 12.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(229, 83, 75)));
+                    }
+                    if mic.clicked() {
+                        action = ComposerAction::ToggleVoice;
                     }
                     if !running && let Some(model) = &session.model {
                         ui.label(egui::RichText::new(model).small().weak());

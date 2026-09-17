@@ -13,6 +13,7 @@ use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsP
 use crate::sidebar::{Sidebar, SidebarAction};
 use crate::tools::{Tools, ToolsAction};
 use crate::usage::UsageLog;
+use crate::voice::{self, Dictation, VoiceError, VoiceEvent};
 
 /// What the middle column shows.
 #[derive(Clone, Copy, PartialEq)]
@@ -61,6 +62,10 @@ pub struct BarduinoApp {
     settings_page: SettingsPage,
     sidebar: Sidebar,
     tools: Tools,
+    /// Voice input in progress, and the session it types into.
+    dictation: Option<(u64, Dictation)>,
+    voice_partial: String,
+    voice_error: Option<VoiceError>,
     /// Agent events, tagged with the ID of the session they belong to.
     events_tx: Sender<(u64, AgentEvent)>,
     events_rx: Receiver<(u64, AgentEvent)>,
@@ -84,6 +89,9 @@ impl BarduinoApp {
             settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
             tools,
+            dictation: None,
+            voice_partial: String::new(),
+            voice_error: None,
             events_tx,
             events_rx,
         };
@@ -225,15 +233,59 @@ impl BarduinoApp {
         }
     }
 
+    fn toggle_voice(&mut self, ctx: &egui::Context) {
+        if let Some((_, dictation)) = &self.dictation {
+            // Stopping takes a moment while the last phrase comes in; the Stopped event clears it.
+            dictation.stop();
+            return;
+        }
+        self.voice_error = None;
+        self.voice_partial.clear();
+        self.dictation = Some((self.state.active_session, Dictation::start(ctx)));
+        self.active_session_mut().focus_composer = true;
+    }
+
+    fn handle_voice_events(&mut self) {
+        let Some((session_id, dictation)) = &self.dictation else { return };
+        let session_id = *session_id;
+        for event in dictation.poll() {
+            match event {
+                VoiceEvent::Partial(text) => self.voice_partial = text,
+                VoiceEvent::Final(text) => {
+                    self.voice_partial.clear();
+                    if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == session_id) {
+                        voice::append_phrase(&mut session.input, &text);
+                    }
+                }
+                VoiceEvent::Stopped(error) => {
+                    self.voice_error = error;
+                    self.voice_partial.clear();
+                    self.dictation = None;
+                    return;
+                }
+            }
+        }
+    }
+
     fn chat_area(&mut self, ui: &mut egui::Ui) {
+        // Voice input belongs to the session it started in.
+        if self.dictation.as_ref().is_some_and(|(id, _)| *id != self.state.active_session) {
+            self.dictation = None;
+            self.voice_partial.clear();
+        }
         let index = self.active_index();
         let session = &mut self.state.sessions[index];
         let settings = &self.state.settings;
         let installed = self.detected.get(session.provider).is_some();
+        let voice = chat::Voice {
+            listening: self.dictation.is_some(),
+            partial: &self.voice_partial,
+            error: self.voice_error.as_ref(),
+        };
 
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
             .show_separator_line(false)
-            .show(ui, |ui| chat::composer(ui, session, settings, installed))
+            .show(ui, |ui| chat::composer(ui, session, settings, installed, voice))
             .inner;
         // Checked again after the composer, which is where the provider can change.
         let installed = self.detected.get(session.provider).is_some();
@@ -252,7 +304,14 @@ impl BarduinoApp {
         });
 
         match composer_action {
-            ComposerAction::Send => self.send(ui.ctx()),
+            ComposerAction::Send => {
+                // Sending ends dictation, so later words don't land in the next message.
+                self.dictation = None;
+                self.voice_partial.clear();
+                self.send(ui.ctx());
+            }
+            ComposerAction::ToggleVoice => self.toggle_voice(ui.ctx()),
+            ComposerAction::OpenSpeechSettings => voice::open_speech_settings(),
             ComposerAction::Stop => self.active_session_mut().stop(),
             ComposerAction::ChangeFolder => self.change_folder(),
             ComposerAction::None => {}
@@ -321,12 +380,17 @@ impl BarduinoApp {
 }
 
 impl eframe::App for BarduinoApp {
-    fn logic(&mut self, _ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_voice_events();
         while let Ok((id, event)) = self.events_rx.try_recv() {
             // Events for a deleted session are dropped.
             if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
                 if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
                     self.state.usage.record(session.provider, *usage);
+                }
+                // The agent may have edited files, so any diff of its folder is out of date.
+                if let AgentEvent::Exited { .. } = &event {
+                    self.tools.refresh_changes(&session.project_dir, ctx);
                 }
                 session.handle_event(event);
             }
