@@ -8,8 +8,9 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{Provider, hidden_command};
+use crate::plan::{self, PlanUsage};
 use crate::tools::{BROWSER_SHORTCUT, TERMINAL_SHORTCUT};
-use crate::usage::{self, LimitPeriod, Period, TokenLimit, Usage, UsageLog};
+use crate::usage::{self, Period, Usage, UsageLog};
 
 /// Colours for states that shouldn't depend on the theme's accent colour.
 const GOOD: egui::Color32 = egui::Color32::from_rgb(76, 175, 120);
@@ -28,8 +29,6 @@ pub struct Settings {
     pub disabled_providers: Vec<Provider>,
     /// Executables the user chose instead of the ones Barduino finds itself.
     pub custom_executables: BTreeMap<Provider, PathBuf>,
-    /// Token limits the user set for themselves, per provider.
-    pub limits: BTreeMap<Provider, TokenLimit>,
 }
 
 impl Default for Settings {
@@ -38,7 +37,6 @@ impl Default for Settings {
             default_provider: Provider::Claude,
             disabled_providers: Vec::new(),
             custom_executables: BTreeMap::new(),
-            limits: BTreeMap::new(),
         }
     }
 }
@@ -152,6 +150,8 @@ pub enum SettingsAction {
 pub struct PageContext<'a> {
     pub detected: &'a Detected,
     pub usage: &'a UsageLog,
+    /// What each provider last said about its own plan limits.
+    pub plan: &'a BTreeMap<Provider, PlanUsage>,
     pub session_counts: BTreeMap<Provider, usize>,
 }
 
@@ -191,7 +191,10 @@ impl SettingsPage {
             }
 
             ui.add_space(14.0);
-            if let Some(clicked) = self.usage_section(ui, settings, context.usage) {
+            plan_section(ui, settings, context);
+
+            ui.add_space(14.0);
+            if let Some(clicked) = self.usage_section(ui, context.usage) {
                 action = clicked;
             }
 
@@ -218,22 +221,12 @@ impl SettingsPage {
         action
     }
 
-    fn usage_section(
-        &mut self,
-        ui: &mut egui::Ui,
-        settings: &mut Settings,
-        log: &UsageLog,
-    ) -> Option<SettingsAction> {
+    fn usage_section(&mut self, ui: &mut egui::Ui, log: &UsageLog) -> Option<SettingsAction> {
         let mut action = None;
-        section_heading(ui, "Usage", |ui| {
+        section_heading(ui, "Tokens spent here", |ui| {
             segmented(ui, "usage_period", &mut self.period, &Period::ALL, Period::label);
         });
-        hint(ui, "Tokens spent by messages sent from Barduino. Using the CLIs elsewhere isn't counted.");
-        hint(
-            ui,
-            "No CLI reports how much of a plan is left, so set your own limit below. For your plan's real \
-             figures, open the CLI in a terminal and run /usage in Claude or /status in Codex.",
-        );
+        hint(ui, "Only messages sent from Barduino. Using the CLIs elsewhere isn't counted here.");
         ui.add_space(10.0);
 
         let totals: Vec<(Provider, Usage)> =
@@ -254,7 +247,7 @@ impl SettingsPage {
         ui.add_space(10.0);
         for (provider, total) in &totals {
             card(ui, None, |ui| {
-                provider_usage(ui, settings, *provider, total, log, sum.total_tokens());
+                provider_usage(ui, *provider, total, sum.total_tokens());
             });
             ui.add_space(8.0);
         }
@@ -304,19 +297,11 @@ impl SettingsPage {
 
 /// One agent's usage: what it spent in the chosen period, and how that sits
 /// against the limit for it, if there is one.
-fn provider_usage(
-    ui: &mut egui::Ui,
-    settings: &mut Settings,
-    provider: Provider,
-    total: &Usage,
-    log: &UsageLog,
-    all_tokens: u64,
-) {
+fn provider_usage(ui: &mut egui::Ui, provider: Provider, total: &Usage, all_tokens: u64) {
     ui.horizontal(|ui| {
         avatar(ui, provider, 24.0, false);
         ui.label(egui::RichText::new(provider.label()).strong());
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            limit_button(ui, settings, provider);
             if total.cost_usd.is_some() {
                 ui.label(egui::RichText::new(format!("est. {}", usage::format_cost(total.cost_usd))).weak());
             }
@@ -325,75 +310,80 @@ fn provider_usage(
     });
 
     ui.add_space(6.0);
-    match settings.limits.get(&provider).copied() {
-        Some(limit) => {
-            let spent = log.total(provider, limit.period.usage_period()).total_tokens();
-            let progress = limit.progress(spent);
-            let colour = if progress.over > 0 {
-                OVER
-            } else if progress.fraction > 0.8 {
-                WARN
-            } else {
-                GOOD
-            };
-            meter(ui, progress.fraction, colour);
-            ui.add_space(4.0);
-            let limit_text = format!("{} {}", usage::format_tokens(limit.tokens), limit.period.label());
-            let status = if progress.over > 0 {
-                format!("{} over your limit of {limit_text}", usage::format_tokens(progress.over))
-            } else {
-                format!(
-                    "{} of {limit_text} left · {} used {}",
-                    usage::format_tokens(progress.left),
-                    usage::format_tokens(spent),
-                    limit.period.window()
-                )
-            };
-            ui.label(egui::RichText::new(status).small().color(colour));
+    let share = if all_tokens == 0 { 0.0 } else { total.total_tokens() as f32 / all_tokens as f32 };
+    meter(ui, share, ui.visuals().selection.bg_fill, None);
+    ui.add_space(4.0);
+    let of_all = format!("{:.0}% of the tokens spent in this period", share * 100.0);
+    ui.label(egui::RichText::new(of_all).small().weak());
+}
+
+/// What each provider says about its own plan limits. Barduino only passes these
+/// figures on: Claude Code sends them with every reply, and Codex saves them with
+/// each run, so they also cover work done outside Barduino.
+fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_>) {
+    section_heading(ui, "Plan limits", |_ui| {});
+    hint(ui, "Straight from each agent, including usage that didn't come from Barduino.");
+    ui.add_space(10.0);
+
+    for provider in Provider::ALL {
+        if !settings.is_enabled(provider) {
+            continue;
         }
-        None => {
-            let share = if all_tokens == 0 { 0.0 } else { total.total_tokens() as f32 / all_tokens as f32 };
-            meter(ui, share, ui.visuals().selection.bg_fill);
-            ui.add_space(4.0);
-            let of_all = format!("{:.0}% of all tokens in this period", share * 100.0);
-            ui.label(egui::RichText::new(of_all).small().weak());
-        }
+        card(ui, None, |ui| {
+            let reported = context.plan.get(&provider);
+            ui.horizontal(|ui| {
+                avatar(ui, provider, 24.0, false);
+                ui.label(egui::RichText::new(provider.label()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if let Some(plan) = reported {
+                        ui.label(egui::RichText::new(plan::read_at_text(plan.read_at)).small().weak());
+                    }
+                });
+            });
+            match reported {
+                Some(plan) => {
+                    ui.add_space(8.0);
+                    egui::Grid::new(format!("plan_{}", provider.short_name()))
+                        .num_columns(4)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            for window in &plan.windows {
+                                plan_window_row(ui, window);
+                            }
+                        });
+                    if !plan.notes.is_empty() {
+                        ui.add_space(6.0);
+                        hint(ui, &plan.notes.join("  ·  "));
+                    }
+                }
+                None => {
+                    ui.add_space(4.0);
+                    hint(ui, plan::why_missing(provider));
+                }
+            }
+        });
+        ui.add_space(8.0);
     }
 }
 
-/// The control for setting a token limit, which lives in a small popup so the
-/// row stays quiet until the user wants to change it.
-fn limit_button(ui: &mut egui::Ui, settings: &mut Settings, provider: Provider) {
-    let has_limit = settings.limits.contains_key(&provider);
-    let label = if has_limit { "Limit" } else { "Set a limit" };
-    let response = ui
-        .small_button(label)
-        .on_hover_text("No plan reports how much you have left, so Barduino counts against a limit you choose");
-    egui::Popup::menu(&response).show(|ui| {
-        ui.set_min_width(260.0);
-        ui.label(egui::RichText::new(format!("Limit for {}", provider.short_name())).strong());
-        ui.add_space(4.0);
-        let limit = settings.limits.entry(provider).or_insert_with(TokenLimit::weekly);
-        ui.horizontal(|ui| {
-            let mut millions = limit.tokens as f64 / 1_000_000.0;
-            if ui.add(egui::DragValue::new(&mut millions).speed(0.1).range(0.1..=500.0).suffix("M tokens")).changed() {
-                limit.tokens = (millions * 1_000_000.0) as u64;
-            }
-            egui::ComboBox::from_id_salt(format!("limit_period_{}", provider.short_name()))
-                .selected_text(limit.period.label())
-                .show_ui(ui, |ui| {
-                    for period in LimitPeriod::ALL {
-                        ui.selectable_value(&mut limit.period, period, period.label());
-                    }
-                });
-        });
-        hint(ui, "Barduino only counts what it sent itself, so this is a guide, not your plan's own meter.");
-        ui.add_space(6.0);
-        if ui.button("Remove limit").clicked() {
-            settings.limits.remove(&provider);
-            ui.close();
-        }
-    });
+/// One limit window: what it is, how full it is, and when it starts over.
+fn plan_window_row(ui: &mut egui::Ui, window: &crate::plan::Window) {
+    const METER_WIDTH: f32 = 220.0;
+    let colour = if window.used >= 1.0 {
+        OVER
+    } else if window.used >= 0.8 {
+        WARN
+    } else {
+        GOOD
+    };
+    ui.label(egui::RichText::new(&window.name).small());
+    meter(ui, window.used, colour, Some(METER_WIDTH));
+    let percent = format!("{:.0}%", (window.used * 100.0).min(100.0));
+    ui.label(egui::RichText::new(percent).monospace().small().color(colour));
+    let left = if window.used >= 1.0 { "used up".to_owned() } else { format!("{:.0}% left", (1.0 - window.used) * 100.0) };
+    let resets = plan::resets_text(window.resets_at).map(|text| format!(" · {text}")).unwrap_or_default();
+    ui.label(egui::RichText::new(format!("{left}{resets}")).small().weak());
+    ui.end_row();
 }
 
 fn usage_row(ui: &mut egui::Ui, name: &str, usage: &Usage, strong: bool) {
@@ -589,10 +579,12 @@ fn stat(ui: &mut egui::Ui, value: &str, name: &str) {
     ui.add_space(28.0);
 }
 
-/// A thin bar showing how full something is. `fraction` above 1.0 fills it completely.
-fn meter(ui: &mut egui::Ui, fraction: f32, colour: egui::Color32) {
+/// A thin bar showing how full something is. `fraction` above 1.0 fills it completely,
+/// and `width` defaults to the room that's left.
+fn meter(ui: &mut egui::Ui, fraction: f32, colour: egui::Color32, width: Option<f32>) {
     const HEIGHT: f32 = 6.0;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), HEIGHT), egui::Sense::hover());
+    let width = width.unwrap_or_else(|| ui.available_width());
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {
         return;
     }

@@ -4,10 +4,11 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentEvent, PermissionMode};
+use crate::agent::{AgentEvent, PermissionMode, Provider};
 use crate::browser::BrowserState;
 use crate::chat::{self, ComposerAction};
 use crate::icons::{self, Icon};
+use crate::plan::{self, PlanUsage};
 use crate::session::Session;
 use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarAction};
@@ -33,6 +34,8 @@ struct SavedState {
     show_tools: bool,
     settings: Settings,
     usage: UsageLog,
+    /// The plan limits each provider last reported.
+    plan: std::collections::BTreeMap<Provider, PlanUsage>,
     browser: BrowserState,
     /// Where older versions saved the browser address. Only read, to carry it over.
     #[serde(skip_serializing)]
@@ -49,6 +52,7 @@ impl Default for SavedState {
             show_tools: true,
             settings: Settings::default(),
             usage: UsageLog::default(),
+            plan: std::collections::BTreeMap::new(),
             browser: BrowserState::default(),
             browser_address: String::new(),
         }
@@ -66,6 +70,8 @@ pub struct BarduinoApp {
     dictation: Option<(u64, Dictation)>,
     voice_partial: String,
     voice_error: Option<VoiceError>,
+    /// Plan limits being read from disk, for CLIs that only write them there.
+    plan_from_disk: std::sync::Arc<std::sync::Mutex<Option<std::collections::BTreeMap<Provider, PlanUsage>>>>,
     /// Agent events, tagged with the ID of the session they belong to.
     events_tx: Sender<(u64, AgentEvent)>,
     events_rx: Receiver<(u64, AgentEvent)>,
@@ -92,6 +98,7 @@ impl BarduinoApp {
             dictation: None,
             voice_partial: String::new(),
             voice_error: None,
+            plan_from_disk: plan::read_in_background(&cc.egui_ctx),
             events_tx,
             events_rx,
         };
@@ -226,14 +233,22 @@ impl BarduinoApp {
         for session in &self.state.sessions {
             *session_counts.entry(session.provider).or_default() += 1;
         }
-        let context = PageContext { detected: &self.detected, usage: &self.state.usage, session_counts };
+        let context = PageContext {
+            detected: &self.detected,
+            usage: &self.state.usage,
+            plan: &self.state.plan,
+            session_counts,
+        };
         let (page, settings) = (&mut self.settings_page, &mut self.state.settings);
         let action = egui::CentralPanel::default().show(ui, |ui| page.ui(ui, settings, &context)).inner;
 
         match action {
             SettingsAction::None => {}
             SettingsAction::Close => self.view = View::Chat,
-            SettingsAction::Rescan => self.detected = Detected::scan(&self.state.settings, ui.ctx()),
+            SettingsAction::Rescan => {
+                self.detected = Detected::scan(&self.state.settings, ui.ctx());
+                self.plan_from_disk = plan::read_in_background(ui.ctx());
+            }
             SettingsAction::ChooseExecutable(provider) => {
                 let mut dialog = rfd::FileDialog::new().set_title(format!("Choose the {} executable", provider.label()));
                 if let Some(dir) = self.detected.get(provider).and_then(|exe| exe.parent()) {
@@ -403,10 +418,16 @@ impl BarduinoApp {
 impl eframe::App for BarduinoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_shortcuts(ctx);
+        if let Some(found) = self.plan_from_disk.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
+            self.state.plan.extend(found);
+        }
         self.handle_voice_events();
         while let Ok((id, event)) = self.events_rx.try_recv() {
             // Events for a deleted session are dropped.
             if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
+                if let AgentEvent::Plan(plan) = &event {
+                    self.state.plan.insert(session.provider, plan.clone());
+                }
                 if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
                     self.state.usage.record(session.provider, *usage);
                 }

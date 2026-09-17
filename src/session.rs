@@ -201,6 +201,8 @@ impl Session {
                     self.model = Some(model);
                 }
             }
+            // The app records plan figures for the provider before this is called.
+            AgentEvent::Plan(_) => {}
             AgentEvent::TextDelta(text) => self.streaming.push_str(&text),
             AgentEvent::Text(text) => {
                 self.streaming.clear();

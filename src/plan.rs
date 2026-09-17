@@ -1,0 +1,337 @@
+//! What each agent CLI says about its own plan limits. These are the providers'
+//! official figures, not anything Barduino works out: Claude Code sends them with
+//! every reply, and Codex writes them into the session file it keeps for each run.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+
+use eframe::egui;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::agent::{self, Provider};
+
+/// Session files bigger than this are skipped, so reading can't stall on a huge one.
+const MAX_SESSION_FILE: u64 = 32 * 1024 * 1024;
+/// How many recent session files to look through for the latest figures.
+const RECENT_FILES: usize = 6;
+
+/// One of a provider's limit windows, such as Claude's five-hour window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Window {
+    pub name: String,
+    /// The share of the limit used, where 1.0 is all of it.
+    pub used: f32,
+    /// When the window starts over, in seconds since the Unix epoch.
+    pub resets_at: Option<i64>,
+}
+
+/// A provider's plan usage as it reported it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlanUsage {
+    pub windows: Vec<Window>,
+    /// Anything else the provider mentions, such as the plan name or credits left.
+    pub notes: Vec<String>,
+    /// When these figures were read, in seconds since the Unix epoch.
+    pub read_at: i64,
+}
+
+/// Claude Code's `rate_limit_event`. Its utilization is already a share of the limit.
+pub fn from_claude(info: &Value) -> Option<PlanUsage> {
+    let mut windows = Vec::new();
+    if let Some(unified) = info["unifiedWindows"].as_object() {
+        for (key, window) in unified {
+            if let Some(used) = window["utilization"].as_f64() {
+                let resets_at = window["resetsAt"].as_i64();
+                windows.push(Window { name: claude_window_name(key), used: used as f32, resets_at });
+            }
+        }
+    }
+    // Older versions report only the window that is closest to its limit.
+    if windows.is_empty() {
+        let used = info["utilization"].as_f64()?;
+        let name = claude_window_name(info["rateLimitType"].as_str().unwrap_or_default());
+        windows.push(Window { name, used: used as f32, resets_at: info["resetsAt"].as_i64() });
+    }
+    windows.sort_by_key(|window| window.resets_at.unwrap_or(i64::MAX));
+
+    let mut notes = Vec::new();
+    if info["isUsingOverage"].as_bool() == Some(true) {
+        notes.push("Using extra usage beyond the plan".to_owned());
+    }
+    Some(PlanUsage { windows, notes, read_at: now() })
+}
+
+fn claude_window_name(key: &str) -> String {
+    match key {
+        "five_hour" => "5-hour limit".to_owned(),
+        "seven_day" => "7-day limit".to_owned(),
+        "seven_day_opus" => "7-day Opus limit".to_owned(),
+        "" => "Plan limit".to_owned(),
+        other => format!("{} limit", other.replace('_', " ")),
+    }
+}
+
+/// Codex's `rate_limits`, where the figures are percentages.
+fn from_codex(limits: &Value) -> Option<PlanUsage> {
+    let mut windows = Vec::new();
+    for key in ["primary", "secondary"] {
+        let window = &limits[key];
+        if let Some(percent) = window["used_percent"].as_f64() {
+            windows.push(Window {
+                name: codex_window_name(window["window_minutes"].as_i64()),
+                used: (percent / 100.0) as f32,
+                resets_at: window["resets_at"].as_i64(),
+            });
+        }
+    }
+    if windows.is_empty() {
+        return None;
+    }
+    windows.sort_by_key(|window| window.resets_at.unwrap_or(i64::MAX));
+
+    let mut notes = Vec::new();
+    if let Some(plan) = limits["plan_type"].as_str().filter(|plan| !plan.is_empty()) {
+        notes.push(format!("{plan} plan"));
+    }
+    let credits = &limits["credits"];
+    if credits["has_credits"].as_bool() == Some(true) {
+        if credits["unlimited"].as_bool() == Some(true) {
+            notes.push("Unlimited credits".to_owned());
+        } else if let Some(balance) = credits["balance"].as_str().and_then(|b| b.parse::<f64>().ok()) {
+            notes.push(format!("${balance:.2} in credits"));
+        }
+    }
+    Some(PlanUsage { windows, notes, read_at: now() })
+}
+
+fn codex_window_name(minutes: Option<i64>) -> String {
+    match minutes {
+        Some(60) => "Hourly limit".to_owned(),
+        Some(300) => "5-hour limit".to_owned(),
+        Some(1440) => "Daily limit".to_owned(),
+        Some(10080) => "Weekly limit".to_owned(),
+        Some(43200) => "Monthly limit".to_owned(),
+        Some(minutes) if minutes % 1440 == 0 => format!("{}-day limit", minutes / 1440),
+        Some(minutes) if minutes % 60 == 0 => format!("{}-hour limit", minutes / 60),
+        Some(minutes) => format!("{minutes}-minute limit"),
+        None => "Plan limit".to_owned(),
+    }
+}
+
+/// Why a provider has no figures to show yet.
+pub fn why_missing(provider: Provider) -> &'static str {
+    match provider {
+        Provider::Claude => "Claude Code reports its limits with every reply. Send a message and they appear here.",
+        Provider::Codex => {
+            "Codex saves its limits whenever it runs. Send a message with it, or open `codex` in a terminal."
+        }
+        Provider::Antigravity => "Antigravity's agy CLI doesn't report plan limits.",
+    }
+}
+
+/// Reads the figures that a CLI only keeps on disk. Runs on a background thread
+/// and asks `ctx` to redraw once they're ready.
+pub fn read_in_background(ctx: &egui::Context) -> Arc<Mutex<Option<BTreeMap<Provider, PlanUsage>>>> {
+    let slot = Arc::new(Mutex::new(None));
+    let (into, ctx) = (Arc::clone(&slot), ctx.clone());
+    std::thread::spawn(move || {
+        let mut found = BTreeMap::new();
+        if let Some(codex) = read_codex() {
+            found.insert(Provider::Codex, codex);
+        }
+        *into.lock().unwrap_or_else(PoisonError::into_inner) = Some(found);
+        ctx.request_repaint();
+    });
+    slot
+}
+
+/// Codex records its limits in the session file for each run, so the newest file
+/// holds the latest figures, including from runs outside Barduino.
+fn read_codex() -> Option<PlanUsage> {
+    let sessions = agent::home_dir()?.join(".codex").join("sessions");
+    for path in newest_files(&sessions) {
+        if let Some(plan) = codex_session_file(&path) {
+            return Some(plan);
+        }
+    }
+    None
+}
+
+fn codex_session_file(path: &Path) -> Option<PlanUsage> {
+    if std::fs::metadata(path).ok()?.len() > MAX_SESSION_FILE {
+        return None;
+    }
+    let text = std::fs::read_to_string(path).ok()?;
+    // The last entry is the most recent, and only some entries carry limits.
+    text.lines()
+        .rev()
+        .filter(|line| line.contains("rate_limits"))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .find_map(|entry| from_codex(&entry["payload"]["rate_limits"]))
+}
+
+/// The most recently changed files under `dir`, newest first. Codex sorts its
+/// sessions into year, month and day folders, so this looks a few levels down.
+fn newest_files(dir: &Path) -> Vec<PathBuf> {
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    let mut folders = vec![(dir.to_owned(), 0_u32)];
+    while let Some((folder, depth)) = folders.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else { continue };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            if kind.is_dir() && depth < 4 {
+                folders.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                let changed = entry.metadata().and_then(|m| m.modified()).ok();
+                files.push((changed.unwrap_or(std::time::UNIX_EPOCH), entry.path()));
+            }
+        }
+    }
+    files.sort_by_key(|(changed, _)| std::cmp::Reverse(*changed));
+    files.into_iter().take(RECENT_FILES).map(|(_, path)| path).collect()
+}
+
+/// "resets in 2h 10m" for something soon, or "resets Friday 09:00" for something further off.
+pub fn resets_text(resets_at: Option<i64>) -> Option<String> {
+    let resets_at = resets_at?;
+    let when = chrono::DateTime::from_timestamp(resets_at, 0)?.with_timezone(&chrono::Local);
+    Some(resets_in((resets_at - now()) / 60, &when))
+}
+
+fn resets_in(minutes: i64, when: &chrono::DateTime<chrono::Local>) -> String {
+    match minutes {
+        ..=0 => "resets any moment".to_owned(),
+        1..60 => format!("resets in {minutes}m"),
+        60..1440 => format!("resets in {}h {}m", minutes / 60, minutes % 60),
+        _ => format!("resets {}", when.format("%A %H:%M")),
+    }
+}
+
+/// "as of 22:19", or with the date once the figures are from another day.
+pub fn read_at_text(read_at: i64) -> String {
+    let Some(when) = chrono::DateTime::from_timestamp(read_at, 0) else {
+        return String::new();
+    };
+    let when = when.with_timezone(&chrono::Local);
+    if when.date_naive() == chrono::Local::now().date_naive() {
+        format!("as of {}", when.format("%H:%M"))
+    } else {
+        format!("as of {}", when.format("%d %b %H:%M"))
+    }
+}
+
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs() as i64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_claudes_two_windows() {
+        let info = serde_json::json!({
+            "status": "allowed_warning",
+            "resetsAt": 1_789_707_600_i64,
+            "rateLimitType": "seven_day",
+            "utilization": 0.87,
+            "isUsingOverage": false,
+            "unifiedWindows": {
+                "five_hour": { "utilization": 0.0, "resetsAt": 1_789_677_000_i64 },
+                "seven_day": { "utilization": 0.87, "resetsAt": 1_789_707_600_i64 }
+            }
+        });
+        let plan = from_claude(&info).expect("the event should describe the plan");
+        // The window that starts over soonest comes first.
+        assert_eq!(plan.windows[0].name, "5-hour limit");
+        assert_eq!(plan.windows[1], Window { name: "7-day limit".into(), used: 0.87, resets_at: Some(1_789_707_600) });
+        assert!(plan.notes.is_empty());
+    }
+
+    #[test]
+    fn reads_claudes_older_single_window() {
+        let info = serde_json::json!({ "rateLimitType": "five_hour", "utilization": 0.4, "isUsingOverage": true });
+        let plan = from_claude(&info).expect("one window is enough");
+        assert_eq!(plan.windows, vec![Window { name: "5-hour limit".into(), used: 0.4, resets_at: None }]);
+        assert_eq!(plan.notes, vec!["Using extra usage beyond the plan"]);
+        assert!(from_claude(&serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn reads_codex_percentages_and_credits() {
+        let limits = serde_json::json!({
+            "limit_id": "codex",
+            "primary": { "used_percent": 100.0, "window_minutes": 10080, "resets_at": 1_789_805_599_i64 },
+            "secondary": null,
+            "credits": { "has_credits": true, "unlimited": false, "balance": "171.6073735000" },
+            "plan_type": "pro"
+        });
+        let plan = from_codex(&limits).expect("the entry should describe the plan");
+        assert_eq!(plan.windows, vec![Window {
+            name: "Weekly limit".into(),
+            used: 1.0,
+            resets_at: Some(1_789_805_599),
+        }]);
+        assert_eq!(plan.notes, vec!["pro plan", "$171.61 in credits"]);
+        assert!(from_codex(&serde_json::json!({ "primary": null })).is_none());
+    }
+
+    #[test]
+    fn takes_the_last_limits_in_a_session_file() {
+        let dir = std::env::temp_dir().join("barduino-plan-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("2026").join("09").join("17")).unwrap();
+        let path = dir.join("2026").join("09").join("17").join("rollout-test.jsonl");
+        let entry = |percent: f64| {
+            format!(
+                r#"{{"type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{percent},"window_minutes":300,"resets_at":1}},"plan_type":"pro"}}}}}}"#
+            )
+        };
+        std::fs::write(&path, format!("{{\"type\":\"other\"}}\n{}\n{}\n", entry(12.0), entry(34.0))).unwrap();
+
+        let plan = codex_session_file(&path).expect("the file holds limits");
+        assert_eq!(plan.windows[0].name, "5-hour limit");
+        assert!((plan.windows[0].used - 0.34).abs() < 0.001, "{:?}", plan.windows[0]);
+        assert_eq!(newest_files(&dir), vec![path]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn describes_when_windows_reset() {
+        let when = chrono::DateTime::from_timestamp(1_789_707_600, 0).unwrap().with_timezone(&chrono::Local);
+        assert_eq!(resets_in(130, &when), "resets in 2h 10m");
+        assert_eq!(resets_in(1, &when), "resets in 1m");
+        assert_eq!(resets_in(59, &when), "resets in 59m");
+        assert_eq!(resets_in(0, &when), "resets any moment");
+        assert_eq!(resets_in(-5, &when), "resets any moment");
+        assert!(resets_in(4320, &when).starts_with("resets "), "a few days off names the day");
+        assert_eq!(resets_text(None), None);
+        assert!(resets_text(Some(now() + 600)).is_some());
+        assert!(read_at_text(now()).starts_with("as of "));
+    }
+
+    /// Reads the real Codex limits on this computer. Depends on Codex having run
+    /// here, so it only runs when asked for:
+    /// `cargo test -- --ignored plan --nocapture`
+    #[test]
+    #[ignore]
+    fn reads_codex_limits_from_this_computer() {
+        let started = std::time::Instant::now();
+        let plan = read_codex().expect("Codex should have saved limits on this computer");
+        println!("read in {:?}: {plan:#?}", started.elapsed());
+        assert!(!plan.windows.is_empty());
+    }
+
+    #[test]
+    fn names_odd_codex_windows() {
+        assert_eq!(codex_window_name(Some(4320)), "3-day limit");
+        assert_eq!(codex_window_name(Some(180)), "3-hour limit");
+        assert_eq!(codex_window_name(Some(7)), "7-minute limit");
+        assert_eq!(codex_window_name(None), "Plan limit");
+    }
+}

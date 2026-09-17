@@ -56,6 +56,10 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     }
 
     match msg["type"].as_str().unwrap_or_default() {
+        // Claude reports how much of the plan's limits are used as the reply streams.
+        "rate_limit_event" => crate::plan::from_claude(&msg["rate_limit_info"])
+            .map(|plan| vec![AgentEvent::Plan(plan)])
+            .unwrap_or_default(),
         "system" if msg["subtype"] == "init" => vec![AgentEvent::Started {
             session_id: string(&msg["session_id"]),
             model: string(&msg["model"]),
@@ -225,6 +229,8 @@ mod tests {
         let subagent = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"inner"}]},"parent_tool_use_id":"t1"}"#;
         assert!(parse_line(subagent).is_empty());
         assert!(parse_line(r#"{"type":"rate_limit_event"}"#).is_empty());
+        let limits = r#"{"type":"rate_limit_event","rate_limit_info":{"rateLimitType":"five_hour","utilization":0.25}}"#;
+        assert!(matches!(&parse_line(limits)[..], [AgentEvent::Plan(plan)] if plan.windows[0].used == 0.25));
         assert!(parse_line("not json").is_empty());
         assert!(parse_line("").is_empty());
     }

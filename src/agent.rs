@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::plan::PlanUsage;
 use crate::usage::Usage;
 use crate::{antigravity, claude, codex};
 
@@ -83,6 +84,9 @@ pub enum AgentEvent {
     Text(String),
     ToolUse { name: String, detail: String },
     ToolResult { text: String, is_error: bool },
+    /// What the CLI says about the account's plan limits, which belongs to the
+    /// provider rather than to this session.
+    Plan(PlanUsage),
     /// The agent finished the turn.
     Finished {
         session_id: Option<String>,
