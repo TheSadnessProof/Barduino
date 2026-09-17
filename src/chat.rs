@@ -384,22 +384,246 @@ fn diff_line(ui: &mut egui::Ui, kind: LineKind, text: &str) {
     });
 }
 
-/// Tool output, with diff lines picked out when a command printed a diff.
+/// Tool output, formatted as a diff when a command printed a diff, or as a dark
+/// terminal card with parsed ANSI colors, tabs expanded, and a copy button.
 fn output_text(ui: &mut egui::Ui, text: &str) {
     let looks_like_diff = text.lines().any(|line| line.starts_with("@@ ") || line.starts_with("diff --git"));
-    if !looks_like_diff {
-        ui.label(egui::RichText::new(text).monospace().small());
+    if looks_like_diff {
+        for line in text.lines() {
+            let colour = match line.chars().next() {
+                Some('+') if !line.starts_with("+++") => ADDED,
+                Some('-') if !line.starts_with("---") => REMOVED,
+                Some('@') => ui.visuals().selection.stroke.color,
+                _ => ui.visuals().weak_text_color(),
+            };
+            ui.label(egui::RichText::new(line).monospace().small().color(colour));
+        }
         return;
     }
-    for line in text.lines() {
-        let colour = match line.chars().next() {
-            Some('+') if !line.starts_with("+++") => ADDED,
-            Some('-') if !line.starts_with("---") => REMOVED,
-            Some('@') => ui.visuals().selection.stroke.color,
-            _ => ui.visuals().weak_text_color(),
-        };
-        ui.label(egui::RichText::new(line).monospace().small().color(colour));
+
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(18, 18, 20))
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.4)))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let lines = text.lines().count();
+                ui.label(
+                    egui::RichText::new(format!("{lines} {}", if lines == 1 { "line" } else { "lines" }))
+                        .monospace()
+                        .small()
+                        .weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Copy").on_hover_text("Copy output to clipboard").clicked() {
+                        ui.ctx().copy_text(strip_ansi(text));
+                    }
+                });
+            });
+            ui.add_space(4.0);
+
+            egui::ScrollArea::horizontal()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let font_id = egui::FontId::new(12.5, egui::FontFamily::Monospace);
+                    let job = parse_ansi_to_layout_job(text, ui.visuals().text_color(), font_id);
+                    ui.label(job);
+                });
+        });
+}
+
+/// Parses ANSI escape sequences into an egui LayoutJob with colored text spans,
+/// expanding tabs and handling carriage returns.
+fn parse_ansi_to_layout_job(text: &str, default_color: egui::Color32, font_id: egui::FontId) -> egui::text::LayoutJob {
+    let mut job = egui::text::LayoutJob::default();
+    let mut current_fg = default_color;
+    let mut bold = false;
+    let mut italic = false;
+    let mut underline = false;
+
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        let effective = raw_line.rsplit('\r').find(|seg| !seg.is_empty()).unwrap_or(raw_line);
+        lines.push(effective.replace('\t', "    "));
     }
+    let processed = lines.join("\n");
+
+    let mut chars = processed.char_indices().peekable();
+    let mut start = 0;
+
+    while let Some(&(idx, ch)) = chars.peek() {
+        if ch == '\x1b' {
+            if idx > start {
+                let segment = &processed[start..idx];
+                let color = if bold && current_fg == default_color {
+                    egui::Color32::from_rgb(
+                        current_fg.r().saturating_add(40),
+                        current_fg.g().saturating_add(40),
+                        current_fg.b().saturating_add(40),
+                    )
+                } else {
+                    current_fg
+                };
+                job.append(
+                    segment,
+                    0.0,
+                    egui::TextFormat {
+                        font_id: font_id.clone(),
+                        color,
+                        italics: italic,
+                        underline: if underline { egui::Stroke::new(1.0, color) } else { egui::Stroke::NONE },
+                        ..Default::default()
+                    },
+                );
+            }
+
+            chars.next();
+            if let Some(&(_, '[')) = chars.peek() {
+                chars.next();
+                let mut params = String::new();
+                while let Some(&(_, p_ch)) = chars.peek() {
+                    chars.next();
+                    if p_ch.is_ascii_alphabetic() {
+                        if p_ch == 'm' {
+                            apply_sgr_params(&params, &mut current_fg, &mut bold, &mut italic, &mut underline, default_color);
+                        }
+                        break;
+                    } else {
+                        params.push(p_ch);
+                    }
+                }
+            }
+            start = chars.peek().map(|&(i, _)| i).unwrap_or(processed.len());
+        } else {
+            chars.next();
+        }
+    }
+
+    if start < processed.len() {
+        let segment = &processed[start..];
+        job.append(
+            segment,
+            0.0,
+            egui::TextFormat {
+                font_id,
+                color: current_fg,
+                italics: italic,
+                underline: if underline { egui::Stroke::new(1.0, current_fg) } else { egui::Stroke::NONE },
+                ..Default::default()
+            },
+        );
+    }
+
+    job
+}
+
+fn apply_sgr_params(
+    params: &str,
+    fg: &mut egui::Color32,
+    bold: &mut bool,
+    italic: &mut bool,
+    underline: &mut bool,
+    default_fg: egui::Color32,
+) {
+    if params.is_empty() {
+        *fg = default_fg;
+        *bold = false;
+        *italic = false;
+        *underline = false;
+        return;
+    }
+
+    let codes: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            0 => {
+                *fg = default_fg;
+                *bold = false;
+                *italic = false;
+                *underline = false;
+            }
+            1 => *bold = true,
+            2 => *fg = fg.gamma_multiply(0.7),
+            3 => *italic = true,
+            4 => *underline = true,
+            22 => *bold = false,
+            23 => *italic = false,
+            24 => *underline = false,
+            39 => *fg = default_fg,
+            30 => *fg = egui::Color32::from_rgb(0, 0, 0),
+            31 => *fg = egui::Color32::from_rgb(220, 60, 60),
+            32 => *fg = egui::Color32::from_rgb(50, 190, 100),
+            33 => *fg = egui::Color32::from_rgb(220, 180, 40),
+            34 => *fg = egui::Color32::from_rgb(70, 130, 230),
+            35 => *fg = egui::Color32::from_rgb(180, 80, 190),
+            36 => *fg = egui::Color32::from_rgb(40, 180, 200),
+            37 => *fg = egui::Color32::from_rgb(210, 210, 210),
+            90 => *fg = egui::Color32::from_rgb(120, 120, 120),
+            91 => *fg = egui::Color32::from_rgb(240, 90, 90),
+            92 => *fg = egui::Color32::from_rgb(70, 220, 130),
+            93 => *fg = egui::Color32::from_rgb(245, 210, 60),
+            94 => *fg = egui::Color32::from_rgb(100, 160, 255),
+            95 => *fg = egui::Color32::from_rgb(215, 110, 225),
+            96 => *fg = egui::Color32::from_rgb(70, 210, 230),
+            97 => *fg = egui::Color32::from_rgb(255, 255, 255),
+            38 => {
+                if i + 2 < codes.len() && codes[i + 1] == 5 {
+                    *fg = ansi_256_color(codes[i + 2] as u8);
+                    i += 2;
+                } else if i + 4 < codes.len() && codes[i + 1] == 2 {
+                    *fg = egui::Color32::from_rgb(codes[i + 2] as u8, codes[i + 3] as u8, codes[i + 4] as u8);
+                    i += 4;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+}
+
+fn ansi_256_color(idx: u8) -> egui::Color32 {
+    const ANSI: [(u8, u8, u8); 16] = [
+        (0, 0, 0), (205, 49, 49), (13, 188, 121), (229, 229, 16),
+        (36, 114, 200), (188, 63, 188), (17, 168, 205), (229, 229, 229),
+        (102, 102, 102), (241, 76, 76), (35, 209, 139), (245, 245, 67),
+        (59, 142, 234), (214, 112, 214), (41, 184, 219), (255, 255, 255),
+    ];
+    match idx {
+        0..16 => {
+            let (r, g, b) = ANSI[idx as usize];
+            egui::Color32::from_rgb(r, g, b)
+        }
+        16..232 => {
+            let i = idx - 16;
+            let level = |v: u8| if v == 0 { 0 } else { 55 + v * 40 };
+            egui::Color32::from_rgb(level(i / 36), level((i / 6) % 6), level(i % 6))
+        }
+        232..=255 => {
+            let gray = 8 + (idx - 232) * 10;
+            egui::Color32::from_rgb(gray, gray, gray)
+        }
+    }
+}
+
+/// Strips ANSI escape sequences and carriage returns so copied text is clean plain text.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_escape = false;
+    for ch in text.chars() {
+        if ch == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if ch.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if ch != '\r' {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 /// Puts a block under the tool it belongs to, behind a coloured line down the left.
@@ -476,4 +700,25 @@ fn shorten_note(note: &str) -> String {
         return one_line;
     }
     one_line.chars().take(MAX - 1).chain(['…']).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_color_codes_and_carriage_returns() {
+        let raw = "\x1b[32mSuccess\x1b[0m: built in 1.2s\rDone\x1b[K";
+        assert_eq!(strip_ansi(raw), "Success: built in 1.2sDone");
+    }
+
+    #[test]
+    fn ansi_parser_expands_tabs_and_handles_colors() {
+        let text = "\x1b[31mError\x1b[0m:\tfailed";
+        let job = parse_ansi_to_layout_job(text, egui::Color32::WHITE, egui::FontId::monospace(12.0));
+        assert_eq!(job.text, "Error:    failed");
+        assert_eq!(job.sections.len(), 2);
+        assert_eq!(job.sections[0].format.color, egui::Color32::from_rgb(220, 60, 60));
+        assert_eq!(job.sections[1].format.color, egui::Color32::WHITE);
+    }
 }

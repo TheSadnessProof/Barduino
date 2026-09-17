@@ -36,7 +36,6 @@ pub struct Settings {
     pub shell: Option<PathBuf>,
 }
 
-
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -610,13 +609,15 @@ fn shell_card(ui: &mut egui::Ui, settings: &mut Settings, shells: &[Shell]) {
             return;
         }
         // The first is what Barduino would pick on its own, so saying so means the
-        // default doesn't need a name of its own in the list.
+        // default doesn't need a name of its own in the list. A choice that has
+        // since been uninstalled reads as this too, because that is what happens.
+        let picked = settings.shell.clone().filter(|chosen| shells.iter().any(|s| s.path == *chosen));
         let automatic = format!("Choose for me — currently {}", shells[0].name);
-        if ui.radio(settings.shell.is_none(), automatic).clicked() {
+        if ui.radio(picked.is_none(), automatic).clicked() {
             settings.shell = None;
         }
         for shell in shells {
-            let chosen = settings.shell.as_deref() == Some(shell.path.as_path());
+            let chosen = picked.as_deref() == Some(shell.path.as_path());
             if ui.radio(chosen, shell.name).on_hover_text(shell.path.display().to_string()).clicked() {
                 settings.shell = Some(shell.path.clone());
             }

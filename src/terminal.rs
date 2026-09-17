@@ -514,6 +514,26 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).filter(|l| !l.is_empty()).collect()
     }
 
+    /// Lists the shells this computer offers. Free, but it depends on what is
+    /// installed here, so it only runs when asked for:
+    /// `cargo test -- --ignored shells --nocapture`
+    #[test]
+    #[ignore]
+    fn finds_the_shells_on_this_computer() {
+        let shells = available_shells();
+        for shell in &shells {
+            println!("{:20} {}", shell.name, shell.path.display());
+        }
+        println!("default: {}", default_shell().display());
+        assert!(!shells.is_empty(), "anything running this has a shell");
+        assert!(shells.iter().all(|shell| shell.path.is_file()), "and each one is really there");
+        let paths: Vec<&PathBuf> = shells.iter().map(|shell| &shell.path).collect();
+        let mut unique = paths.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(paths.len(), unique.len(), "with no shell listed twice");
+    }
+
     /// Starts a long-running program inside a terminal, closes the terminal, and
     /// checks that the program was stopped too. Only runs when asked for:
     /// `cargo test -- --ignored closing_a_terminal --nocapture`

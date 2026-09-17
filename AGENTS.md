@@ -65,13 +65,28 @@ than saying nothing. See the `verifying-a-ui-change` skill.
 
 ### 3.2 Never run the ignored tests wholesale
 
-Seven tests carry `#[ignore]`. They drive the **real** CLIs against the user's
-**real, paid** accounts — Claude, Codex and Antigravity.
+The `#[ignore]`d tests reach outside the process, and they are **not all the
+same kind**. Every one of them says which it is in its own doc comment — read
+that before running anything.
 
-- ❌ `cargo test -- --ignored`
-- ❌ Removing an `#[ignore]` to "check it passes"
-- ✅ Only the exact command in that test's own doc comment, only when the user
-  asks for it, e.g. `cargo test -- --ignored antigravity --nocapture`
+- **Some spend the user's money**, driving a real CLI against a real paid
+  account: `runs_the_real_antigravity_cli`, `runs_the_real_codex_cli`,
+  `full_access_really_runs_commands`. Run these **only when the user asks**.
+- **The rest are free but depend on this computer** — what is installed, signed
+  in, or running: `real_models_come_from_the_clis`, `checks_real_plan_limits`,
+  `reads_codex_limits_from_this_computer`, `finds_the_shells_on_this_computer`,
+  `closing_a_terminal_stops_programs_started_in_it`. These are fine to run when
+  they are what you actually need to check.
+
+Either way:
+
+- ❌ `cargo test -- --ignored` — that sweeps up the paid ones too.
+- ❌ Removing an `#[ignore]` to "check it passes".
+- ✅ The exact command in that test's own doc comment, e.g.
+  `cargo test -- --ignored antigravity --nocapture`.
+
+A new `#[ignore]`d test must say in its doc comment which kind it is and how to
+run it.
 
 ### 3.3 Do not run `cargo fmt`
 
