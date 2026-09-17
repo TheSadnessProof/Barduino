@@ -40,6 +40,8 @@ pub enum ToolsAction {
 
 /// What the panel needs from the session it belongs to.
 pub struct PanelContext<'a> {
+    /// Which session this panel belongs to.
+    pub id: u64,
     /// The folder terminals start in and changes are read from.
     pub cwd: &'a Path,
     /// The shell a new terminal runs.
@@ -69,6 +71,11 @@ impl Tools {
         matches!(self.tabs.get(self.active), Some(Tab::Browser))
     }
 
+    /// Whether the tab in front is a terminal.
+    fn shows_terminal(&self) -> bool {
+        matches!(self.tabs.get(self.active), Some(Tab::Terminal { .. }))
+    }
+
     /// Opens a new terminal in `cwd`, optionally typing a command into it.
     pub fn open_terminal(&mut self, cwd: &Path, typed: Option<String>) {
         let number = self.next_terminal_number;
@@ -79,7 +86,10 @@ impl Tools {
 
     /// Shows a terminal in `cwd`: the most recent one that's open, or a new one.
     pub fn show_terminal(&mut self, cwd: &Path) {
-        match self.tabs.iter().rposition(|tab| matches!(tab, Tab::Terminal { .. })) {
+        // The one already in front, so the shortcut returns you to the terminal you
+        // were using rather than always to the newest.
+        let showing = self.shows_terminal().then_some(self.active);
+        match showing.or_else(|| self.tabs.iter().rposition(|tab| matches!(tab, Tab::Terminal { .. }))) {
             Some(index) => {
                 self.active = index;
                 self.focus_terminal(index);
@@ -140,15 +150,19 @@ impl Tools {
         }
     }
 
-    /// Closes tab `index`. `browser` is given up when it was the browser tab.
-    fn close(&mut self, index: usize, browser: &mut Browser) {
-        // Dropping a terminal tab stops its shell.
-        if let Tab::Browser = self.tabs.remove(index) {
-            browser.close();
-        }
+    /// Closes tab `index`. Dropping a terminal tab stops its shell. The WebView is
+    /// shared, so it is left alone here — app.rs closes it once no session wants it.
+    fn close(&mut self, index: usize) {
+        self.tabs.remove(index);
         if self.active >= index && self.active > 0 {
             self.active -= 1;
         }
+    }
+
+    /// Whether this panel has a browser tab open at all, in front or behind. The
+    /// WebView is shared, so it may only be closed once this is false everywhere.
+    pub fn wants_browser(&self) -> bool {
+        self.tabs.iter().any(|tab| matches!(tab, Tab::Browser))
     }
 
     /// The "+" menu. `cwd` is where a new terminal starts. Returns true when a tab was opened.
@@ -184,7 +198,7 @@ impl Tools {
         session: PanelContext<'_>,
         collapse: &mut bool,
     ) -> ToolsAction {
-        let PanelContext { cwd, shell, browser, page } = session;
+        let PanelContext { id, cwd, shell, browser, page } = session;
         let mut close = None;
         // Both are acted on after the strip, which is iterating the tabs.
         let mut clicked = None;
@@ -287,7 +301,7 @@ impl Tools {
             self.focus_terminal(index);
         }
         if let Some(index) = close {
-            self.close(index, browser);
+            self.close(index);
             if self.tabs.is_empty() {
                 *collapse = true;
             }
@@ -310,10 +324,10 @@ impl Tools {
                 });
             }
             Some(Tab::Terminal { number, cwd, terminal, typed, focus }) => {
-                let (text, take_keyboard) = (typed.take(), std::mem::take(focus));
+                let take_keyboard = std::mem::take(focus);
                 let restarted = ui
                     .push_id(("terminal", *number), |ui| {
-                        terminal::show(ui, terminal, cwd, shell, text, take_keyboard)
+                        terminal::show(ui, terminal, cwd, shell, typed, take_keyboard)
                     })
                     .inner;
                 // The restarted shell is a new terminal, so it wants the cursor as well.
@@ -324,7 +338,7 @@ impl Tools {
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.
                 let page_visible = !egui::Popup::is_any_open(ui.ctx());
-                match browser.ui(page, ui, frame, page_visible) {
+                match browser.ui(id, page, ui, frame, page_visible) {
                     BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
                     BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
                     BrowserAction::None => {}
@@ -349,7 +363,7 @@ mod tests {
         let mut tools = Tools::default();
         tools.open_terminal(Path::new("."), None);
         assert_eq!(tools.tabs.len(), 1);
-        tools.close(0, &mut Browser::default());
+        tools.close(0);
         assert!(tools.tabs.is_empty());
     }
 

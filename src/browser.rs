@@ -178,9 +178,13 @@ pub struct Browser {
     /// The page's size last frame, so the pixel boxes can report what filling the
     /// panel actually works out to.
     page_size: [u32; 2],
-    /// The address the WebView is actually showing, which is how switching session
-    /// is noticed: the session's own address no longer matches it.
+    /// The address the WebView is actually showing, so a session whose own address
+    /// differs from it is one whose page still has to be fetched.
     loaded: String,
+    /// Which session's page is in the WebView. Comments and picking mode belong to
+    /// that session, and the address alone can't tell them apart: two sessions in
+    /// one project usually point at the same dev server.
+    showing: Option<u64>,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
 }
@@ -193,6 +197,7 @@ impl Default for Browser {
             focus_note: None,
             page_size: BrowserState::default().size,
             loaded: String::new(),
+            showing: None,
             #[cfg(any(windows, target_os = "macos"))]
             native: None,
         }
@@ -200,21 +205,29 @@ impl Default for Browser {
 }
 
 impl Browser {
-    /// Closes the page. It opens again the next time the browser tab is shown.
+    /// Closes the page. It opens again the next time a browser tab is shown.
     pub fn close(&mut self) {
-        self.mode = Mode::Off;
-        self.comments.clear();
-        self.focus_note = None;
+        self.forget_marks();
         self.loaded.clear();
+        self.showing = None;
         #[cfg(any(windows, target_os = "macos"))]
         {
             self.native = None;
         }
     }
 
+    /// Drops what was left on the page: the comments, the pins they go with, and
+    /// whatever clicking was about to do.
+    fn forget_marks(&mut self) {
+        self.mode = Mode::Off;
+        self.comments.clear();
+        self.focus_note = None;
+    }
+
     #[cfg(not(any(windows, target_os = "macos")))]
     pub fn ui(
         &mut self,
+        _owner: u64,
         _state: &mut BrowserState,
         ui: &mut egui::Ui,
         _frame: &eframe::Frame,
@@ -235,6 +248,7 @@ impl Browser {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn ui(
         &mut self,
+        owner: u64,
         state: &mut BrowserState,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
@@ -245,14 +259,16 @@ impl Browser {
         let mut commands = Vec::new();
         let mut result = BrowserAction::None;
 
-        // A different session's page belongs in the WebView now, and the comments
-        // left on the last one aren't about this page.
+        // Comments and picking belong to the session that left them, even when the
+        // next session happens to point at the same address.
+        if self.showing != Some(owner) {
+            self.forget_marks();
+            self.showing = Some(owner);
+        }
+        // The page itself only needs fetching again when the address really differs.
         let wanted = normalize_url(&state.address);
         if !self.loaded.is_empty() && self.loaded != wanted {
             commands.push(Command::Load(wanted));
-            self.mode = Mode::Off;
-            self.comments.clear();
-            self.focus_note = None;
         }
 
         // Messages from the page arrive between frames.
@@ -408,11 +424,16 @@ impl Browser {
                 } else {
                     browser.hide();
                 }
+                let navigating = commands.iter().any(|command| matches!(command, Command::Load(_)));
                 for command in commands {
                     browser.run(command);
                 }
-                // Follow links clicked inside the page, unless the user is typing an address.
-                if !address_focused && let Some(url) = browser.url() {
+                // Navigating is asynchronous, so on a frame that asked for one the
+                // WebView still reports the page it is leaving. Believing it then
+                // would write the outgoing page into this session's saved address,
+                // and record it as loaded — so the switch would never be retried
+                // and two sessions could end up trading pages for good.
+                if !navigating && !address_focused && let Some(url) = browser.url() {
                     state.address = url;
                 }
             }

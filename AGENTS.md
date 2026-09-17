@@ -42,6 +42,18 @@ Clippy being at zero is a real invariant, not an aspiration. If your change adds
 a warning, you fix the warning — you do not add `#[allow(...)]` to silence it
 unless you explain why in a comment.
 
+**A commit hook enforces both.** `.githooks/pre-commit` runs clippy with
+`-D warnings` and the test suite, and refuses the commit if either fails. It is
+in the repo rather than in `.git/hooks` so it applies to whoever is committing,
+whichever tool they are driving. Enable it once per clone:
+
+```
+git config core.hooksPath .githooks
+```
+
+Do not reach for `--no-verify`. If the hook is in your way, the build is broken
+and that is the thing to fix.
+
 ---
 
 ## 3. Hard rules

@@ -1,0 +1,23 @@
+#!/bin/sh
+# Refuses a commit that doesn't build, doesn't pass, or adds a clippy warning.
+#
+# It lives in the repo rather than in .git/hooks so that it is shared, and git
+# enforces it whoever is committing — Claude Code, Codex, Antigravity or a person.
+# Enable it once per clone:
+#
+#   git config core.hooksPath .githooks
+#
+# The whole thing takes a couple of seconds. To skip it for one commit, which
+# should be rare and deliberate: git commit --no-verify
+
+set -e
+
+echo "pre-commit: clippy"
+# -D warnings, because AGENTS.md rule 2 says this repo stays at zero.
+cargo clippy --all-targets --message-format short -- -D warnings
+
+echo "pre-commit: tests"
+# Not --ignored: some of those drive real CLIs and spend the user's money.
+cargo test --quiet
+
+echo "pre-commit: ok"

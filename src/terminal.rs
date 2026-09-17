@@ -255,7 +255,8 @@ impl Drop for Terminal {
 }
 
 /// Shows the terminal for a session, starting it the first time. `typed` is
-/// text to send to the shell as if the user had typed it, and `take_keyboard`
+/// text to send to the shell as if the user had typed it once it is running, and
+/// `take_keyboard`
 /// puts the cursor in it straight away. Returns true if the shell was restarted,
 /// since the replacement is a new terminal that wants the cursor too.
 pub fn show(
@@ -263,13 +264,15 @@ pub fn show(
     slot: &mut Option<Result<Terminal, String>>,
     cwd: &Path,
     shell: &Path,
-    typed: Option<String>,
+    typed: &mut Option<String>,
     take_keyboard: bool,
 ) -> bool {
     let terminal = slot.get_or_insert_with(|| Terminal::start(cwd, shell, ui.ctx().clone()));
     let restart = match terminal {
         Ok(terminal) => {
-            if let Some(text) = typed {
+            // Taken here rather than by the caller, so a shell that failed to start
+            // doesn't swallow the command it was opened to run.
+            if let Some(text) = typed.take() {
                 terminal.parser().screen_mut().set_scrollback(0);
                 write_all(&terminal.writer, text.as_bytes());
             }

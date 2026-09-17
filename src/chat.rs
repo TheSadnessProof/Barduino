@@ -30,7 +30,6 @@ pub enum ConversationAction {
     None,
     ChangeFolder,
     SelectProvider(Provider),
-    InsertPrompt(String),
 }
 
 /// Claude signature terracotta/coral accent for primary actions and focus states.
@@ -164,7 +163,9 @@ pub fn composer(
                     .desired_width(f32::INFINITY)
                     .hint_text(hint),
             );
-            if std::mem::take(&mut session.focus_composer) {
+            // Only when nothing else holds the keyboard. A turn finishing sets this,
+            // and it used to pull the cursor out of a terminal mid-command.
+            if std::mem::take(&mut session.focus_composer) && ui.memory(|m| m.focused().is_none()) {
                 response.request_focus();
             }
 
@@ -537,48 +538,6 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                 if folder_resp.response.clicked() {
                     action = ConversationAction::ChangeFolder;
                 }
-
-                ui.add_space(26.0);
-
-                // --- 3. Quick Actions ---
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.label(egui::RichText::new("SUGGESTED ACTIONS").size(11.0).strong().weak());
-                });
-                ui.add_space(8.0);
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-                    let starters: &[(&str, &str)] = match session.provider {
-                        Provider::Claude => &[
-                            ("/review", "Review recent changes"),
-                            ("/compact", "Compact context"),
-                            ("/help", "List CLI commands"),
-                        ],
-                        Provider::Antigravity => &[
-                            ("/goal", "Run autonomous task"),
-                            ("/schedule", "Set background timer"),
-                            ("/help", "List CLI commands"),
-                        ],
-                        Provider::Codex => &[
-                            ("/review", "Review recent changes"),
-                            ("/fix", "Diagnose & fix errors"),
-                            ("/explain", "Explain code structure"),
-                        ],
-                    };
-
-                    for &(cmd, hint) in starters {
-                        let chip_btn = egui::Button::new(
-                            egui::RichText::new(format!("{cmd}  {hint}")).small()
-                        )
-                        .corner_radius(6.0)
-                        .fill(ui.visuals().faint_bg_color)
-                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
-
-                        if ui.add(chip_btn).on_hover_text(format!("Insert {cmd} into message box")).clicked() {
-                            action = ConversationAction::InsertPrompt(format!("{cmd} "));
-                        }
-                    }
-                });
             },
         );
     });
@@ -717,8 +676,12 @@ fn output_text(ui: &mut egui::Ui, text: &str) {
         return;
     }
 
+    // The house background for output, rather than a hardcoded dark one: Windows
+    // defaults to a light theme, where a near-black card with theme-coloured text
+    // on it came out at about 2.3:1 — unreadable.
+    let background = ui.visuals().extreme_bg_color;
     egui::Frame::new()
-        .fill(egui::Color32::from_rgb(18, 18, 20))
+        .fill(background)
         .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color.gamma_multiply(0.4)))
         .corner_radius(6.0)
         .inner_margin(egui::Margin::symmetric(10, 8))
@@ -734,37 +697,44 @@ fn output_text(ui: &mut egui::Ui, text: &str) {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.small_button("Copy").on_hover_text("Copy output to clipboard").clicked() {
-                        ui.ctx().copy_text(strip_ansi(text));
+                        ui.ctx().copy_text(visible_text(text));
                     }
                 });
             });
             ui.add_space(4.0);
 
+            // Hug the content vertically. Nested in the conversation's own scroll area,
+            // `false` on the cross axis resolves to the *available* height, which
+            // changes as the user scrolls — so the card grew to fill the viewport and
+            // shifted everything under it on every frame.
             egui::ScrollArea::horizontal()
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     let font_id = egui::FontId::new(12.5, egui::FontFamily::Monospace);
-                    let job = parse_ansi_to_layout_job(text, ui.visuals().text_color(), font_id);
-                    ui.label(job);
+                    let job = parse_ansi_to_layout_job(text, ui.visuals().text_color(), background, font_id);
+                    // Extend, or `Label` wraps to the visible width and the scroll
+                    // area it sits in can never scroll.
+                    ui.add(egui::Label::new(job).wrap_mode(egui::TextWrapMode::Extend));
                 });
         });
 }
 
 /// Parses ANSI escape sequences into an egui LayoutJob with colored text spans,
 /// expanding tabs and handling carriage returns.
-fn parse_ansi_to_layout_job(text: &str, default_color: egui::Color32, font_id: egui::FontId) -> egui::text::LayoutJob {
+fn parse_ansi_to_layout_job(
+    text: &str,
+    default_color: egui::Color32,
+    background: egui::Color32,
+    font_id: egui::FontId,
+) -> egui::text::LayoutJob {
     let mut job = egui::text::LayoutJob::default();
     let mut current_fg = default_color;
     let mut bold = false;
+    let mut dim = false;
     let mut italic = false;
     let mut underline = false;
 
-    let mut lines = Vec::new();
-    for raw_line in text.lines() {
-        let effective = raw_line.rsplit('\r').find(|seg| !seg.is_empty()).unwrap_or(raw_line);
-        lines.push(effective.replace('\t', "    "));
-    }
-    let processed = lines.join("\n");
+    let processed = flatten_lines(text);
 
     let mut chars = processed.char_indices().peekable();
     let mut start = 0;
@@ -773,15 +743,7 @@ fn parse_ansi_to_layout_job(text: &str, default_color: egui::Color32, font_id: e
         if ch == '\x1b' {
             if idx > start {
                 let segment = &processed[start..idx];
-                let color = if bold && current_fg == default_color {
-                    egui::Color32::from_rgb(
-                        current_fg.r().saturating_add(40),
-                        current_fg.g().saturating_add(40),
-                        current_fg.b().saturating_add(40),
-                    )
-                } else {
-                    current_fg
-                };
+                let color = run_colour(current_fg, default_color, background, bold, dim);
                 job.append(
                     segment,
                     0.0,
@@ -796,20 +758,56 @@ fn parse_ansi_to_layout_job(text: &str, default_color: egui::Color32, font_id: e
             }
 
             chars.next();
-            if let Some(&(_, '[')) = chars.peek() {
-                chars.next();
-                let mut params = String::new();
-                while let Some(&(_, p_ch)) = chars.peek() {
+            match chars.peek() {
+                Some(&(_, '[')) => {
                     chars.next();
-                    if p_ch.is_ascii_alphabetic() {
-                        if p_ch == 'm' {
-                            apply_sgr_params(&params, &mut current_fg, &mut bold, &mut italic, &mut underline, default_color);
+                    let mut params = String::new();
+                    while let Some(&(_, p_ch)) = chars.peek() {
+                        chars.next();
+                        if p_ch.is_ascii_alphabetic() {
+                            if p_ch == 'm' {
+                                apply_sgr_params(
+                                    &params,
+                                    &mut current_fg,
+                                    &mut bold,
+                                    &mut dim,
+                                    &mut italic,
+                                    &mut underline,
+                                    default_color,
+                                );
+                            }
+                            break;
                         }
-                        break;
-                    } else {
                         params.push(p_ch);
                     }
                 }
+                // An OSC — a window title, or a hyperlink — ends at BEL or at ESC
+                // backslash, not at the first letter: its payload is full of them.
+                Some(&(_, ']')) => {
+                    chars.next();
+                    while let Some(&(_, c)) = chars.peek() {
+                        chars.next();
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' {
+                            if let Some(&(_, '\\')) = chars.peek() {
+                                chars.next();
+                            }
+                            break;
+                        }
+                    }
+                }
+                // A character-set selector, such as the ESC ( B `tput sgr0` emits.
+                Some(&(_, '(' | ')' | '*' | '+' | '%' | '#')) => {
+                    chars.next();
+                    chars.next();
+                }
+                // A single-character escape, such as ESC 7 or ESC =.
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
             }
             start = chars.peek().map(|&(i, _)| i).unwrap_or(processed.len());
         } else {
@@ -819,14 +817,17 @@ fn parse_ansi_to_layout_job(text: &str, default_color: egui::Color32, font_id: e
 
     if start < processed.len() {
         let segment = &processed[start..];
+        // Through the same helper as the runs above: output ending without a reset
+        // — a CLI killed mid-write — used to lose its bold and dim right here.
+        let color = run_colour(current_fg, default_color, background, bold, dim);
         job.append(
             segment,
             0.0,
             egui::TextFormat {
                 font_id,
-                color: current_fg,
+                color,
                 italics: italic,
-                underline: if underline { egui::Stroke::new(1.0, current_fg) } else { egui::Stroke::NONE },
+                underline: if underline { egui::Stroke::new(1.0, color) } else { egui::Stroke::NONE },
                 ..Default::default()
             },
         );
@@ -839,6 +840,7 @@ fn apply_sgr_params(
     params: &str,
     fg: &mut egui::Color32,
     bold: &mut bool,
+    dim: &mut bool,
     italic: &mut bool,
     underline: &mut bool,
     default_fg: egui::Color32,
@@ -846,26 +848,40 @@ fn apply_sgr_params(
     if params.is_empty() {
         *fg = default_fg;
         *bold = false;
+        *dim = false;
         *italic = false;
         *underline = false;
         return;
     }
 
-    let codes: Vec<u32> = params.split(';').filter_map(|s| s.parse().ok()).collect();
+    // An empty parameter means zero, per ECMA-48, so `ESC[;31m` resets and then goes
+    // red. Anything that isn't a number at all becomes a code nothing matches, which
+    // keeps the arguments of a 38 or a 48 in the right places.
+    let codes: Vec<u32> = params
+        .split(';')
+        .map(|part| if part.is_empty() { 0 } else { part.parse().unwrap_or(u32::MAX) })
+        .collect();
     let mut i = 0;
     while i < codes.len() {
         match codes[i] {
             0 => {
                 *fg = default_fg;
                 *bold = false;
+                *dim = false;
                 *italic = false;
                 *underline = false;
             }
             1 => *bold = true,
-            2 => *fg = fg.gamma_multiply(0.7),
+            // A flag rather than a change to the colour. Dimming the colour itself
+            // was cumulative and 22 never put it back, so the repeated dim spans
+            // that npm, jest and eslint emit faded the output away to nothing.
+            2 => *dim = true,
             3 => *italic = true,
             4 => *underline = true,
-            22 => *bold = false,
+            22 => {
+                *bold = false;
+                *dim = false;
+            }
             23 => *italic = false,
             24 => *underline = false,
             39 => *fg = default_fg,
@@ -894,10 +910,116 @@ fn apply_sgr_params(
                     i += 4;
                 }
             }
+            48 => {
+                // The background isn't painted, but its arguments still have to be
+                // stepped over. Unread, `38;5;208;48;5;0` went on to read the
+                // trailing 0 as "reset everything" and wiped the colour just set.
+                if i + 2 < codes.len() && codes[i + 1] == 5 {
+                    i += 2;
+                } else if i + 4 < codes.len() && codes[i + 1] == 2 {
+                    i += 4;
+                }
+            }
             _ => {}
         }
         i += 1;
     }
+}
+
+/// What a run of text is drawn in, once bold and dim have had their say and the
+/// result has been kept clear of the card behind it.
+fn run_colour(
+    fg: egui::Color32,
+    default_fg: egui::Color32,
+    background: egui::Color32,
+    bold: bool,
+    dim: bool,
+) -> egui::Color32 {
+    let mut colour = if bold && fg == default_fg {
+        egui::Color32::from_rgb(fg.r().saturating_add(40), fg.g().saturating_add(40), fg.b().saturating_add(40))
+    } else {
+        fg
+    };
+    if dim {
+        colour = colour.gamma_multiply(0.65);
+    }
+    readable_on(colour, background, default_fg)
+}
+
+/// Keeps a colour the output asked for legible on the card. A tool that assumes a
+/// dark terminal asks for black and one that assumes a light terminal asks for
+/// white; whichever way the theme goes, one of those would be invisible.
+fn readable_on(colour: egui::Color32, background: egui::Color32, fallback: egui::Color32) -> egui::Color32 {
+    let luma =
+        |c: egui::Color32| 0.2126 * f32::from(c.r()) + 0.7152 * f32::from(c.g()) + 0.0722 * f32::from(c.b());
+    if (luma(colour) - luma(background)).abs() < 40.0 { fallback } else { colour }
+}
+
+/// What a line looks like on screen: a progress bar that rewrote itself with a
+/// carriage return shows only its last state, and tabs become spaces. Shared with
+/// [`visible_text`] so what Copy hands over is what was on the screen.
+fn flatten_lines(text: &str) -> String {
+    text.lines()
+        .map(|raw| {
+            let effective = raw.rsplit('\r').find(|segment| !segment.is_empty()).unwrap_or(raw);
+            effective.replace('\t', "    ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The text the card is showing, for the Copy button.
+fn visible_text(text: &str) -> String {
+    strip_escapes(&flatten_lines(text))
+}
+
+/// Removes escape sequences and leaves the text they were dressing up.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            out.push(ch);
+            continue;
+        }
+        match chars.peek() {
+            // A CSI runs up to and including its first letter.
+            Some('[') => {
+                chars.next();
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            // An OSC — a window title, or a hyperlink — ends at BEL or at ESC
+            // backslash. Its payload is full of letters, so it can't end at the
+            // first one: that is how the h of https was eaten out of the clipboard.
+            Some(']') => {
+                chars.next();
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' {
+                        chars.next_if_eq(&'\\');
+                        break;
+                    }
+                }
+            }
+            // A character-set selector, such as the ESC ( B that `tput sgr0` emits.
+            Some('(' | ')' | '*' | '+' | '%' | '#') => {
+                chars.next();
+                chars.next();
+            }
+            // A single-character escape, such as ESC 7 or ESC =.
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    out
 }
 
 fn ansi_256_color(idx: u8) -> egui::Color32 {
@@ -922,24 +1044,6 @@ fn ansi_256_color(idx: u8) -> egui::Color32 {
             egui::Color32::from_rgb(gray, gray, gray)
         }
     }
-}
-
-/// Strips ANSI escape sequences and carriage returns so copied text is clean plain text.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_escape = false;
-    for ch in text.chars() {
-        if ch == '\x1b' {
-            in_escape = true;
-        } else if in_escape {
-            if ch.is_ascii_alphabetic() {
-                in_escape = false;
-            }
-        } else if ch != '\r' {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// Puts a block under the tool it belongs to, behind a coloured line down the left.
@@ -978,9 +1082,13 @@ fn slash_suggestions_ui(
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("{} Commands", session.provider.short_name()))
-                        .strong()
-                        .small(),
+                    egui::RichText::new(format!(
+                        "{} Commands ({})",
+                        session.provider.short_name(),
+                        matches.len()
+                    ))
+                    .strong()
+                    .small(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
@@ -1010,7 +1118,7 @@ fn slash_suggestions_ui(
 
             egui::ScrollArea::vertical()
                 .id_salt(("slash_scroll", session.id))
-                .max_height(180.0)
+                .max_height(240.0)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
@@ -1074,11 +1182,16 @@ fn slash_suggestions_ui(
                                                 egui::RichText::new(&cmd.description).weak().small(),
                                             )
                                             .truncate(),
-                                        );
+                                        )
+                                        .on_hover_text(&cmd.description);
                                     });
                                 });
                             },
                         );
+
+                        if is_selected {
+                            row.response.scroll_to_me(Some(egui::Align::Center));
+                        }
 
                         if row.response.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -1165,16 +1278,133 @@ fn shorten_note(note: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The card and the Copy button must never disagree: whatever the parser puts on
+    /// screen is exactly what the clipboard gets. The old stripper concatenated every
+    /// progress frame a `\r` had overwritten, so Copy produced text nobody had seen.
     #[test]
-    fn strip_ansi_removes_color_codes_and_carriage_returns() {
-        let raw = "\x1b[32mSuccess\x1b[0m: built in 1.2s\rDone\x1b[K";
-        assert_eq!(strip_ansi(raw), "Success: built in 1.2sDone");
+    fn copied_output_is_exactly_what_is_on_screen() {
+        let shown = |raw: &str| {
+            parse_ansi_to_layout_job(raw, egui::Color32::WHITE, egui::Color32::BLACK, egui::FontId::monospace(12.0))
+                .text
+        };
+        for raw in [
+            "\x1b[32mSuccess\x1b[0m: built in 1.2s\rDone\x1b[K",
+            "plain",
+            "tab\tseparated",
+            "\x1b[31mred\x1b[0m and \x1b[2mdim\x1b[22m",
+            "downloading 10%\rdownloading 50%\rdownloading 100%",
+            "\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
+            "",
+        ] {
+            assert_eq!(visible_text(raw), shown(raw), "copy and display disagree on {raw:?}");
+        }
+        // And specifically: only the last thing written to the line survives.
+        assert_eq!(visible_text("\x1b[32mSuccess\x1b[0m: built in 1.2s\rDone\x1b[K"), "Done");
+    }
+
+    #[test]
+    fn the_output_parser_survives_junk() {
+        let job = |raw: &str| {
+            parse_ansi_to_layout_job(raw, egui::Color32::WHITE, egui::Color32::BLACK, egui::FontId::monospace(12.0))
+        };
+        assert_eq!(job("").text, "");
+        assert_eq!(job("\x1b").text, "", "a lone escape at the very end");
+        assert_eq!(job("\x1b[").text, "", "a CSI that never finishes");
+        assert_eq!(job("\x1b[38;5").text, "", "a colour whose arguments are cut off");
+        assert_eq!(job("\x1b[999mstill here").text, "still here", "an unknown code");
+        assert_eq!(job("\x1b[99999999999mstill here").text, "still here", "a parameter too big to parse");
+        assert_eq!(job("\x1b[;;mstill here").text, "still here", "nothing but empty parameters");
+
+        // Escapes that aren't CSI have to be consumed too, or their bodies show up
+        // as literal text: a window title, and the ESC ( B that `tput sgr0` emits.
+        assert_eq!(job("\x1b]0;my window\x07after").text, "after");
+        assert_eq!(job("\x1b(Bafter").text, "after");
+        assert_eq!(visible_text("\x1b]8;;https://example.com\x1b\\click\x1b]8;;\x1b\\"), "click");
+    }
+
+    #[test]
+    fn a_background_colour_does_not_wipe_the_foreground() {
+        // What bat, delta, fzf and rg emit: orange on black, in one sequence. The
+        // background's arguments used to be read as more foreground codes, so the
+        // trailing 0 reset the orange that the same sequence had just set.
+        let job = parse_ansi_to_layout_job(
+            "\x1b[38;5;208;48;5;0morange",
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            egui::FontId::monospace(12.0),
+        );
+        assert_eq!(job.text, "orange");
+        assert_eq!(job.sections[0].format.color, egui::Color32::from_rgb(255, 135, 0));
+    }
+
+    #[test]
+    fn dim_does_not_pile_up_and_bold_survives_a_missing_reset() {
+        let job = |raw: &str| {
+            parse_ansi_to_layout_job(raw, egui::Color32::WHITE, egui::Color32::BLACK, egui::FontId::monospace(12.0))
+        };
+        // Repeated dim spans — npm, jest and eslint emit them constantly — used to
+        // multiply, fading the bottom of the card away to nothing.
+        let repeated = job("\x1b[2ma\x1b[22m\x1b[2mb\x1b[22m\x1b[2mc\x1b[22m");
+        let dimmed: Vec<egui::Color32> = repeated.sections.iter().map(|s| s.format.color).collect();
+        assert!(dimmed.windows(2).all(|pair| pair[0] == pair[1]), "each dim span is equally dim: {dimmed:?}");
+        assert!(dimmed[0] != egui::Color32::WHITE, "and dimmer than plain text");
+
+        // 22 puts the colour back, rather than leaving it dimmed for good.
+        let restored = job("\x1b[2mdim\x1b[22mplain");
+        assert_eq!(restored.sections.last().expect("two runs").format.color, egui::Color32::WHITE);
+
+        // Output cut off before its reset still gets its bold; the trailing run used
+        // to skip the styling the runs before it had. Grey, because bold brightens by
+        // adding to each channel and white has nowhere left to go.
+        let grey = egui::Color32::from_gray(180);
+        let unreset = parse_ansi_to_layout_job(
+            "plain\x1b[1mbold",
+            grey,
+            egui::Color32::BLACK,
+            egui::FontId::monospace(12.0),
+        );
+        assert_ne!(
+            unreset.sections[0].format.color,
+            unreset.sections.last().expect("two runs").format.color,
+            "bold reads brighter even with no reset at the end"
+        );
+    }
+
+    #[test]
+    fn an_empty_parameter_counts_as_zero() {
+        // ECMA-48: `ESC[;31m` is a reset followed by red.
+        let job = parse_ansi_to_layout_job(
+            "\x1b[1m\x1b[;31mred",
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            egui::FontId::monospace(12.0),
+        );
+        assert_eq!(job.sections.last().expect("a run").format.color, egui::Color32::from_rgb(220, 60, 60));
+    }
+
+    #[test]
+    fn a_colour_that_would_vanish_into_the_card_is_replaced() {
+        // A tool assuming a dark terminal asks for black; on a dark card that is
+        // invisible, so it falls back to the theme's own text colour.
+        let on_dark = readable_on(egui::Color32::BLACK, egui::Color32::from_gray(16), egui::Color32::WHITE);
+        assert_eq!(on_dark, egui::Color32::WHITE);
+        // The same the other way round, which is what a light theme gets.
+        let on_light = readable_on(egui::Color32::WHITE, egui::Color32::from_gray(248), egui::Color32::BLACK);
+        assert_eq!(on_light, egui::Color32::BLACK);
+        // A colour with room around it is left exactly as the output asked.
+        let red = egui::Color32::from_rgb(220, 60, 60);
+        assert_eq!(readable_on(red, egui::Color32::from_gray(16), egui::Color32::WHITE), red);
     }
 
     #[test]
     fn ansi_parser_expands_tabs_and_handles_colors() {
         let text = "\x1b[31mError\x1b[0m:\tfailed";
-        let job = parse_ansi_to_layout_job(text, egui::Color32::WHITE, egui::FontId::monospace(12.0));
+        let job = parse_ansi_to_layout_job(
+            text,
+            egui::Color32::WHITE,
+            egui::Color32::BLACK,
+            egui::FontId::monospace(12.0),
+        );
         assert_eq!(job.text, "Error:    failed");
         assert_eq!(job.sections.len(), 2);
         assert_eq!(job.sections[0].format.color, egui::Color32::from_rgb(220, 60, 60));
@@ -1196,30 +1426,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_session_quick_starters_cover_all_providers() {
-        for &provider in &Provider::ALL {
-            let starters: &[(&str, &str)] = match provider {
-                Provider::Claude => &[
-                    ("/review", "Review recent changes"),
-                    ("/compact", "Compact context"),
-                    ("/help", "List CLI commands"),
-                ],
-                Provider::Antigravity => &[
-                    ("/goal", "Run autonomous task"),
-                    ("/schedule", "Set background timer"),
-                    ("/help", "List CLI commands"),
-                ],
-                Provider::Codex => &[
-                    ("/review", "Review recent changes"),
-                    ("/fix", "Diagnose & fix errors"),
-                    ("/explain", "Explain code structure"),
-                ],
-            };
-            assert!(!starters.is_empty());
-            for &(cmd, hint) in starters {
-                assert!(cmd.starts_with('/'));
-                assert!(!hint.is_empty());
-            }
-        }
+    fn empty_session_without_folder_is_detected() {
+        let session = Session::new(1, std::path::PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
+        assert!(!session.has_folder(), "new session with empty path has no folder");
     }
 }

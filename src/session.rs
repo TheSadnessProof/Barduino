@@ -74,7 +74,12 @@ impl UserMessage {
 }
 
 /// One conversation with an agent, tied to a project folder.
+///
+/// `default` at the struct level as well as on the newer fields: `SavedState` holds
+/// every session in one RON document, so a single unreadable field here would take
+/// the whole file — all sessions, settings and history — down with it.
 #[derive(Serialize, Deserialize)]
+#[serde(default)]
 pub struct Session {
     pub id: u64,
     pub title: String,
@@ -123,6 +128,12 @@ pub struct Session {
     pub slash_query: String,
     #[serde(skip)]
     pub slash_dismissed: bool,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new(0, PathBuf::new(), Provider::default(), PermissionMode::default())
+    }
 }
 
 impl Session {

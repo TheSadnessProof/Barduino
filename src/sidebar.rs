@@ -82,6 +82,10 @@ impl Sidebar {
     pub fn invalidate(&mut self, dir: &Path) {
         if let Some(summary) = self.summaries.get_mut(dir) {
             summary.asked = false;
+            // Whatever is in flight was read before the agent finished, so its
+            // answer is already stale. Dropping the slot here means the next ask
+            // replaces it rather than leaving two reads racing.
+            summary.loading = None;
         }
     }
 

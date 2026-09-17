@@ -106,8 +106,11 @@ pub enum AgentEvent {
 }
 
 /// What the agent is allowed to do without asking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PermissionMode {
+    /// The default, because a save that has lost this field must not come back
+    /// granting more than the user had chosen.
+    #[default]
     ReadOnly,
     AcceptEdits,
     /// Everything the agent asks for is allowed, including running commands.

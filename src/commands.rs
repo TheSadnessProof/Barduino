@@ -2,9 +2,28 @@
 //! and agent skills discovered in real time as the user types.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::agent::{self, Provider};
+
+/// How long a scan is reused before the folders are read again: long enough that
+/// typing doesn't re-read the disk on every frame, short enough that a skill added
+/// while the menu is open still turns up.
+const RESCAN_AFTER: Duration = Duration::from_millis(1500);
+
+/// The last scan, kept because [`discover`] is called from the composer on every
+/// frame the menu is open, and reading several directories plus a `SKILL.md` each
+/// at frame rate is a lot of disk for a list that hardly ever changes.
+static LAST_SCAN: Mutex<Option<Scan>> = Mutex::new(None);
+
+struct Scan {
+    provider: Provider,
+    project_dir: PathBuf,
+    at: Instant,
+    commands: Vec<SlashCommand>,
+}
 
 /// The origin of a slash command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,31 +60,83 @@ pub struct SlashCommand {
 pub fn builtin_commands(provider: Provider) -> &'static [(&'static str, &'static str)] {
     match provider {
         Provider::Claude => &[
-            ("help", "Show available Claude commands and CLI usage"),
-            ("compact", "Clear conversation history but keep a summary in context"),
+            ("help", "Show help and available commands"),
+            ("compact", "Free up context by summarizing the conversation so far"),
+            ("clear", "Start a new session with empty context; previous session stays on disk"),
             ("cost", "Show token usage and estimated cost for this session"),
+            ("context", "Visualize current context usage as a colored grid"),
+            ("memory", "Edit CLAUDE.md files and memory settings"),
             ("review", "Review recent changes and diffs in the project"),
             ("init", "Initialize CLAUDE.md guidelines and project config"),
             ("doctor", "Check system health and tool installations"),
-            ("terminal-setup", "Configure terminal integration and Shift+Enter bindings"),
-            ("bug", "Report a bug or issue to Anthropic"),
-            ("clear", "Reset conversation context and clear the screen"),
-            ("config", "Open configuration to manage settings"),
+            ("add-dir", "Add a new working directory"),
+            ("artifacts", "Browse your published and shared artifacts"),
+            ("btw", "Ask a quick side question without interrupting the main conversation"),
+            ("cd", "Move this session to a new working directory"),
+            ("ide", "Manage IDE integrations and show status"),
+            ("install-github-app", "Set up Claude GitHub Actions for a repository"),
+            ("install-slack-app", "Install the Claude Slack app"),
+            ("mcp", "Manage MCP servers"),
+            ("resume", "Resume a previous conversation"),
+            ("skills", "List available skills"),
+            ("tasks", "View and manage everything running in the background"),
+            ("skill-doctor", "Show which loaded skills are unused and costing context"),
+            ("permissions", "Manage allow and deny tool permission rules"),
+            ("branch", "Create a branch of the current conversation at this point"),
+            ("fork", "Spawn a background agent that inherits the full conversation"),
+            ("subtask", "Send a subagent off with your full context; its result comes back here"),
+            ("reload-plugins", "Activate pending plugin changes in the current session"),
+            ("reload-skills", "Pick up skills added or changed on disk during this session"),
+            ("ultraplan", "Claude Code on the web drafts a plan you can edit and approve"),
+            ("ultrareview", "Find and verify bugs in your branch using Claude Code on the web"),
+            ("teleport", "Send this session to the cloud, or resume one from claude.ai"),
+            ("schedule", "Create and manage scheduled remote Claude Code agents"),
+            ("autofix-pr", "Monitor and autofix any issues with the current PR"),
+            ("model", "Set model for this session"),
+            ("effort", "Set effort level for model usage"),
+            ("plan", "Enable plan mode or view the current session plan"),
+            ("theme", "Change the theme"),
+            ("tui", "Set the terminal UI renderer (default | fullscreen)"),
+            ("config", "Open settings"),
             ("pr-comments", "Fetch and review GitHub pull request comments"),
-            ("login", "Sign in with your Anthropic account"),
-            ("logout", "Sign out of your Anthropic account"),
+            ("bug", "Report a bug or share your conversation"),
+            ("feedback", "Send feedback to Anthropic or report a bug"),
+            ("login", "Sign in to your Anthropic account"),
+            ("logout", "Sign out from your Anthropic account"),
+            ("terminal-setup", "Configure terminal integration and Shift+Enter bindings"),
+            ("copy", "Copy Claude's last response to clipboard"),
+            ("autocompact", "Set how full the context gets before auto-summarizing"),
+            ("status", "Show Claude Code status including version, model, account, and tools"),
+            ("voice", "Toggle voice mode"),
+            ("powerup", "Discover Claude Code features through quick interactive lessons"),
+            ("loops", "List, create, and delete loops"),
+            ("hooks", "View hook configurations for tool events"),
+            ("export", "Export the current conversation to a file or clipboard"),
+            ("usage-credits", "Configure usage credits or request them from your admin"),
+            ("recap", "Generate a one-line session recap now"),
+            ("goal", "Set a goal Claude checks before stopping"),
         ],
         Provider::Antigravity => &[
+            ("help", "Show available commands and keybindings"),
+            ("agents", "List available custom agents"),
+            ("changelog", "Show release notes and changes"),
+            ("config", "Open settings panel"),
+            ("credits", "Show remaining G1 credits and purchase link"),
+            ("effort", "Set the reasoning effort"),
+            ("hooks", "Manage hook configurations for tool events"),
+            ("model", "Set a model, or run a single prompt on another model"),
+            ("permissions", "Manage tool permissions"),
+            ("skills", "List available skills"),
+            ("usage", "View model quota usage"),
+            ("mode", "Set the agent execution mode (accept-edits, plan)"),
+            ("plugin", "Manage plugins (install, uninstall, list, enable, disable)"),
             ("goal", "Run an autonomous long-running task thoroughly until completion"),
             ("schedule", "Schedule an instruction on a recurring cron schedule or timer"),
             ("grill-me", "Align on a plan through an interactive interview to resolve decisions"),
             ("learn", "Extract and persist learnings, patterns, and conventions from this session"),
-            ("help", "View Antigravity help, commands, and CLI options"),
-            ("mode", "Set agent execution mode (plan or accept-edits)"),
-            ("model", "View or switch the active reasoning model"),
-            ("mcp", "Manage MCP servers and external tools"),
-            ("plugin", "Manage and inspect installed plugins"),
-            ("changelog", "View recent Antigravity release notes and changes"),
+            ("remote-control", "Manage the remote-control background daemon"),
+            ("clear", "Start a new session with empty context"),
+            ("compact", "Summarize conversation history to conserve context"),
         ],
         Provider::Codex => &[
             ("help", "View Codex help and available commands"),
@@ -74,6 +145,23 @@ pub fn builtin_commands(provider: Provider) -> &'static [(&'static str, &'static
             ("explain", "Explain code structure, architecture, or logic"),
             ("test", "Generate comprehensive unit tests for the current code"),
             ("plan", "Create an implementation plan before making modifications"),
+            ("goal", "Set or adjust objective for the current session"),
+            ("diff", "Show git diff of uncommitted changes"),
+            ("clear", "Reset conversation context and start fresh"),
+            ("compact", "Compact context by summarizing conversation history"),
+            ("model", "View or change the active model"),
+            ("mcp", "Manage external MCP servers and tools"),
+            ("skills", "List and manage installed Codex skills"),
+            ("apps", "Manage connected ChatGPT apps and plugins"),
+            ("usage", "View quota, token usage, and limits"),
+            ("recap", "Generate a summary of the current session"),
+            ("raw", "Toggle raw output mode without formatting"),
+            ("keymap", "Display keyboard shortcuts and key bindings"),
+            ("status", "Show session metadata and agent status"),
+            ("settings", "Open configuration and preferences"),
+            ("feedback", "Submit feedback or report an issue"),
+            ("logout", "Remove stored authentication credentials"),
+            ("exit", "End the current session"),
         ],
     }
 }
@@ -81,6 +169,26 @@ pub fn builtin_commands(provider: Provider) -> &'static [(&'static str, &'static
 /// Discovers all available slash commands for a provider in real time,
 /// including built-in commands, project skills, and custom commands.
 pub fn discover(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
+    let mut last = LAST_SCAN.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(scan) = last.as_ref()
+        && scan.provider == provider
+        && scan.project_dir == project_dir
+        && scan.at.elapsed() < RESCAN_AFTER
+    {
+        return scan.commands.clone();
+    }
+    let commands = scan_everything(provider, project_dir);
+    *last = Some(Scan {
+        provider,
+        project_dir: project_dir.to_owned(),
+        at: Instant::now(),
+        commands: commands.clone(),
+    });
+    commands
+}
+
+/// Reads the folders. Separate from [`discover`] so that it can be cached.
+fn scan_everything(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
 
@@ -108,6 +216,7 @@ pub fn discover(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
                 scan_skills(&project_dir.join(".gemini").join("skills"), &mut commands, &mut seen);
             }
             Provider::Codex => {
+                scan_skills(&project_dir.join(".codex").join("skills"), &mut commands, &mut seen);
                 scan_skills(&project_dir.join(".agents").join("skills"), &mut commands, &mut seen);
             }
         }
@@ -118,6 +227,12 @@ pub fn discover(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
         match provider {
             Provider::Claude => {
                 scan_claude_commands(&home.join(".claude").join("commands"), &mut commands, &mut seen);
+                scan_skills(&home.join(".claude").join("skills"), &mut commands, &mut seen);
+                scan_claude_plugin_marketplaces(
+                    &home.join(".claude").join("plugins").join("marketplaces"),
+                    &mut commands,
+                    &mut seen,
+                );
             }
             Provider::Antigravity => {
                 scan_skills(&home.join(".gemini").join("config").join("skills"), &mut commands, &mut seen);
@@ -127,11 +242,31 @@ pub fn discover(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> {
                     &mut seen,
                 );
             }
-            Provider::Codex => {}
+            Provider::Codex => {
+                scan_skills(&home.join(".codex").join("skills"), &mut commands, &mut seen);
+                scan_skills(&home.join(".codex").join("skills").join(".system"), &mut commands, &mut seen);
+            }
         }
     }
 
     commands
+}
+
+/// Scans marketplace plugins for packaged commands and skills (`<marketplace>/plugins/*`).
+fn scan_claude_plugin_marketplaces(dir: &Path, commands: &mut Vec<SlashCommand>, seen: &mut HashSet<String>) {
+    let Ok(marketplaces) = std::fs::read_dir(dir) else { return };
+    for marketplace in marketplaces.flatten() {
+        let plugins = marketplace.path().join("plugins");
+        let Ok(entries) = std::fs::read_dir(&plugins) else { continue };
+        for entry in entries.flatten() {
+            let plugin_dir = entry.path();
+            if !plugin_dir.is_dir() {
+                continue;
+            }
+            scan_claude_commands(&plugin_dir.join("commands"), commands, seen);
+            scan_skills(&plugin_dir.join("skills"), commands, seen);
+        }
+    }
 }
 
 /// Scans a directory of skills (`<dir>/<skill_name>/SKILL.md`).
@@ -279,6 +414,27 @@ mod tests {
                 assert!(!desc.is_empty(), "command description should explain what it does");
             }
         }
+    }
+
+    #[test]
+    fn providers_builtins_match_their_clis() {
+        let claude_names: HashSet<&str> = builtin_commands(Provider::Claude).iter().map(|(n, _)| *n).collect();
+        assert!(claude_names.contains("compact"), "claude has compact");
+        assert!(claude_names.contains("context"), "claude has context");
+        assert!(claude_names.contains("cost"), "claude has cost");
+        assert!(claude_names.contains("memory"), "claude has memory");
+
+        let agy_names: HashSet<&str> = builtin_commands(Provider::Antigravity).iter().map(|(n, _)| *n).collect();
+        assert!(agy_names.contains("agents"), "agy has agents");
+        assert!(agy_names.contains("changelog"), "agy has changelog");
+        assert!(agy_names.contains("credits"), "agy has credits");
+        assert!(agy_names.contains("skills"), "agy has skills");
+
+        let codex_names: HashSet<&str> = builtin_commands(Provider::Codex).iter().map(|(n, _)| *n).collect();
+        assert!(codex_names.contains("diff"), "codex has diff");
+        assert!(codex_names.contains("goal"), "codex has goal");
+        assert!(codex_names.contains("apps"), "codex has apps");
+        assert!(codex_names.contains("review"), "codex has review");
     }
 
     #[test]

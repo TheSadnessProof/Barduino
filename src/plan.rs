@@ -20,7 +20,12 @@ const MAX_SESSION_FILE: u64 = 32 * 1024 * 1024;
 const RECENT_FILES: usize = 6;
 
 /// One of a provider's limit windows, such as Claude's five-hour window.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `default` because this is saved: without it, adding a field here would stop the
+/// whole file loading, and the user would lose every session rather than a figure
+/// that gets read again on the next turn anyway.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Window {
     pub name: String,
     /// The share of the limit used, where 1.0 is all of it.
@@ -29,8 +34,10 @@ pub struct Window {
     pub resets_at: Option<i64>,
 }
 
-/// A provider's plan usage as it reported it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A provider's plan usage as it reported it. `default` for the same reason as
+/// [`Window`]: a missing field here must not cost the user their sessions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PlanUsage {
     pub windows: Vec<Window>,
     /// Anything else the provider mentions, such as the plan name or credits left.

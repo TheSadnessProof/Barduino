@@ -51,6 +51,17 @@ fn saved_before_panel_defaults() -> bool {
     true
 }
 
+/// Copies a save that couldn't be read somewhere safe, before eframe writes over
+/// it. Returns what to tell the user, when there is anything to tell.
+fn keep_unreadable_save(raw: String) -> Option<String> {
+    let backup = eframe::storage_dir("Barduino")?.join("app.ron.bak");
+    std::fs::write(&backup, raw).ok()?;
+    Some(format!(
+        "Your saved sessions couldn't be read, so Barduino has started empty. The old file was kept at {} —          keep hold of it if you want them back.",
+        backup.display()
+    ))
+}
+
 /// Sessions saved before each of them had its own browser take the one address
 /// that used to be saved for the whole app, so nobody loses the page they had open.
 fn carry_browser_over(sessions: &mut [Session], saved: BrowserState) {
@@ -96,6 +107,8 @@ pub struct BarduinoApp {
     shells: Vec<terminal::Shell>,
     /// Set until the width egui remembers for the right panel has been forgotten.
     forget_panel_width: bool,
+    /// Something the user has to be told, shown across the top until dismissed.
+    notice: Option<String>,
     /// Markdown the conversation has already laid out, kept so it isn't redone each frame.
     markdown: egui_commonmark::CommonMarkCache,
     /// The models each CLI offers, read in the background when first needed.
@@ -114,19 +127,33 @@ pub struct BarduinoApp {
 
 impl BarduinoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut state: SavedState =
-            cc.storage.and_then(|storage| eframe::get_value(storage, eframe::APP_KEY)).unwrap_or_default();
+        let stored = cc.storage.and_then(|storage| eframe::get_value::<SavedState>(storage, eframe::APP_KEY));
+        // Nothing saved is an ordinary first launch. Something saved that won't read
+        // is not: eframe hands back None either way, and its next autosave — thirty
+        // seconds later — would write an empty state over the file. So it is copied
+        // aside first, and the user is told where it went.
+        let mut notice = None;
+        let mut state = stored.unwrap_or_else(|| {
+            notice = cc
+                .storage
+                .and_then(|storage| storage.get_string(eframe::APP_KEY))
+                .and_then(keep_unreadable_save);
+            SavedState::default()
+        });
         let old_address = std::mem::take(&mut state.browser_address);
         if state.browser.address.is_empty() {
             state.browser.address = old_address;
         }
-        // Someone who had the panel open keeps it closed from now on, at the new width.
         let apply_panel_defaults = std::mem::take(&mut state.apply_panel_defaults);
-        if apply_panel_defaults {
-            state.show_tools = false;
-        }
-        // The right tools panel starts closed by default on launch.
+        // The right tools panel starts closed on every launch, new width and all.
         state.show_tools = false;
+        // Live terminals and browser pages are keyed by session ID, so a repeated ID
+        // would have two sessions sharing one panel and one agent's output going to
+        // the other. Whatever the file says, start above every ID already in it.
+        let highest = state.sessions.iter().map(|session| session.id).max();
+        if let Some(highest) = highest {
+            state.next_session_id = state.next_session_id.max(highest + 1);
+        }
         carry_browser_over(&mut state.sessions, std::mem::take(&mut state.browser));
         let (events_tx, events_rx) = mpsc::channel();
 
@@ -146,6 +173,7 @@ impl BarduinoApp {
             plan_errors: std::collections::BTreeMap::new(),
             plan_from_disk: plan::read_in_background(&cc.egui_ctx),
             forget_panel_width: apply_panel_defaults,
+            notice,
             events_tx,
             events_rx,
         };
@@ -200,11 +228,7 @@ impl BarduinoApp {
         // Dropping the session stops its agent if it's still working, and dropping
         // its panel stops any shell it had open.
         let removed = self.state.sessions.remove(index);
-        if let Some(panel) = self.tools.remove(&id)
-            && panel.shows_browser()
-        {
-            self.browser.close();
-        }
+        self.tools.remove(&id);
 
         if self.state.sessions.is_empty() {
             self.new_session(removed.project_dir, removed.permission_mode);
@@ -260,8 +284,22 @@ impl BarduinoApp {
         if dir == session.project_dir {
             return;
         }
+        // A path that isn't valid UTF-8 can't be serialized, and eframe only logs
+        // that failure — so every save from then on would quietly do nothing.
+        if dir.to_str().is_none() {
+            self.notice = Some(format!(
+                "Barduino can't work in {} — the folder name has characters it can't save.",
+                dir.display()
+            ));
+            return;
+        }
         if session.entries.is_empty() {
+            let id = session.id;
             session.project_dir = dir;
+            // The panel's terminals were started in the old folder — before one was
+            // chosen, that is Barduino's own — and its Changes tab watches it. Left
+            // alone they would quietly be about the wrong project, so they go.
+            self.tools.remove(&id);
         } else {
             // A conversation belongs to its folder, so a different folder gets a new session.
             let permission_mode = session.permission_mode;
@@ -415,11 +453,6 @@ impl BarduinoApp {
                     session.effort = None;
                 }
             }
-            chat::ConversationAction::InsertPrompt(prompt) => {
-                let session = self.active_session_mut();
-                session.input = prompt;
-                session.focus_composer = true;
-            }
             chat::ConversationAction::None => {}
         }
 
@@ -452,6 +485,27 @@ impl BarduinoApp {
         self.handle_sidebar(action, ui.ctx());
     }
 
+    /// A line across the top for something the user has to see, such as a save that
+    /// couldn't be read. It stays until dismissed, because it is usually the only
+    /// chance they get to rescue the old file.
+    fn notice_banner(&mut self, ui: &mut egui::Ui) {
+        let Some(text) = self.notice.clone() else { return };
+        let mut dismissed = false;
+        egui::Panel::top(egui::Id::new("notice_banner")).show(ui, |ui| {
+            ui.add_space(5.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(&text).color(ui.visuals().warn_fg_color));
+                if ui.small_button("Dismiss").clicked() {
+                    dismissed = true;
+                }
+            });
+            ui.add_space(5.0);
+        });
+        if dismissed {
+            self.notice = None;
+        }
+    }
+
     fn right_panel(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let collapsed = egui::Panel::right(egui::Id::new("tools_rail")).resizable(false).exact_size(44.0);
         // A fifth of the window to start with, which the user can then drag wider.
@@ -473,7 +527,7 @@ impl BarduinoApp {
         let page = &mut self.state.sessions[index].browser;
         let action = egui::Panel::show_switched(ui, &mut show, collapsed, expanded, |ui, expanded| {
             if expanded {
-                let session = PanelContext { cwd: &cwd, shell: &shell, browser, page };
+                let session = PanelContext { id, cwd: &cwd, shell: &shell, browser, page };
                 return tools.ui(ui, frame, session, &mut collapse);
             }
             browser.hide();
@@ -488,6 +542,12 @@ impl BarduinoApp {
         self.state.show_tools = (show || expand) && !collapse;
         if !self.state.show_tools {
             self.browser.hide();
+        }
+        // One WebView is shared between every session, so it outlives any single
+        // panel: closing a browser tab in one session must not destroy the page
+        // another session still has open. It goes only once nobody wants it.
+        if !self.tools.values().any(Tools::wants_browser) {
+            self.browser.close();
         }
         if collapse || expand {
             ui.ctx().request_repaint();
@@ -560,6 +620,7 @@ impl eframe::App for BarduinoApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         self.browser.release_focus_on_click(ui.ctx());
+        self.notice_banner(ui);
         self.left_panel(ui);
         self.right_panel(ui, frame);
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| match self.view {
@@ -576,6 +637,80 @@ impl eframe::App for BarduinoApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The state this app actually saves, rather than an empty one. Everything below
+    /// goes through RON, which is what eframe writes.
+    fn populated_state() -> SavedState {
+        let mut session = Session::new(7, PathBuf::from(r"C:\worklpha"), Provider::Codex, PermissionMode::Full);
+        session.title = "Fix the login form".into();
+        session.entries.push(crate::session::Entry::User(crate::session::UserMessage { text: "hi".into(), elements: Vec::new() }));
+        session.entries.push(crate::session::Entry::Agent("hello".into()));
+        session.entries.push(crate::session::Entry::Error("boom".into()));
+        session.input = "half-written".into();
+        session.browser.address = "localhost:5173".into();
+
+        let mut state = SavedState { sessions: vec![session], active_session: 7, next_session_id: 8, ..Default::default() };
+        state.settings.shell = Some(PathBuf::from(r"C:\Windows\System32\cmd.exe"));
+        state.plan.insert(
+            Provider::Claude,
+            PlanUsage {
+                windows: vec![crate::plan::Window { name: "five-hour".into(), used: 0.25, resets_at: Some(1) }],
+                notes: vec!["Max plan".into()],
+                read_at: 42,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn a_real_state_survives_the_round_trip_eframe_does() {
+        let saved = ron::to_string(&populated_state()).expect("should save");
+        let back: SavedState = ron::from_str(&saved).expect(&saved);
+        assert_eq!(back.sessions.len(), 1);
+        assert_eq!(back.sessions[0].entries.len(), 3, "the conversation comes back whole");
+        assert_eq!(back.sessions[0].input, "half-written", "including the unsent message");
+        assert_eq!(back.sessions[0].browser.address, "localhost:5173");
+        assert_eq!(back.sessions[0].permission_mode, PermissionMode::Full);
+        assert_eq!(back.settings.shell, populated_state().settings.shell);
+        assert_eq!(back.plan[&Provider::Claude].windows[0].used, 0.25);
+        assert_eq!(back.next_session_id, 8);
+    }
+
+    #[test]
+    fn one_missing_field_costs_that_field_and_not_every_session() {
+        // Everything in SavedState lives in one RON document, so a struct without
+        // defaults used to take the whole file — every session — down with it.
+        let with_thin_plan = r#"(sessions: [], plan: {Claude: (windows: [])})"#;
+        let state: SavedState = ron::from_str(with_thin_plan).expect("a thin plan entry must still load");
+        assert_eq!(state.plan[&Provider::Claude].read_at, 0, "the figure is lost, the file is not");
+
+        let thin_window = r#"(sessions: [], plan: {Claude: (windows: [(name: "five-hour")])})"#;
+        let state: SavedState = ron::from_str(thin_window).expect("a thin window must still load");
+        assert_eq!(state.plan[&Provider::Claude].windows[0].used, 0.0);
+
+        // A session that has lost a core field keeps the rest of the file readable,
+        // and comes back read-only rather than with more access than was chosen.
+        let thin_session = r#"(sessions: [(id: 3, title: "kept", entries: [Agent("hi")])])"#;
+        let state: SavedState = ron::from_str(thin_session).expect("a thin session must still load");
+        assert_eq!(state.sessions[0].title, "kept");
+        assert_eq!(state.sessions[0].entries.len(), 1);
+        assert_eq!(state.sessions[0].permission_mode, PermissionMode::ReadOnly, "never more than was granted");
+    }
+
+    #[test]
+    fn a_reused_session_id_cannot_come_back_from_disk() {
+        // Live terminals and browser pages are keyed by session ID, so a repeat would
+        // have two sessions sharing one panel and misroute an agent's output.
+        let saved = r#"(sessions: [(id: 0, title: "a", entries: []), (id: 9, title: "b", entries: [])])"#;
+        let mut state: SavedState = ron::from_str(saved).expect("should load");
+        assert_eq!(state.next_session_id, 0, "the file says zero, which is already taken");
+
+        let highest = state.sessions.iter().map(|session| session.id).max();
+        if let Some(highest) = highest {
+            state.next_session_id = state.next_session_id.max(highest + 1);
+        }
+        assert_eq!(state.next_session_id, 10, "so the next one starts clear of both");
+    }
 
     #[test]
     fn the_one_saved_browser_address_reaches_every_old_session() {
