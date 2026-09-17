@@ -17,7 +17,6 @@ pub enum Icon {
     /// A speech bubble, for leaving a comment on a web page.
     Comment,
     Settings,
-    Microphone,
 }
 
 const SIZE: f32 = 26.0;
@@ -76,14 +75,6 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             for (from, to) in [(vec2(-r, 0.0), vec2(-r * 0.3, 0.0)), (vec2(r, 0.0), vec2(r * 0.3, 0.0))] {
                 painter.line_segment([c + from, c + to], stroke);
             }
-        }
-        Icon::Microphone => {
-            let body = Rect::from_center_size(c - vec2(0.0, r * 0.3), vec2(r * 0.8, r * 1.3));
-            painter.rect_stroke(body, r * 0.4, stroke, egui::StrokeKind::Middle);
-            let cup = [pos2(c.x - r * 0.75, c.y - r * 0.1), pos2(c.x - r * 0.7, c.y + r * 0.35), pos2(c.x, c.y + r * 0.6)];
-            painter.line(cup.to_vec(), stroke);
-            painter.line(cup.iter().map(|p| pos2(2.0 * c.x - p.x, p.y)).collect(), stroke);
-            painter.line_segment([pos2(c.x, c.y + r * 0.6), pos2(c.x, c.y + r)], stroke);
         }
         Icon::Comment => {
             let body = Rect::from_min_max(c + vec2(-r, -r * 0.8), c + vec2(r, r * 0.35));

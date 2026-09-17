@@ -131,7 +131,7 @@ pub struct SettingsPage {
 
 impl Default for SettingsPage {
     fn default() -> Self {
-        Self { period: Period::Week, confirm_reset: false }
+        Self { period: Period::Today, confirm_reset: false }
     }
 }
 
@@ -377,7 +377,7 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if context.plan_checks.is_running(provider) {
                         ui.spinner();
-                        ui.label(egui::RichText::new("Checking…").small().weak());
+                        ui.label(egui::RichText::new("Checking…").weak());
                     } else {
                         let installed = context.detected.get(provider).is_some();
                         let check = ui
@@ -388,14 +388,14 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
                             action = Some(SettingsAction::CheckPlan(vec![provider]));
                         }
                         if let Some(plan) = reported {
-                            ui.label(egui::RichText::new(plan::read_at_text(plan.read_at)).small().weak());
+                            ui.label(egui::RichText::new(plan::read_at_text(plan.read_at)).weak());
                         }
                     }
                 });
             });
             if let Some(problem) = context.plan_errors.get(&provider) {
                 ui.add_space(4.0);
-                ui.label(egui::RichText::new(problem).small().color(WARN));
+                ui.label(egui::RichText::new(problem).color(WARN));
             }
             match reported {
                 Some(plan) => {
@@ -426,7 +426,7 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
 
 /// One limit window: what it is, how full it is, and when it starts over.
 fn plan_window_row(ui: &mut egui::Ui, window: &crate::plan::Window) {
-    const METER_WIDTH: f32 = 220.0;
+    const METER_WIDTH: f32 = 200.0;
     let colour = if window.used >= 1.0 {
         OVER
     } else if window.used >= 0.8 {
@@ -434,13 +434,17 @@ fn plan_window_row(ui: &mut egui::Ui, window: &crate::plan::Window) {
     } else {
         GOOD
     };
-    ui.label(egui::RichText::new(&window.name).small());
+    ui.label(&window.name);
     meter(ui, window.used, colour, Some(METER_WIDTH));
     let percent = format!("{:.0}%", (window.used * 100.0).min(100.0));
-    ui.label(egui::RichText::new(percent).monospace().small().color(colour));
-    let left = if window.used >= 1.0 { "used up".to_owned() } else { format!("{:.0}% left", (1.0 - window.used) * 100.0) };
+    ui.label(egui::RichText::new(percent).monospace().strong().color(colour));
+    let left = if window.used >= 1.0 {
+        "used up".to_owned()
+    } else {
+        format!("{:.0}% left", (1.0 - window.used) * 100.0)
+    };
     let resets = plan::resets_text(window.resets_at).map(|text| format!(" · {text}")).unwrap_or_default();
-    ui.label(egui::RichText::new(format!("{left}{resets}")).small().weak());
+    ui.label(egui::RichText::new(format!("{left}{resets}")).weak());
     ui.end_row();
 }
 
@@ -560,14 +564,15 @@ fn provider_card(
 /// A heading for a group of settings, with room for a control on the right.
 fn section_heading(ui: &mut egui::Ui, title: &str, right: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(title.to_uppercase()).small().strong().color(ui.visuals().weak_text_color()));
+        let label = egui::RichText::new(title.to_uppercase()).strong().color(ui.visuals().weak_text_color());
+        ui.label(label);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), right);
     });
     ui.add_space(2.0);
 }
 
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).small().weak());
+    ui.label(egui::RichText::new(text).weak());
 }
 
 /// A panel with a soft background, used for every block on the page.
@@ -640,7 +645,7 @@ fn stat(ui: &mut egui::Ui, value: &str, name: &str) {
 /// A thin bar showing how full something is. `fraction` above 1.0 fills it completely,
 /// and `width` defaults to the room that's left.
 fn meter(ui: &mut egui::Ui, fraction: f32, colour: egui::Color32, width: Option<f32>) {
-    const HEIGHT: f32 = 6.0;
+    const HEIGHT: f32 = 8.0;
     let width = width.unwrap_or_else(|| ui.available_width());
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, HEIGHT), egui::Sense::hover());
     if !ui.is_rect_visible(rect) {

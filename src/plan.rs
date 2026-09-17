@@ -75,24 +75,30 @@ fn claude_window_name(key: &str) -> String {
     }
 }
 
-/// Codex's `rate_limits`, where the figures are percentages.
-fn from_codex(limits: &Value) -> Option<PlanUsage> {
+/// The windows in one Codex `rate_limits` entry, each with the length of its window,
+/// where the figures are percentages. Codex puts them in two named slots and doesn't
+/// always fill both: lately it reports only the weekly one.
+fn codex_windows(limits: &Value) -> Vec<(i64, Window)> {
     let mut windows = Vec::new();
     for key in ["primary", "secondary"] {
         let window = &limits[key];
         if let Some(percent) = window["used_percent"].as_f64() {
-            windows.push(Window {
-                name: codex_window_name(window["window_minutes"].as_i64()),
-                used: (percent / 100.0) as f32,
-                resets_at: window["resets_at"].as_i64(),
-            });
+            let minutes = window["window_minutes"].as_i64();
+            windows.push((
+                minutes.unwrap_or_default(),
+                Window {
+                    name: codex_window_name(minutes),
+                    used: (percent / 100.0) as f32,
+                    resets_at: window["resets_at"].as_i64(),
+                },
+            ));
         }
     }
-    if windows.is_empty() {
-        return None;
-    }
-    windows.sort_by_key(|window| window.resets_at.unwrap_or(i64::MAX));
+    windows
+}
 
+/// What Codex says about the account besides the windows themselves.
+fn codex_notes(limits: &Value) -> Vec<String> {
     let mut notes = Vec::new();
     if let Some(plan) = limits["plan_type"].as_str().filter(|plan| !plan.is_empty()) {
         notes.push(format!("{plan} plan"));
@@ -105,7 +111,7 @@ fn from_codex(limits: &Value) -> Option<PlanUsage> {
             notes.push(format!("${balance:.2} in credits"));
         }
     }
-    Some(PlanUsage { windows, notes, read_at: now() })
+    notes
 }
 
 fn codex_window_name(minutes: Option<i64>) -> String {
@@ -293,29 +299,48 @@ pub fn read_in_background(ctx: &egui::Context) -> Arc<Mutex<Option<BTreeMap<Prov
     slot
 }
 
-/// Codex records its limits in the session file for each run, so the newest file
-/// holds the latest figures, including from runs outside Barduino.
+/// Codex records its limits in the session file for each run, so its recent files hold
+/// the latest figures, including from runs outside Barduino. Each entry only carries the
+/// windows Codex felt like sending, so the newest figure for each window is gathered
+/// across entries, and a window whose reset time has passed is dropped as out of date.
 fn read_codex() -> Option<PlanUsage> {
     let sessions = agent::home_dir()?.join(".codex").join("sessions");
+    let mut windows: BTreeMap<i64, Window> = BTreeMap::new();
+    let mut notes = Vec::new();
     for path in newest_files(&sessions) {
-        if let Some(plan) = codex_session_file(&path) {
-            return Some(plan);
+        for limits in codex_session_file(&path) {
+            if notes.is_empty() {
+                notes = codex_notes(&limits);
+            }
+            for (minutes, window) in codex_windows(&limits) {
+                // Entries come newest first, so the first of each window wins.
+                windows.entry(minutes).or_insert(window);
+            }
         }
     }
-    None
-}
-
-fn codex_session_file(path: &Path) -> Option<PlanUsage> {
-    if std::fs::metadata(path).ok()?.len() > MAX_SESSION_FILE {
+    let now = now();
+    let mut windows: Vec<Window> =
+        windows.into_values().filter(|window| window.resets_at.is_none_or(|at| at > now)).collect();
+    windows.sort_by_key(|window| window.resets_at.unwrap_or(i64::MAX));
+    if windows.is_empty() {
         return None;
     }
-    let text = std::fs::read_to_string(path).ok()?;
-    // The last entry is the most recent, and only some entries carry limits.
+    Some(PlanUsage { windows, notes, read_at: now })
+}
+
+/// The `rate_limits` entries in one session file, newest first.
+fn codex_session_file(path: &Path) -> Vec<Value> {
+    if std::fs::metadata(path).map(|file| file.len()).unwrap_or(u64::MAX) > MAX_SESSION_FILE {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
     text.lines()
         .rev()
         .filter(|line| line.contains("rate_limits"))
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .find_map(|entry| from_codex(&entry["payload"]["rate_limits"]))
+        .map(|entry| entry["payload"]["rate_limits"].clone())
+        .filter(|limits| !codex_windows(limits).is_empty())
+        .collect()
 }
 
 /// The most recently changed files under `dir`, newest first. Codex sorts its
@@ -417,14 +442,21 @@ mod tests {
             "credits": { "has_credits": true, "unlimited": false, "balance": "171.6073735000" },
             "plan_type": "pro"
         });
-        let plan = from_codex(&limits).expect("the entry should describe the plan");
-        assert_eq!(plan.windows, vec![Window {
-            name: "Weekly limit".into(),
-            used: 1.0,
-            resets_at: Some(1_789_805_599),
-        }]);
-        assert_eq!(plan.notes, vec!["pro plan", "$171.61 in credits"]);
-        assert!(from_codex(&serde_json::json!({ "primary": null })).is_none());
+        let windows = codex_windows(&limits);
+        assert_eq!(windows, vec![(
+            10080,
+            Window { name: "Weekly limit".into(), used: 1.0, resets_at: Some(1_789_805_599) }
+        )]);
+        assert_eq!(codex_notes(&limits), vec!["pro plan", "$171.61 in credits"]);
+        assert!(codex_windows(&serde_json::json!({ "primary": null })).is_empty());
+
+        // Codex used to report the five-hour window in the first slot and the week in the second.
+        let both = serde_json::json!({
+            "primary": { "used_percent": 12.5, "window_minutes": 300, "resets_at": 1_789_670_000_i64 },
+            "secondary": { "used_percent": 80.0, "window_minutes": 10080, "resets_at": 1_789_805_599_i64 }
+        });
+        let names: Vec<String> = codex_windows(&both).into_iter().map(|(_, window)| window.name).collect();
+        assert_eq!(names, ["5-hour limit", "Weekly limit"]);
     }
 
     #[test]
@@ -440,9 +472,12 @@ mod tests {
         };
         std::fs::write(&path, format!("{{\"type\":\"other\"}}\n{}\n{}\n", entry(12.0), entry(34.0))).unwrap();
 
-        let plan = codex_session_file(&path).expect("the file holds limits");
-        assert_eq!(plan.windows[0].name, "5-hour limit");
-        assert!((plan.windows[0].used - 0.34).abs() < 0.001, "{:?}", plan.windows[0]);
+        let entries = codex_session_file(&path);
+        assert_eq!(entries.len(), 2, "both entries carry limits");
+        // Newest first, so the later figure is the one that counts.
+        let (minutes, window) = codex_windows(&entries[0]).remove(0);
+        assert_eq!((minutes, window.name.as_str()), (300, "5-hour limit"));
+        assert!((window.used - 0.34).abs() < 0.001, "{window:?}");
         assert_eq!(newest_files(&dir), vec![path]);
         let _ = std::fs::remove_dir_all(&dir);
     }
