@@ -1,4 +1,4 @@
-//! The middle column: a slim top bar, the conversation and the message box.
+//! The middle column: the conversation and the message box.
 
 use eframe::egui;
 
@@ -11,23 +11,6 @@ pub enum ComposerAction {
     Send,
     Stop,
     ChangeFolder,
-}
-
-pub fn top_bar(ui: &mut egui::Ui, session: &Session, show_sessions: &mut bool, show_tools: &mut bool) {
-    ui.add_space(4.0);
-    ui.horizontal(|ui| {
-        ui.toggle_value(show_sessions, "Sessions").on_hover_text("Show or hide the session list");
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.toggle_value(show_tools, "Tools").on_hover_text("Show or hide the terminal and browser");
-            if let Some(model) = &session.model {
-                ui.label(egui::RichText::new(model).small().weak());
-            }
-            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                ui.add(egui::Label::new(egui::RichText::new(&session.title).strong()).truncate());
-            });
-        });
-    });
-    ui.add_space(4.0);
 }
 
 /// The message box, with the agent, permission and folder pickers along its bottom edge.
@@ -73,7 +56,8 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, a
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if session.is_running() {
+                    let running = session.is_running();
+                    if running {
                         if ui.button("Stop").clicked() {
                             action = ComposerAction::Stop;
                         }
@@ -81,6 +65,9 @@ pub fn composer(ui: &mut egui::Ui, session: &mut Session, settings: &Settings, a
                         ui.spinner();
                     } else if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
                         action = ComposerAction::Send;
+                    }
+                    if !running && let Some(model) = &session.model {
+                        ui.label(egui::RichText::new(model).small().weak());
                     }
                 });
             });

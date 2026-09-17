@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
-use crate::terminal::Terminal;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
@@ -44,9 +43,6 @@ pub struct Session {
     pub streaming: String,
     #[serde(skip)]
     pub focus_composer: bool,
-    /// Started the first time the terminal tab is shown for this session.
-    #[serde(skip)]
-    pub terminal: Option<Result<Terminal, String>>,
     #[serde(skip)]
     turn: Option<RunningTurn>,
     #[serde(skip)]
@@ -70,7 +66,6 @@ impl Session {
             input: String::new(),
             streaming: String::new(),
             focus_composer: true,
-            terminal: None,
             turn: None,
             stop_requested: false,
             error_shown: false,

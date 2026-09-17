@@ -7,9 +7,12 @@ mod app;
 mod browser;
 mod chat;
 mod claude;
+mod icons;
 mod session;
 mod settings;
+mod sidebar;
 mod terminal;
+mod tools;
 
 use eframe::egui;
 

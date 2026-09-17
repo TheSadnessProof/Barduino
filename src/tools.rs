@@ -1,0 +1,163 @@
+//! The right-hand panel: tabs for terminals and the browser, opened with "+".
+
+use std::path::{Path, PathBuf};
+
+use eframe::egui;
+
+use crate::browser::{Browser, BrowserAction, BrowserState};
+use crate::icons::{self, Icon};
+use crate::terminal::{self, Terminal};
+
+enum Tab {
+    Terminal {
+        number: u64,
+        cwd: PathBuf,
+        /// Started the first time the tab is drawn.
+        terminal: Option<Result<Terminal, String>>,
+        /// Typed into the shell once it has started.
+        typed: Option<String>,
+    },
+    /// There is at most one, because it shares the single browser window.
+    Browser,
+}
+
+pub enum ToolsAction {
+    None,
+    /// Add this text to the active session's message box.
+    AddToMessage(String),
+}
+
+pub struct Tools {
+    tabs: Vec<Tab>,
+    active: usize,
+    next_terminal_number: u64,
+    browser: Browser,
+}
+
+impl Tools {
+    pub fn new(browser_state: BrowserState) -> Self {
+        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1, browser: Browser::new(browser_state) }
+    }
+
+    pub fn browser_state(&self) -> &BrowserState {
+        &self.browser.state
+    }
+
+    /// Opens a new terminal in `cwd`, optionally typing a command into it.
+    pub fn open_terminal(&mut self, cwd: &Path, typed: Option<String>) {
+        let number = self.next_terminal_number;
+        self.next_terminal_number += 1;
+        self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed });
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Shows the browser tab, opening it if needed.
+    pub fn open_browser(&mut self) {
+        match self.tabs.iter().position(|tab| matches!(tab, Tab::Browser)) {
+            Some(index) => self.active = index,
+            None => {
+                self.tabs.push(Tab::Browser);
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    fn close(&mut self, index: usize) {
+        // Dropping a terminal tab stops its shell.
+        if let Tab::Browser = self.tabs.remove(index) {
+            self.browser.close();
+        }
+        if self.active >= index && self.active > 0 {
+            self.active -= 1;
+        }
+    }
+
+    /// Hides the browser page; call this whenever the panel itself isn't shown.
+    pub fn hide_browser(&mut self) {
+        self.browser.hide();
+    }
+
+    pub fn release_focus_on_click(&self, ctx: &egui::Context) {
+        self.browser.release_focus_on_click(ctx);
+    }
+
+    /// The "+" menu. `cwd` is where a new terminal starts. Returns true when a tab was opened.
+    pub fn add_menu(&mut self, ui: &mut egui::Ui, cwd: &Path) -> bool {
+        let mut opened = false;
+        let response = icons::button(ui, Icon::Plus, "Open a terminal or the browser");
+        egui::Popup::menu(&response).show(|ui| {
+            if ui.button("Terminal").clicked() {
+                self.open_terminal(cwd, None);
+                opened = true;
+            }
+            if ui.button("Browser").clicked() {
+                self.open_browser();
+                opened = true;
+            }
+        });
+        opened
+    }
+
+    /// Draws the expanded panel. `collapse` is set when the user hides it.
+    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame, cwd: &Path, collapse: &mut bool) -> ToolsAction {
+        let mut close = None;
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for (index, tab) in self.tabs.iter().enumerate() {
+                let (title, hover) = match tab {
+                    Tab::Terminal { number, cwd, .. } => {
+                        let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
+                        (title, cwd.display().to_string())
+                    }
+                    Tab::Browser => ("Browser".to_owned(), "Built-in browser".to_owned()),
+                };
+                ui.spacing_mut().item_spacing.x = 0.0;
+                if ui.selectable_label(index == self.active, title).on_hover_text(hover).clicked() {
+                    self.active = index;
+                }
+                if icons::button(ui, Icon::Close, "Close tab").clicked() {
+                    close = Some(index);
+                }
+                ui.spacing_mut().item_spacing.x = 8.0;
+            }
+            self.add_menu(ui, cwd);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if icons::button(ui, Icon::SidebarRight, "Hide panel").clicked() {
+                    *collapse = true;
+                }
+            });
+        });
+        ui.separator();
+        if let Some(index) = close {
+            self.close(index);
+        }
+
+        let browser_shown = matches!(self.tabs.get(self.active), Some(Tab::Browser));
+        if !browser_shown {
+            self.browser.hide();
+        }
+
+        let mut action = ToolsAction::None;
+        match self.tabs.get_mut(self.active) {
+            None => {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Nothing open").weak());
+                    ui.label(egui::RichText::new("Click + to open a terminal or the browser.").small().weak());
+                });
+            }
+            Some(Tab::Terminal { number, cwd, terminal, typed }) => {
+                ui.push_id(("terminal", *number), |ui| terminal::show(ui, terminal, cwd, typed.take()));
+            }
+            Some(Tab::Browser) => {
+                // The page is a native window drawn over the app, so it has to get out
+                // of the way whenever a menu or popup needs to draw on top of it.
+                let page_visible = !egui::Popup::is_any_open(ui.ctx());
+                if let BrowserAction::AddToMessage(text) = self.browser.ui(ui, frame, page_visible) {
+                    action = ToolsAction::AddToMessage(text);
+                }
+            }
+        }
+        action
+    }
+}
