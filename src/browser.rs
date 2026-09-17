@@ -56,6 +56,9 @@ pub struct PickedElement {
     pub html: String,
     pub width: u32,
     pub height: u32,
+    /// What the user wants done here, when the element came from a comment.
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 impl PickedElement {
@@ -70,11 +73,20 @@ impl PickedElement {
         (!text.is_empty()).then(|| shorten(&text, 28))
     }
 
+    /// The note written about this element, if it came from a comment.
+    pub fn note(&self) -> Option<&str> {
+        self.note.as_deref().map(str::trim).filter(|note| !note.is_empty())
+    }
+
     /// How the element is described to the agent when the message is sent.
     pub fn as_prompt(&self) -> String {
+        let heading = match self.note() {
+            Some(note) => format!("Comment on {}: {note}", self.url),
+            None => format!("Element on {}", self.url),
+        };
         let mut prompt = format!(
-            "Element on {} ({} × {} px)\nSelector: `{}`\n```html\n{}\n```",
-            self.url, self.width, self.height, self.selector, self.html
+            "{heading}\nThe element is {} × {} px.\nSelector: `{}`\n```html\n{}\n```",
+            self.width, self.height, self.selector, self.html
         );
         if self.html.chars().count() >= 3000 {
             prompt.push_str("\n(HTML cut off)");
@@ -83,23 +95,49 @@ impl PickedElement {
     }
 }
 
+/// A comment the user left on an element, numbered to match its pin on the page.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Comment {
+    pub number: u32,
+    #[serde(flatten)]
+    pub element: PickedElement,
+    /// What the user typed about it, which starts empty.
+    #[serde(skip)]
+    pub note: String,
+}
+
 /// A message sent from the page through `window.ipc`.
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 enum PageMessage {
     Picked(PickedElement),
+    Commented(Comment),
     Cancelled,
+}
+
+/// What clicking on the page does at the moment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Off,
+    /// One click sends an element to the message box.
+    Picking,
+    /// Each click pins a numbered comment on the page.
+    Commenting,
 }
 
 pub enum BrowserAction {
     None,
-    /// Attach this element to the message being written.
-    Attach(PickedElement),
+    /// Attach these elements to the message being written.
+    Attach(Vec<PickedElement>),
 }
 
 pub struct Browser {
     pub state: BrowserState,
-    picking: bool,
+    mode: Mode,
+    /// Comments waiting to be sent, in the order they were left.
+    comments: Vec<Comment>,
+    /// The comment whose note should take the keyboard next time it's drawn.
+    focus_note: Option<u32>,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
 }
@@ -108,7 +146,9 @@ impl Browser {
     pub fn new(state: BrowserState) -> Self {
         Self {
             state,
-            picking: false,
+            mode: Mode::Off,
+            comments: Vec::new(),
+            focus_note: None,
             #[cfg(any(windows, target_os = "macos"))]
             native: None,
         }
@@ -116,7 +156,9 @@ impl Browser {
 
     /// Closes the page. It opens again the next time the browser tab is shown.
     pub fn close(&mut self) {
-        self.picking = false;
+        self.mode = Mode::Off;
+        self.comments.clear();
+        self.focus_note = None;
         #[cfg(any(windows, target_os = "macos"))]
         {
             self.native = None;
@@ -148,15 +190,22 @@ impl Browser {
         if let Some(Ok(browser)) = &self.native {
             for message in browser.take_messages() {
                 match message {
-                    // Only accept a pick the user started, not one a page sends on its own.
-                    native::Message::Page(PageMessage::Picked(element)) if self.picking => {
-                        self.picking = false;
-                        result = BrowserAction::Attach(element);
+                    // Only accept what the user started, not what a page sends on its own.
+                    native::Message::Page(PageMessage::Picked(element)) if self.mode == Mode::Picking => {
+                        self.mode = Mode::Off;
+                        result = BrowserAction::Attach(vec![element]);
                     }
-                    native::Message::Page(PageMessage::Cancelled) => self.picking = false,
-                    native::Message::Page(PageMessage::Picked(_)) => {}
-                    // A new page starts without the picker running.
-                    native::Message::PageLoading => self.picking = false,
+                    native::Message::Page(PageMessage::Commented(comment))
+                        if self.mode == Mode::Commenting =>
+                    {
+                        self.focus_note = Some(comment.number);
+                        self.comments.push(comment);
+                    }
+                    native::Message::Page(PageMessage::Cancelled) => self.mode = Mode::Off,
+                    native::Message::Page(_) => {}
+                    // A new page starts without picking or commenting, and its pins are gone
+                    // with it. The comments themselves are kept, since the notes are the point.
+                    native::Message::PageLoading => self.mode = Mode::Off,
                 }
             }
         }
@@ -199,20 +248,49 @@ impl Browser {
                 ui.add(egui::DragValue::new(height).range(200..=2400).suffix(" px"));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let tooltip = if self.picking {
+                let commenting = self.mode == Mode::Commenting;
+                let comment_tip = if commenting {
+                    "Commenting: click the places you want changed (Esc to stop)"
+                } else {
+                    "Leave comments on the page, then send them to the agent"
+                };
+                if icons::toggle(ui, Icon::Comment, comment_tip, commenting).clicked() {
+                    self.mode = if commenting { Mode::Off } else { Mode::Commenting };
+                    // Numbering carries on from the comments already listed, so the pins
+                    // on the page match the list even after a reload.
+                    let from = self.comments.iter().map(|comment| comment.number).max().unwrap_or(0) + 1;
+                    commands.push(Command::Comment(self.mode == Mode::Commenting, from));
+                }
+
+                let picking = self.mode == Mode::Picking;
+                let pick_tip = if picking {
                     "Picking: click an element on the page (Esc to cancel)"
                 } else {
                     "Select an element on the page"
                 };
-                if icons::toggle(ui, Icon::Pick, tooltip, self.picking).clicked() {
-                    self.picking = !self.picking;
-                    commands.push(Command::Pick(self.picking));
+                if icons::toggle(ui, Icon::Pick, pick_tip, picking).clicked() {
+                    self.mode = if picking { Mode::Off } else { Mode::Picking };
+                    commands.push(Command::Pick(self.mode == Mode::Picking));
                 }
-                if self.picking {
-                    ui.label(egui::RichText::new("Click an element").small().weak());
+
+                match self.mode {
+                    Mode::Picking => {
+                        ui.label(egui::RichText::new("Click an element").small().weak());
+                    }
+                    Mode::Commenting => {
+                        ui.label(egui::RichText::new("Click a place to comment on").small().weak());
+                    }
+                    Mode::Off => {}
                 }
             });
         });
+
+        if !self.comments.is_empty() {
+            ui.add_space(4.0);
+            if let Some(action) = self.comment_list(ui, &mut commands) {
+                result = action;
+            }
+        }
 
         let area = ui.available_rect_before_wrap();
         ui.allocate_rect(area, egui::Sense::hover());
@@ -253,6 +331,77 @@ impl Browser {
         result
     }
 
+    /// The comments left so far: a note each, and buttons to send or drop them.
+    #[cfg(any(windows, target_os = "macos"))]
+    fn comment_list(&mut self, ui: &mut egui::Ui, commands: &mut Vec<native::Command>) -> Option<BrowserAction> {
+        let mut action = None;
+        let mut remove = None;
+        egui::Frame::new()
+            .fill(ui.visuals().faint_bg_color)
+            .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
+            .corner_radius(8.0)
+            .inner_margin(egui::Margin::same(8))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                let count = self.comments.len();
+                ui.horizontal(|ui| {
+                    let heading = if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") };
+                    ui.label(egui::RichText::new(heading).strong().small());
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let send = ui
+                            .button("Add to message")
+                            .on_hover_text("Puts every comment in the message box, ready to send");
+                        if send.clicked() {
+                            let elements = self.comments.drain(..).map(Comment::into_element).collect();
+                            commands.push(native::Command::ClearPins);
+                            action = Some(BrowserAction::Attach(elements));
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.comments.clear();
+                            commands.push(native::Command::ClearPins);
+                        }
+                    });
+                });
+                ui.add_space(2.0);
+
+                egui::ScrollArea::vertical().max_height(150.0).id_salt("comments").show(ui, |ui| {
+                    for comment in &mut self.comments {
+                        ui.horizontal(|ui| {
+                            pin_number(ui, comment.number);
+                            let note = ui.add(
+                                egui::TextEdit::singleline(&mut comment.note)
+                                    .desired_width(ui.available_width() - 120.0)
+                                    .hint_text("What should change here?"),
+                            );
+                            // The note for a fresh pin takes the keyboard, so the user can just type.
+                            if self.focus_note == Some(comment.number) {
+                                note.request_focus();
+                                self.focus_note = None;
+                            }
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(comment.element.short_label()).monospace().small().weak(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(&comment.element.selector);
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if icons::button(ui, Icon::Close, "Remove this comment").clicked() {
+                                    remove = Some(comment.number);
+                                }
+                            });
+                        });
+                    }
+                });
+            });
+
+        if let Some(number) = remove {
+            self.comments.retain(|comment| comment.number != number);
+            commands.push(native::Command::RemovePin(number));
+        }
+        action
+    }
+
     /// Hides the page when the browser tab isn't showing. The page is a separate
     /// native window, so egui can't hide it by just not drawing it.
     #[cfg(any(windows, target_os = "macos"))]
@@ -272,6 +421,32 @@ impl Browser {
             browser.focus_app();
         }
     }
+}
+
+impl Comment {
+    /// The element with the note attached, which is what the message carries.
+    fn into_element(self) -> PickedElement {
+        let note = self.note.trim();
+        PickedElement { note: (!note.is_empty()).then(|| note.to_owned()), ..self.element }
+    }
+}
+
+/// The number that matches a comment to its pin on the page.
+fn pin_number(ui: &mut egui::Ui, number: u32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    // The same orange as the pin the page draws.
+    const PIN: egui::Color32 = egui::Color32::from_rgb(217, 119, 63);
+    ui.painter().circle_filled(rect.center(), 10.0, PIN);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        number.to_string(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::WHITE,
+    );
 }
 
 /// Cuts `text` to at most `max` characters, ending with "…" if anything was cut.
@@ -341,6 +516,10 @@ mod native {
         Reload,
         Load(String),
         Pick(bool),
+        /// Turn commenting on or off, numbering new pins from this number.
+        Comment(bool, u32),
+        RemovePin(u32),
+        ClearPins,
     }
 
     pub enum Message {
@@ -456,6 +635,19 @@ mod native {
                     }
                     self.webview.evaluate_script(&format!("window.__barduino && window.__barduino.pick({on})"))
                 }
+                Command::Comment(on, from) => {
+                    if on {
+                        let _ = self.webview.focus();
+                    }
+                    self.webview
+                        .evaluate_script(&format!("window.__barduino && window.__barduino.comment({on}, {from})"))
+                }
+                Command::RemovePin(number) => self
+                    .webview
+                    .evaluate_script(&format!("window.__barduino && window.__barduino.removePin({number})")),
+                Command::ClearPins => {
+                    self.webview.evaluate_script("window.__barduino && window.__barduino.clearPins()")
+                }
             };
         }
     }
@@ -502,6 +694,23 @@ mod tests {
         assert!(element.as_prompt().contains("Selector: `main > button.primary`"));
         assert_eq!(element.short_label(), "button.primary");
         assert_eq!(element.short_text().as_deref(), Some("Sign in"));
+        // A comment is the same element plus the number of its pin on the page.
+        let commented = r#"{"kind":"commented","number":2,"url":"http://localhost:3000/","selector":"main > h1","tag":"h1","text":"Welcome","html":"<h1>Welcome</h1>","width":400,"height":48}"#;
+        let Ok(PageMessage::Commented(comment)) = serde_json::from_str::<PageMessage>(commented) else {
+            panic!("should parse a commented element");
+        };
+        assert_eq!((comment.number, comment.element.tag.as_str()), (2, "h1"));
+        assert_eq!(comment.note, "", "the note is typed in the app, not on the page");
+
+        let noted = Comment { note: "  Make this bigger  ".into(), ..comment }.into_element();
+        assert_eq!(noted.note(), Some("Make this bigger"), "the note is trimmed onto the element");
+        let prompt = noted.as_prompt();
+        assert!(prompt.starts_with("Comment on http://localhost:3000/: Make this bigger"), "{prompt}");
+        assert!(prompt.contains("Selector: `main > h1`"), "{prompt}");
+        // A note that is only spaces leaves an ordinary picked element.
+        let blank = Comment { number: 3, element: noted.clone(), note: "   ".into() }.into_element();
+        assert_eq!(blank.note(), None);
+
         assert_eq!(serde_json::from_str::<PageMessage>(r#"{"kind":"cancelled"}"#).unwrap(), PageMessage::Cancelled);
         assert!(serde_json::from_str::<PageMessage>(r#"{"kind":"steal-cookies"}"#).is_err());
     }

@@ -142,6 +142,10 @@ pub struct Turn {
     pub cwd: PathBuf,
     pub resume_session: Option<String>,
     pub permission_mode: PermissionMode,
+    /// The model the session asked for, or None for the CLI's own default.
+    pub model: Option<String>,
+    /// How hard the model should work, in the provider's own words, e.g. "high".
+    pub effort: Option<String>,
 }
 
 /// A turn whose CLI process is still running.
@@ -437,6 +441,8 @@ mod tests {
                 cwd: dir.clone(),
                 resume_session: None,
                 permission_mode: PermissionMode::ReadOnly,
+                model: None,
+                effort: None,
             },
         );
         println!("{first:#?}");
@@ -454,6 +460,8 @@ mod tests {
                 cwd: dir,
                 resume_session: Some(conversation.clone()),
                 permission_mode: PermissionMode::ReadOnly,
+                model: None,
+                effort: None,
             },
         );
         println!("{second:#?}");
@@ -517,6 +525,8 @@ mod tests {
                 cwd: std::env::temp_dir(),
                 resume_session: None,
                 permission_mode: PermissionMode::Full,
+                model: None,
+                effort: None,
             };
             let _running = start_turn(provider, &exe, turn, move |event| {
                 let _ = tx.send(event);

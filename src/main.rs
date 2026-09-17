@@ -11,6 +11,7 @@ mod claude;
 mod codex;
 mod git_diff;
 mod icons;
+mod models;
 mod plan;
 mod session;
 mod settings;

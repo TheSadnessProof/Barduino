@@ -8,6 +8,7 @@ use crate::agent::{AgentEvent, PermissionMode, Provider};
 use crate::browser::BrowserState;
 use crate::chat::{self, ComposerAction};
 use crate::icons::{self, Icon};
+use crate::models::Catalog;
 use crate::plan::{self, PlanUsage};
 use crate::session::Session;
 use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsPage};
@@ -81,6 +82,8 @@ pub struct BarduinoApp {
     voice_error: Option<VoiceError>,
     /// Set until the width egui remembers for the right panel has been forgotten.
     forget_panel_width: bool,
+    /// The models each CLI offers, read in the background when first needed.
+    models: Catalog,
     /// Set once this launch has asked the agents that answer for free.
     checked_free_plans: bool,
     /// Plan limit checks running in the background, and what they said.
@@ -119,6 +122,7 @@ impl BarduinoApp {
             dictation: None,
             voice_partial: String::new(),
             voice_error: None,
+            models: Catalog::default(),
             checked_free_plans: false,
             plan_checks: plan::Checks::default(),
             plan_errors: std::collections::BTreeMap::new(),
@@ -359,9 +363,15 @@ impl BarduinoApp {
             self.voice_partial.clear();
         }
         let index = self.active_index();
+        let provider = self.state.sessions[index].provider;
+        let installed = self.detected.get(provider).is_some();
+        // A provider's model list is read once per launch, when a session first shows it.
+        if let Some(exe) = self.detected.get(provider).cloned() {
+            self.models.start(provider, exe, ui.ctx());
+        }
         let session = &mut self.state.sessions[index];
         let settings = &self.state.settings;
-        let installed = self.detected.get(session.provider).is_some();
+        let models = &self.models;
         let voice = chat::Voice {
             listening: self.dictation.is_some(),
             partial: &self.voice_partial,
@@ -370,7 +380,7 @@ impl BarduinoApp {
 
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
             .show_separator_line(false)
-            .show(ui, |ui| chat::composer(ui, session, settings, installed, voice))
+            .show(ui, |ui| chat::composer(ui, session, settings, models, installed, voice))
             .inner;
         // Checked again after the composer, which is where the provider can change.
         let installed = self.detected.get(session.provider).is_some();
@@ -454,9 +464,11 @@ impl BarduinoApp {
             self.tools.hide_browser();
         }
 
-        if let ToolsAction::Attach(element) = action {
+        if let ToolsAction::Attach(elements) = action {
             let session = self.active_session_mut();
-            session.attach(element);
+            for element in elements {
+                session.attach(element);
+            }
             session.focus_composer = true;
             self.view = View::Chat;
         }

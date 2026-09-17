@@ -74,6 +74,12 @@ pub struct Session {
     #[serde(default)]
     pub provider: Provider,
     pub permission_mode: PermissionMode,
+    /// The model this session asked for, or None for the CLI's own default.
+    #[serde(default)]
+    pub chosen_model: Option<String>,
+    /// How hard the model should work, in the provider's own words, e.g. "high".
+    #[serde(default)]
+    pub effort: Option<String>,
     /// The CLI's own session ID, used to continue the conversation.
     #[serde(alias = "claude_session_id")]
     pub agent_session_id: Option<String>,
@@ -107,6 +113,8 @@ impl Session {
             project_dir,
             provider,
             permission_mode,
+            chosen_model: None,
+            effort: None,
             agent_session_id: None,
             model: None,
             entries: Vec::new(),
@@ -136,7 +144,11 @@ impl Session {
 
     /// Attaches a page element to the unsent message. Picking the same element again does nothing.
     pub fn attach(&mut self, element: PickedElement) {
-        let already = self.elements.iter().any(|e| e.url == element.url && e.selector == element.selector);
+        // Two comments on one element are both worth keeping, so the note counts too.
+        let already = self
+            .elements
+            .iter()
+            .any(|e| e.url == element.url && e.selector == element.selector && e.note() == element.note());
         if !already {
             self.elements.push(element);
         }
@@ -163,12 +175,16 @@ impl Session {
             cwd: self.project_dir.clone(),
             resume_session: self.agent_session_id.clone(),
             permission_mode: self.permission_mode,
+            model: self.chosen_model.clone(),
+            effort: self.effort.clone(),
         };
         match agent::start_turn(self.provider, exe, turn, on_event) {
             Ok(running) => {
                 if self.title == UNTITLED {
                     self.title = match message.elements.first() {
-                        Some(element) if message.text.is_empty() => title_from(&element.short_label()),
+                        Some(element) if message.text.is_empty() => {
+                            title_from(element.note().unwrap_or(&element.short_label()))
+                        }
                         _ => title_from(&message.text),
                     };
                 }
@@ -233,8 +249,18 @@ impl Session {
                     self.entries.push(Entry::Error(error));
                 }
                 if !denied_tools.is_empty() {
+                    // Headless CLIs can't be asked for approval, so anything needing it is
+                    // refused until the session is on full access.
+                    let what_to_do = if self.permission_mode == PermissionMode::Full {
+                        "It refused even on full access, so it may be the CLI's own setting.".to_owned()
+                    } else {
+                        format!(
+                            "Pick \"{}\" under the message box to let it do that without asking.",
+                            PermissionMode::Full.label()
+                        )
+                    };
                     self.entries.push(Entry::Notice(format!(
-                        "{} wasn't allowed to use: {}. Change the permissions under the message box to allow more.",
+                        "{} wasn't allowed to use: {}. {what_to_do}",
                         self.provider.short_name(),
                         denied_tools.join(", ")
                     )));
@@ -353,7 +379,23 @@ mod tests {
             usage: None,
         });
         assert_eq!(s.agent_session_id.as_deref(), Some("second"));
-        assert!(matches!(&s.entries[..], [Entry::Notice(text)] if text.starts_with("Claude wasn't allowed to use: Bash, Write")));
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice") };
+        assert!(text.starts_with("Claude wasn't allowed to use: Bash, Write"), "{text}");
+        assert!(text.contains("Full access"), "the notice names the mode that allows it: {text}");
+    }
+
+    #[test]
+    fn denials_on_full_access_point_at_the_cli() {
+        let mut s = session(Provider::Antigravity);
+        s.permission_mode = PermissionMode::Full;
+        s.handle_event(AgentEvent::Finished {
+            session_id: None,
+            error: None,
+            denied_tools: vec!["RunCommand".into()],
+            usage: None,
+        });
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice") };
+        assert!(text.contains("refused even on full access"), "{text}");
     }
 
     #[test]
@@ -381,6 +423,7 @@ mod tests {
             html: "<button class=\"primary\">Sign in</button>".into(),
             width: 120,
             height: 36,
+            note: None,
         }
     }
 
@@ -390,6 +433,9 @@ mod tests {
         s.attach(element("main > button"));
         s.attach(element("main > button"));
         assert_eq!(s.elements.len(), 1, "the same element is only attached once");
+        let commented = PickedElement { note: Some("make this blue".into()), ..element("main > button") };
+        s.attach(commented);
+        assert_eq!(s.elements.len(), 2, "a comment on the same element is its own attachment");
         assert!(s.has_message(), "an element alone can be sent");
 
         let message = UserMessage { text: "Make this blue".into(), elements: s.elements.clone() };

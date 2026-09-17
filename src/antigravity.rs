@@ -39,6 +39,19 @@ pub fn args(turn: &Turn) -> Vec<String> {
         PermissionMode::Full => args.push("--dangerously-skip-permissions".into()),
         PermissionMode::Plan => args.extend(["--mode".into(), "plan".into()]),
     }
+    if let Some(model) = &turn.model {
+        args.extend(["--model".into(), model.clone()]);
+        // Most agy models have their effort in the name, like "gemini-3.8-flash-high",
+        // so the flag is only added when the name doesn't already say.
+        let named_level = ["-low", "-medium", "-high"].iter().any(|level| model.ends_with(level));
+        if let Some(effort) = &turn.effort
+            && !named_level
+        {
+            args.extend(["--effort".into(), effort.clone()]);
+        }
+    } else if let Some(effort) = &turn.effort {
+        args.extend(["--effort".into(), effort.clone()]);
+    }
     if let Some(conversation_id) = &turn.resume_session {
         args.extend(["--conversation".into(), conversation_id.clone()]);
     }
@@ -200,7 +213,28 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: None,
             permission_mode: PermissionMode::Full,
+            model: None,
+            effort: None,
         }
+    }
+
+    /// Most agy models carry their effort in the name, so the flag would clash.
+    #[test]
+    fn effort_is_left_out_when_the_model_name_already_says_it() {
+        let turn = |model: &str| Turn {
+            prompt: "hello".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: Some(model.to_owned()),
+            effort: Some("low".into()),
+        };
+        let named = args(&turn("gemini-3.8-flash-high"));
+        assert!(named.windows(2).any(|pair| pair == ["--model", "gemini-3.8-flash-high"]), "{named:?}");
+        assert!(!named.iter().any(|arg| arg == "--effort"), "{named:?}");
+
+        let plain = args(&turn("claude-sonnet-4-6"));
+        assert!(plain.windows(2).any(|pair| pair == ["--effort", "low"]), "{plain:?}");
     }
 
     #[test]
@@ -210,6 +244,8 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: Some("abc".into()),
             permission_mode: PermissionMode::AcceptEdits,
+            model: None,
+            effort: None,
         };
         assert_eq!(
             args(&turn),

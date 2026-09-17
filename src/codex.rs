@@ -57,6 +57,13 @@ pub fn args(turn: &Turn) -> Vec<String> {
     if turn.resume_session.is_none() {
         args.extend(["-C".to_owned(), turn.cwd.display().to_string()]);
     }
+    if let Some(model) = &turn.model {
+        args.extend(["-m".to_owned(), model.clone()]);
+    }
+    // Codex sets the reasoning level through its config rather than a flag.
+    if let Some(effort) = &turn.effort {
+        args.extend(["-c".to_owned(), format!("model_reasoning_effort={effort}")]);
+    }
     // "-" makes Codex read the prompt from stdin, which start_turn writes and then closes.
     // Prompts can carry a whole page of HTML, far more than a command line holds on Windows.
     args.push("-".to_owned());
@@ -284,6 +291,8 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: None,
             permission_mode: PermissionMode::AcceptEdits,
+            model: None,
+            effort: None,
         };
         assert_eq!(
             args(&turn),
@@ -307,10 +316,28 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: None,
             permission_mode: PermissionMode::Full,
+            model: None,
+            effort: None,
         };
         let args = args(&turn);
         assert!(args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()), "{args:?}");
         assert!(!args.iter().any(|arg| arg.starts_with("sandbox_mode=")), "one or the other, not both: {args:?}");
+    }
+
+    #[test]
+    fn asks_for_a_model_and_reasoning_level() {
+        let turn = Turn {
+            prompt: "hello".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: Some("gpt-6-astra".into()),
+            effort: Some("xhigh".into()),
+        };
+        let args = args(&turn);
+        assert!(args.windows(2).any(|pair| pair == ["-m", "gpt-6-astra"]), "{args:?}");
+        // Codex takes the level as a config override rather than a flag.
+        assert!(args.contains(&"model_reasoning_effort=xhigh".to_owned()), "{args:?}");
     }
 
     #[test]
@@ -320,6 +347,8 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: Some("01a0b087-2797-7a71-952c-496a702e3409".into()),
             permission_mode: PermissionMode::Plan,
+            model: None,
+            effort: None,
         };
         assert_eq!(
             args(&turn),
@@ -389,6 +418,8 @@ mod tests {
             cwd: dir.clone(),
             resume_session: None,
             permission_mode: PermissionMode::ReadOnly,
+            model: None,
+            effort: None,
         });
         println!("{first:#?}");
         let Some(AgentEvent::Started { session_id: thread_id, .. }) = first.first() else {
@@ -404,6 +435,8 @@ mod tests {
             cwd: dir,
             resume_session: Some(thread_id.clone()),
             permission_mode: PermissionMode::ReadOnly,
+            model: None,
+            effort: None,
         });
         println!("{second:#?}");
         let reply: String = second

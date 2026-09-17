@@ -1,13 +1,18 @@
-// Injected into every page the Barduino browser opens. Barduino turns picking
-// on with `window.__barduino.pick(true)`; the user then hovers to highlight an
-// element and clicks to send its details back through `window.ipc`.
+// Injected into every page the Barduino browser opens. Barduino turns picking on
+// with `window.__barduino.pick(true)` and commenting with
+// `window.__barduino.comment(true, nextNumber)`; the user then hovers to highlight
+// an element and clicks to send its details back through `window.ipc`. Picking
+// sends one element and stops; commenting leaves a numbered pin on the page and
+// carries on, so several places can be marked in a row.
 (() => {
   if (window.__barduino) return;
 
-  let active = false;
+  let mode = null; // null, "pick" or "comment"
   let box = null;
   let label = null;
   let current = null;
+  let nextNumber = 1;
+  const pins = [];
 
   const describe = (el) =>
     el.localName +
@@ -34,12 +39,79 @@
     return parts.join(" > ");
   };
 
+  const details = (el, kind) => {
+    const r = el.getBoundingClientRect();
+    return {
+      kind,
+      url: location.href,
+      selector: selectorFor(el),
+      tag: describe(el),
+      text: (el.innerText || "").trim().slice(0, 300),
+      html: el.outerHTML.slice(0, 3000),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+  };
+
   const highlight = (el) => {
     const r = el.getBoundingClientRect();
     Object.assign(box.style, { left: r.left + "px", top: r.top + "px", width: r.width + "px", height: r.height + "px" });
     label.textContent = describe(el) + "  " + Math.round(r.width) + " × " + Math.round(r.height);
     label.style.left = Math.max(0, r.left) + "px";
     label.style.top = (r.top > 24 ? r.top - 22 : r.bottom + 4) + "px";
+  };
+
+  // A numbered marker that stays on its element while the page scrolls.
+  const addPin = (el, number) => {
+    const marker = document.createElement("div");
+    marker.textContent = number;
+    marker.style.cssText =
+      "position:fixed;z-index:2147483647;pointer-events:none;min-width:20px;height:20px;" +
+      "box-sizing:border-box;padding:0 5px;border-radius:10px;background:#d9773f;color:#fff;" +
+      "font:600 12px/20px ui-sans-serif,system-ui,sans-serif;text-align:center;" +
+      "box-shadow:0 1px 4px rgba(0,0,0,.4);";
+    const outline = document.createElement("div");
+    outline.style.cssText =
+      "position:fixed;z-index:2147483646;pointer-events:none;border:1px dashed #d9773f;" +
+      "background:rgba(217,119,63,.10);border-radius:2px;";
+    document.documentElement.append(outline, marker);
+    pins.push({ number, el, marker, outline });
+    layoutPins();
+  };
+
+  const layoutPins = () => {
+    for (const pin of pins) {
+      const r = pin.el.getBoundingClientRect();
+      const gone = !pin.el.isConnected || (r.width === 0 && r.height === 0);
+      const display = gone ? "none" : "block";
+      pin.marker.style.display = display;
+      pin.outline.style.display = display;
+      if (gone) continue;
+      Object.assign(pin.outline.style, {
+        left: r.left + "px",
+        top: r.top + "px",
+        width: r.width + "px",
+        height: r.height + "px",
+      });
+      pin.marker.style.left = Math.max(2, r.left - 8) + "px";
+      pin.marker.style.top = Math.max(2, r.top - 10) + "px";
+    }
+  };
+
+  const clearPins = () => {
+    for (const pin of pins) {
+      pin.marker.remove();
+      pin.outline.remove();
+    }
+    pins.length = 0;
+  };
+
+  const removePin = (number) => {
+    const index = pins.findIndex((pin) => pin.number === number);
+    if (index < 0) return;
+    pins[index].marker.remove();
+    pins[index].outline.remove();
+    pins.splice(index, 1);
   };
 
   const block = (event) => {
@@ -56,20 +128,17 @@
   const onClick = (event) => {
     block(event);
     const el = current || event.target;
-    const r = el.getBoundingClientRect();
+    if (mode === "comment") {
+      const number = nextNumber++;
+      const message = details(el, "commented");
+      message.number = number;
+      addPin(el, number);
+      window.ipc.postMessage(JSON.stringify(message));
+      return;
+    }
+    const message = details(el, "picked");
     stop();
-    window.ipc.postMessage(
-      JSON.stringify({
-        kind: "picked",
-        url: location.href,
-        selector: selectorFor(el),
-        tag: describe(el),
-        text: (el.innerText || "").trim().slice(0, 300),
-        html: el.outerHTML.slice(0, 3000),
-        width: Math.round(r.width),
-        height: Math.round(r.height),
-      }),
-    );
+    window.ipc.postMessage(JSON.stringify(message));
   };
 
   const onKey = (event) => {
@@ -79,7 +148,7 @@
     window.ipc.postMessage(JSON.stringify({ kind: "cancelled" }));
   };
 
-  // Clicks must not reach the page while picking, or they'd follow links and press buttons.
+  // Clicks must not reach the page while picking, or they would follow links and press buttons.
   const listeners = [
     ["mousemove", onMove],
     ["click", onClick],
@@ -88,9 +157,11 @@
     ["keydown", onKey],
   ];
 
-  function start() {
-    if (active) return;
-    active = true;
+  function start(which, from) {
+    if (mode === which) return;
+    if (mode) stop();
+    mode = which;
+    if (from) nextNumber = from;
     box = document.createElement("div");
     box.style.cssText =
       "position:fixed;z-index:2147483647;pointer-events:none;background:rgba(66,133,244,.18);" +
@@ -105,8 +176,8 @@
   }
 
   function stop() {
-    if (!active) return;
-    active = false;
+    if (!mode) return;
+    mode = null;
     box.remove();
     label.remove();
     current = null;
@@ -114,5 +185,14 @@
     document.documentElement.style.cursor = "";
   }
 
-  window.__barduino = { pick: (on) => (on ? start() : stop()) };
+  // Pins are placed in viewport coordinates, so they follow the page as it moves.
+  window.addEventListener("scroll", layoutPins, true);
+  window.addEventListener("resize", layoutPins, true);
+
+  window.__barduino = {
+    pick: (on) => (on ? start("pick") : stop()),
+    comment: (on, from) => (on ? start("comment", from) : stop()),
+    clearPins,
+    removePin,
+  };
 })();

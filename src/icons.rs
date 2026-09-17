@@ -14,6 +14,8 @@ pub enum Icon {
     Close,
     /// A crosshair, for picking an element on a web page.
     Pick,
+    /// A speech bubble, for leaving a comment on a web page.
+    Comment,
     Settings,
     Microphone,
 }
@@ -82,6 +84,19 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.line(cup.to_vec(), stroke);
             painter.line(cup.iter().map(|p| pos2(2.0 * c.x - p.x, p.y)).collect(), stroke);
             painter.line_segment([pos2(c.x, c.y + r * 0.6), pos2(c.x, c.y + r)], stroke);
+        }
+        Icon::Comment => {
+            let body = Rect::from_min_max(c + vec2(-r, -r * 0.8), c + vec2(r, r * 0.35));
+            painter.rect_stroke(body, r * 0.35, stroke, egui::StrokeKind::Middle);
+            // The tail, which makes it read as speech rather than a box.
+            painter.add(egui::Shape::line(
+                vec![
+                    c + vec2(-r * 0.45, r * 0.35),
+                    c + vec2(-r * 0.55, r * 0.95),
+                    c + vec2(0.05 * r, r * 0.35),
+                ],
+                stroke,
+            ));
         }
         Icon::Settings => {
             painter.circle_stroke(c, r * 0.4, stroke);

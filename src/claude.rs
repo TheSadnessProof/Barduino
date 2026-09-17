@@ -40,6 +40,12 @@ pub fn args(turn: &Turn) -> Vec<String> {
         .map(String::from)
         .to_vec();
     args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
+    if let Some(model) = &turn.model {
+        args.extend(["--model".to_owned(), model.clone()]);
+    }
+    if let Some(effort) = &turn.effort {
+        args.extend(["--effort".to_owned(), effort.clone()]);
+    }
     if let Some(session_id) = &turn.resume_session {
         args.extend(["--resume".to_owned(), session_id.clone()]);
     }
@@ -163,10 +169,27 @@ mod tests {
             cwd: PathBuf::from("C:\\work\\demo"),
             resume_session: None,
             permission_mode: PermissionMode::Full,
+            model: None,
+            effort: None,
         };
         let args = args(&turn);
         let mode = args.windows(2).find(|pair| pair[0] == "--permission-mode").map(|pair| pair[1].clone());
         assert_eq!(mode.as_deref(), Some("bypassPermissions"), "{args:?}");
+    }
+
+    #[test]
+    fn asks_for_a_model_and_effort_when_the_session_chose_them() {
+        let turn = Turn {
+            prompt: "hello".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: Some("opus".into()),
+            effort: Some("max".into()),
+        };
+        let args = args(&turn);
+        assert!(args.windows(2).any(|pair| pair == ["--model", "opus"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--effort", "max"]), "{args:?}");
     }
 
     #[test]
