@@ -12,24 +12,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::usage::Usage;
-use crate::{antigravity, claude};
+use crate::{antigravity, claude, codex};
 
 /// An agent CLI that can act as the brain of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum Provider {
     #[default]
     Claude,
+    Codex,
     /// Sessions saved while Gemini CLI was an option now use Antigravity.
     #[serde(alias = "Gemini")]
     Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 2] = [Self::Claude, Self::Antigravity];
+    pub const ALL: [Provider; 3] = [Self::Claude, Self::Codex, Self::Antigravity];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
             Self::Antigravity => "Antigravity (agy)",
         }
     }
@@ -38,6 +40,7 @@ impl Provider {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
+            Self::Codex => "Codex",
             Self::Antigravity => "Antigravity",
         }
     }
@@ -46,6 +49,7 @@ impl Provider {
     pub fn command(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::Codex => "codex",
             Self::Antigravity => "agy",
         }
     }
@@ -53,6 +57,7 @@ impl Provider {
     pub fn install_hint(self) -> &'static str {
         match self {
             Self::Claude => "Install it from https://claude.com/claude-code",
+            Self::Codex => "Install it from https://developers.openai.com/codex/cli",
             Self::Antigravity => "Install Google Antigravity, which includes the agy command",
         }
     }
@@ -61,6 +66,7 @@ impl Provider {
     pub fn find(self) -> Option<PathBuf> {
         match self {
             Self::Claude => claude::find_executable(),
+            Self::Codex => codex::find_executable(),
             Self::Antigravity => antigravity::find_executable(),
         }
     }
@@ -221,6 +227,10 @@ pub fn start_turn(
         Provider::Claude => {
             cmd.args(claude::args(&turn));
             claude::parse_line
+        }
+        Provider::Codex => {
+            cmd.args(codex::args(&turn));
+            codex::parse_line
         }
         Provider::Antigravity => {
             cmd.args(antigravity::args(&turn));

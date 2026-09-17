@@ -153,6 +153,30 @@ impl BarduinoApp {
         });
     }
 
+    /// Keys that open the tools panel. They're taken before anything is drawn, so
+    /// a focused terminal or message box never swallows them.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        // COMMAND is Ctrl on Windows and Linux, and Cmd on macOS.
+        const TERMINAL: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Backtick);
+        const BROWSER: KeyboardShortcut =
+            KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::B);
+
+        let (terminal, browser) =
+            ctx.input_mut(|i| (i.consume_shortcut(&TERMINAL), i.consume_shortcut(&BROWSER)));
+        if !terminal && !browser {
+            return;
+        }
+        let cwd = self.active_session_mut().project_dir.clone();
+        if terminal {
+            self.tools.show_terminal(&cwd);
+        }
+        if browser {
+            self.tools.open_browser();
+        }
+        self.state.show_tools = true;
+    }
+
     fn change_folder(&mut self) {
         let session = self.active_session_mut();
         let Some(dir) = rfd::FileDialog::new().set_directory(&session.project_dir).pick_folder() else {
@@ -378,6 +402,7 @@ impl BarduinoApp {
 
 impl eframe::App for BarduinoApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ctx);
         self.handle_voice_events();
         while let Ok((id, event)) = self.events_rx.try_recv() {
             // Events for a deleted session are dropped.

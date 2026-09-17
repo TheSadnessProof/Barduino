@@ -73,6 +73,78 @@ impl Period {
     }
 }
 
+/// How long a self-set token limit lasts before it starts over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LimitPeriod {
+    Day,
+    Week,
+    Month,
+}
+
+impl LimitPeriod {
+    pub const ALL: [LimitPeriod; 3] = [Self::Day, Self::Week, Self::Month];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Day => "per day",
+            Self::Week => "per week",
+            Self::Month => "per month",
+        }
+    }
+
+    /// How the spent part is described, e.g. "used today".
+    pub fn window(self) -> &'static str {
+        match self {
+            Self::Day => "today",
+            Self::Week => "in the last 7 days",
+            Self::Month => "in the last 30 days",
+        }
+    }
+
+    pub fn usage_period(self) -> Period {
+        match self {
+            Self::Day => Period::Today,
+            Self::Week => Period::Week,
+            Self::Month => Period::Month,
+        }
+    }
+}
+
+/// A token limit the user set for one provider. No agent CLI reports how much of a
+/// subscription is left, so Barduino measures what it spent against a chosen number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenLimit {
+    pub tokens: u64,
+    pub period: LimitPeriod,
+}
+
+impl TokenLimit {
+    /// What a new limit starts at, in tokens.
+    pub const DEFAULT_TOKENS: u64 = 5_000_000;
+
+    pub fn weekly() -> Self {
+        Self { tokens: Self::DEFAULT_TOKENS, period: LimitPeriod::Week }
+    }
+
+    pub fn progress(self, used: u64) -> LimitProgress {
+        LimitProgress {
+            fraction: if self.tokens == 0 { 1.0 } else { (used as f64 / self.tokens as f64) as f32 },
+            left: self.tokens.saturating_sub(used),
+            over: used.saturating_sub(self.tokens),
+        }
+    }
+}
+
+/// Where usage stands against a limit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LimitProgress {
+    /// The share of the limit used, which goes above 1.0 once it's passed.
+    pub fraction: f32,
+    pub left: u64,
+    /// How far past the limit, or 0 while there's still something left.
+    pub over: u64,
+}
+
 /// Usage per day (local time) and provider, for turns run through Barduino.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -165,6 +237,20 @@ mod tests {
 
         let agy = log.total_on(today, Provider::Antigravity, Period::AllTime);
         assert_eq!((agy.turns, agy.total_tokens(), agy.cost_usd), (1, 17, None));
+    }
+
+    #[test]
+    fn limits_report_what_is_left_and_what_is_over() {
+        let limit = TokenLimit { tokens: 1_000_000, period: LimitPeriod::Week };
+        let half = limit.progress(500_000);
+        assert_eq!((half.fraction, half.left, half.over), (0.5, 500_000, 0));
+
+        let past = limit.progress(1_250_000);
+        assert_eq!((past.fraction, past.left, past.over), (1.25, 0, 250_000));
+
+        // A limit of zero counts as fully used, so it can't show as "0% used".
+        assert_eq!(TokenLimit { tokens: 0, period: LimitPeriod::Day }.progress(0).fraction, 1.0);
+        assert_eq!(LimitPeriod::Week.usage_period(), Period::Week);
     }
 
     #[test]

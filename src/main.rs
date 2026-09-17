@@ -8,6 +8,7 @@ mod browser;
 mod changes;
 mod chat;
 mod claude;
+mod codex;
 mod git_diff;
 mod icons;
 mod session;

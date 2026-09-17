@@ -23,6 +23,10 @@ enum Tab {
     Browser,
 }
 
+/// Shown next to the menu items and in Settings; the keys are handled in app.rs.
+pub const TERMINAL_SHORTCUT: &str = "Ctrl+`";
+pub const BROWSER_SHORTCUT: &str = "Ctrl+Shift+B";
+
 pub enum ToolsAction {
     None,
     /// Attach this page element to the active session's message.
@@ -51,6 +55,14 @@ impl Tools {
         self.next_terminal_number += 1;
         self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed });
         self.active = self.tabs.len() - 1;
+    }
+
+    /// Shows a terminal in `cwd`: the most recent one that's open, or a new one.
+    pub fn show_terminal(&mut self, cwd: &Path) {
+        match self.tabs.iter().rposition(|tab| matches!(tab, Tab::Terminal { .. })) {
+            Some(index) => self.active = index,
+            None => self.open_terminal(cwd, None),
+        }
     }
 
     /// Shows the uncommitted changes in `dir`, reusing a tab that already does.
@@ -121,7 +133,7 @@ impl Tools {
         let mut opened = false;
         let response = icons::button(ui, Icon::Plus, "Open a terminal, changes or the browser");
         egui::Popup::menu(&response).show(|ui| {
-            if ui.button("Terminal").clicked() {
+            if ui.add(egui::Button::new("Terminal").shortcut_text(TERMINAL_SHORTCUT)).clicked() {
                 self.open_terminal(cwd, None);
                 opened = true;
             }
@@ -133,7 +145,7 @@ impl Tools {
                 ui.close();
                 opened |= self.compare_files(cwd, ui.ctx());
             }
-            if ui.button("Browser").clicked() {
+            if ui.add(egui::Button::new("Browser").shortcut_text(BROWSER_SHORTCUT)).clicked() {
                 self.open_browser();
                 opened = true;
             }
@@ -194,6 +206,9 @@ impl Tools {
                 ui.vertical_centered(|ui| {
                     ui.label(egui::RichText::new("Nothing open").weak());
                     ui.label(egui::RichText::new("Click + to open a terminal, changes or the browser.").small().weak());
+                    ui.add_space(6.0);
+                    let keys = format!("{TERMINAL_SHORTCUT} terminal  ·  {BROWSER_SHORTCUT} browser");
+                    ui.label(egui::RichText::new(keys).small().weak());
                 });
             }
             Some(Tab::Terminal { number, cwd, terminal, typed }) => {
