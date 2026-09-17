@@ -1,24 +1,23 @@
 //! Runs Google Antigravity's `agy` CLI in print mode and turns its streaming
 //! JSON output into events the UI can show. `agy` uses the Antigravity app's
-//! own sign-in, so it works without setting up Gemini CLI.
+//! own sign-in, so there is nothing extra to set up.
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-use crate::agent::{self, AgentEvent, Launcher, PermissionMode, Turn, string};
+use crate::agent::{self, AgentEvent, PermissionMode, Turn, string};
 
 /// Finds `agy` on PATH or where the Antigravity installer puts it.
-pub fn find_launcher() -> Option<Launcher> {
+pub fn find_executable() -> Option<PathBuf> {
     let name = if cfg!(windows) { "agy.exe" } else { "agy" };
     if let Some(exe) = agent::find_on_path(&[name]) {
-        return Some(Launcher::program(exe));
+        return Some(exe);
     }
     // Apps launched from the Start menu don't always see the PATH a terminal has.
     let local_app_data = std::env::var_os("LOCALAPPDATA")?;
     Some(PathBuf::from(local_app_data).join("agy").join("bin").join(name))
         .filter(|exe| exe.is_file())
-        .map(Launcher::program)
 }
 
 /// Arguments for one print-mode turn.

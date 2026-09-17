@@ -1,9 +1,11 @@
 //! App settings and the Settings page shown in the middle column.
 
+use std::path::PathBuf;
+
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{Launcher, Provider};
+use crate::agent::Provider;
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -46,14 +48,14 @@ impl Settings {
 }
 
 /// Where each provider's CLI was found on this computer, if anywhere.
-pub struct Detected([Option<Launcher>; Provider::ALL.len()]);
+pub struct Detected([Option<PathBuf>; Provider::ALL.len()]);
 
 impl Detected {
     pub fn scan() -> Self {
         Self(Provider::ALL.map(Provider::find))
     }
 
-    pub fn get(&self, provider: Provider) -> Option<&Launcher> {
+    pub fn get(&self, provider: Provider) -> Option<&PathBuf> {
         self.0[provider as usize].as_ref()
     }
 }
@@ -131,14 +133,14 @@ fn provider_card(
     ui: &mut egui::Ui,
     settings: &mut Settings,
     provider: Provider,
-    launcher: Option<&Launcher>,
+    exe: Option<&PathBuf>,
 ) -> Option<SettingsAction> {
     let mut action = None;
     egui::Frame::group(ui.style()).fill(ui.visuals().faint_bg_color).show(ui, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
             ui.label(egui::RichText::new(provider.label()).strong());
-            match launcher {
+            match exe {
                 Some(_) => ui.colored_label(egui::Color32::from_rgb(80, 180, 110), "● Installed"),
                 None => ui.colored_label(ui.visuals().warn_fg_color, "● Not found"),
             };
@@ -154,9 +156,9 @@ fn provider_card(
             });
         });
 
-        match launcher {
-            Some(launcher) => {
-                ui.label(egui::RichText::new(launcher.display()).monospace().small().weak());
+        match exe {
+            Some(exe) => {
+                ui.label(egui::RichText::new(exe.display().to_string()).monospace().small().weak());
                 ui.horizontal(|ui| {
                     let command = provider.command();
                     if ui
@@ -202,7 +204,7 @@ mod tests {
     fn switching_off_the_default_picks_another() {
         let mut settings = Settings::default();
         settings.set_enabled(Provider::Claude, false);
-        assert_eq!(settings.default_provider, Provider::Gemini);
+        assert_eq!(settings.default_provider, Provider::Antigravity);
         settings.set_enabled(Provider::Claude, true);
         assert_eq!(settings.enabled_providers().collect::<Vec<_>>(), Provider::ALL);
     }
@@ -210,8 +212,8 @@ mod tests {
     #[test]
     fn switching_off_twice_does_not_duplicate() {
         let mut settings = Settings::default();
-        settings.set_enabled(Provider::Gemini, false);
-        settings.set_enabled(Provider::Gemini, false);
-        assert_eq!(settings.disabled_providers, vec![Provider::Gemini]);
+        settings.set_enabled(Provider::Antigravity, false);
+        settings.set_enabled(Provider::Antigravity, false);
+        assert_eq!(settings.disabled_providers, vec![Provider::Antigravity]);
     }
 }

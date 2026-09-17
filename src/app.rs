@@ -123,12 +123,12 @@ impl BarduinoApp {
 
     fn send(&mut self, ctx: &egui::Context) {
         let provider = self.active_session_mut().provider;
-        let Some(launcher) = self.detected.get(provider).cloned() else { return };
+        let Some(exe) = self.detected.get(provider).cloned() else { return };
         let tx = self.events_tx.clone();
         let ctx = ctx.clone();
         let session = self.active_session_mut();
         let id = session.id;
-        session.send(&launcher, move |event| {
+        session.send(&exe, move |event| {
             let _ = tx.send((id, event));
             ctx.request_repaint();
         });

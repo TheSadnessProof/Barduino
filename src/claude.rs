@@ -1,15 +1,17 @@
 //! Runs the Claude Code CLI in headless mode and turns its streaming JSON
 //! output into events the UI can show.
 
+use std::path::PathBuf;
+
 use serde_json::Value;
 
-use crate::agent::{self, AgentEvent, Launcher, PermissionMode, Turn, string, tool_detail};
+use crate::agent::{self, AgentEvent, PermissionMode, Turn, string, tool_detail};
 
 /// Finds the `claude` executable on PATH or in the usual install locations.
-pub fn find_launcher() -> Option<Launcher> {
+pub fn find_executable() -> Option<PathBuf> {
     let names: &[&str] = if cfg!(windows) { &["claude.exe", "claude.cmd"] } else { &["claude"] };
     if let Some(exe) = agent::find_on_path(names) {
-        return Some(Launcher::program(exe));
+        return Some(exe);
     }
 
     // Apps launched from the Start menu don't always see the PATH a terminal has.
@@ -18,8 +20,10 @@ pub fn find_launcher() -> Option<Launcher> {
         home.join(".local").join("bin").join(names[0]),
         home.join(".claude").join("local").join(names[0]),
     ];
-    fallbacks.extend(agent::npm_global_dir().map(|dir| dir.join("claude.cmd")));
-    fallbacks.into_iter().find(|candidate| candidate.is_file()).map(Launcher::program)
+    if let Some(app_data) = std::env::var_os("APPDATA") {
+        fallbacks.push(PathBuf::from(app_data).join("npm").join("claude.cmd"));
+    }
+    fallbacks.into_iter().find(|candidate| candidate.is_file())
 }
 
 /// Arguments for one headless turn. The prompt itself is sent on stdin.

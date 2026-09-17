@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{self, AgentEvent, Launcher, PermissionMode, Provider, RunningTurn, Turn};
+use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
 use crate::terminal::Terminal;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
@@ -12,7 +12,7 @@ const UNTITLED: &str = "New session";
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Entry {
     User(String),
-    /// A reply from the agent. Saved sessions from before Gemini support call it `Claude`.
+    /// A reply from the agent. Sessions saved when only Claude was supported call it `Claude`.
     #[serde(alias = "Claude")]
     Agent(String),
     Tool { name: String, detail: String },
@@ -96,7 +96,7 @@ impl Session {
 
     /// Sends the message box contents to the agent. `on_event` is called from a
     /// background thread for everything that happens during the turn.
-    pub fn send(&mut self, launcher: &Launcher, on_event: impl Fn(AgentEvent) + Send + 'static) {
+    pub fn send(&mut self, exe: &Path, on_event: impl Fn(AgentEvent) + Send + 'static) {
         let prompt = self.input.trim().to_owned();
         if prompt.is_empty() || self.is_running() {
             return;
@@ -108,7 +108,7 @@ impl Session {
             resume_session: self.agent_session_id.clone(),
             permission_mode: self.permission_mode,
         };
-        match agent::start_turn(self.provider, launcher, turn, on_event) {
+        match agent::start_turn(self.provider, exe, turn, on_event) {
             Ok(running) => {
                 if self.title == UNTITLED {
                     self.title = title_from(&prompt);
@@ -159,15 +159,6 @@ impl Session {
                     text.push_str("\n… (cut off)");
                 }
                 self.entries.push(Entry::ToolOutput { text, is_error });
-            }
-            AgentEvent::Notice { text, is_error } => {
-                self.keep_streamed_text();
-                if is_error {
-                    self.error_shown = true;
-                    self.entries.push(Entry::Error(text));
-                } else {
-                    self.entries.push(Entry::Notice(text));
-                }
             }
             AgentEvent::Finished { session_id, error, denied_tools } => {
                 self.keep_streamed_text();
@@ -251,8 +242,8 @@ mod tests {
 
     #[test]
     fn streamed_text_is_kept_before_tools_and_at_the_end() {
-        // Gemini never sends a finished block, only pieces.
-        let mut s = session(Provider::Gemini);
+        // Antigravity never sends a finished block, only pieces.
+        let mut s = session(Provider::Antigravity);
         s.handle_event(AgentEvent::TextDelta("Let me look.".into()));
         s.handle_event(AgentEvent::ToolUse { name: "read_file".into(), detail: "a.txt".into() });
         s.handle_event(AgentEvent::TextDelta("Done.".into()));
@@ -278,13 +269,13 @@ mod tests {
 
     #[test]
     fn exit_error_is_not_repeated_after_a_reported_error() {
-        let mut s = session(Provider::Gemini);
+        let mut s = session(Provider::Antigravity);
         s.handle_event(AgentEvent::Finished {
             session_id: None,
             error: Some("API key not valid".into()),
             denied_tools: Vec::new(),
         });
-        s.handle_event(AgentEvent::Exited { error: Some("Gemini CLI exited with exit code: 144".into()) });
+        s.handle_event(AgentEvent::Exited { error: Some("Antigravity (agy) exited with code 1.".into()) });
         assert_eq!(s.entries, vec![Entry::Error("API key not valid".into())]);
     }
 

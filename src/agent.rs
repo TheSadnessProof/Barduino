@@ -1,7 +1,6 @@
 //! The parts every agent CLI shares: which providers exist, the events the UI
 //! understands, and running one turn as a background process.
 
-use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -12,33 +11,32 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{antigravity, claude, gemini};
+use crate::{antigravity, claude};
 
 /// An agent CLI that can act as the brain of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum Provider {
     #[default]
     Claude,
-    Gemini,
+    /// Sessions saved while Gemini CLI was an option now use Antigravity.
+    #[serde(alias = "Gemini")]
     Antigravity,
 }
 
 impl Provider {
-    pub const ALL: [Provider; 3] = [Self::Claude, Self::Gemini, Self::Antigravity];
+    pub const ALL: [Provider; 2] = [Self::Claude, Self::Antigravity];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Claude => "Claude Code",
-            Self::Gemini => "Gemini CLI",
             Self::Antigravity => "Antigravity (agy)",
         }
     }
 
-    /// The short name used in sentences like "Gemini is working…".
+    /// The short name used in sentences like "Claude is working…".
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
-            Self::Gemini => "Gemini",
             Self::Antigravity => "Antigravity",
         }
     }
@@ -47,7 +45,6 @@ impl Provider {
     pub fn command(self) -> &'static str {
         match self {
             Self::Claude => "claude",
-            Self::Gemini => "gemini",
             Self::Antigravity => "agy",
         }
     }
@@ -55,38 +52,15 @@ impl Provider {
     pub fn install_hint(self) -> &'static str {
         match self {
             Self::Claude => "Install it from https://claude.com/claude-code",
-            Self::Gemini => "Install it with: npm install -g @google/gemini-cli",
             Self::Antigravity => "Install Google Antigravity, which includes the agy command",
         }
     }
 
-    /// Finds how to start this CLI on this computer.
-    pub fn find(self) -> Option<Launcher> {
+    /// Finds this CLI's executable on this computer.
+    pub fn find(self) -> Option<PathBuf> {
         match self {
-            Self::Claude => claude::find_launcher(),
-            Self::Gemini => gemini::find_launcher(),
-            Self::Antigravity => antigravity::find_launcher(),
-        }
-    }
-}
-
-/// How to start a CLI: a program plus any arguments that must come first.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Launcher {
-    pub program: PathBuf,
-    pub leading_args: Vec<OsString>,
-}
-
-impl Launcher {
-    pub fn program(program: PathBuf) -> Self {
-        Self { program, leading_args: Vec::new() }
-    }
-
-    /// What to show the user as the CLI's location.
-    pub fn display(&self) -> String {
-        match self.leading_args.last() {
-            Some(script) => PathBuf::from(script).display().to_string(),
-            None => self.program.display().to_string(),
+            Self::Claude => claude::find_executable(),
+            Self::Antigravity => antigravity::find_executable(),
         }
     }
 }
@@ -102,8 +76,6 @@ pub enum AgentEvent {
     Text(String),
     ToolUse { name: String, detail: String },
     ToolResult { text: String, is_error: bool },
-    /// A warning or error the CLI reported while it kept going.
-    Notice { text: String, is_error: bool },
     /// The agent finished the turn.
     Finished {
         session_id: Option<String>,
@@ -164,20 +136,15 @@ impl Drop for RunningTurn {
 /// thread for each event.
 pub fn start_turn(
     provider: Provider,
-    launcher: &Launcher,
+    exe: &Path,
     turn: Turn,
     on_event: impl Fn(AgentEvent) + Send + 'static,
 ) -> std::io::Result<RunningTurn> {
-    let mut cmd = Command::new(&launcher.program);
-    cmd.args(&launcher.leading_args);
+    let mut cmd = Command::new(exe);
     let parse_line: fn(&str) -> Vec<AgentEvent> = match provider {
         Provider::Claude => {
             cmd.args(claude::args(&turn));
             claude::parse_line
-        }
-        Provider::Gemini => {
-            cmd.args(gemini::args(&turn));
-            gemini::parse_line
         }
         Provider::Antigravity => {
             cmd.args(antigravity::args(&turn));
@@ -202,8 +169,8 @@ pub fn start_turn(
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let child = Arc::new(Mutex::new(child));
 
-    // Claude and Gemini read the prompt from stdin, which avoids command-line quoting and
-    // length limits. Dropping stdin afterwards tells the CLI the prompt is complete.
+    // Claude reads the prompt from stdin, which avoids command-line quoting and length
+    // limits. Dropping stdin afterwards tells the CLI the prompt is complete.
     let prompt = turn.prompt;
     thread::spawn(move || {
         let _ = stdin.write_all(prompt.as_bytes());
@@ -250,16 +217,7 @@ fn wait(child: &Mutex<Child>) -> std::io::Result<ExitStatus> {
 
 /// Turns a failed CLI run into a message the user can act on.
 fn exit_error(provider: Provider, code: Option<i32>, stderr: &str) -> String {
-    // Gemini CLI exits with 41 when it can't authenticate.
-    const GEMINI_AUTH_FAILED: i32 = 41;
-
     let details = error_summary(stderr);
-    if provider == Provider::Gemini && code == Some(GEMINI_AUTH_FAILED) {
-        return format!(
-            "Gemini CLI isn't signed in. Open Settings, click \"Run `gemini` in the terminal\" and choose \
-             \"Sign in with Google\". Gemini said: {details}"
-        );
-    }
     match code {
         Some(code) => format!("{} exited with code {code}. {details}", provider.label()),
         None => format!("{} stopped unexpectedly. {details}", provider.label()),
@@ -305,11 +263,6 @@ pub fn home_dir() -> Option<PathBuf> {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from)
 }
 
-/// Where npm puts globally installed commands on Windows.
-pub fn npm_global_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|app_data| Path::new(&app_data).join("npm"))
-}
-
 pub fn string(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
 }
@@ -344,36 +297,10 @@ mod tests {
         assert_eq!(tool_detail(&serde_json::json!({"x": 1})), r#"{"x":1}"#);
     }
 
-    /// Runs the installed Gemini CLI end to end. It needs Gemini CLI and a network
-    /// connection, so it only runs when asked for:
-    /// `GEMINI_API_KEY=invalid cargo test -- --ignored gemini`
-    /// Run it with a temporary USERPROFILE/HOME so your real Gemini settings aren't used.
-    #[test]
-    #[ignore]
-    fn runs_the_real_gemini_cli() {
-        let launcher = Provider::Gemini.find().expect("Gemini CLI should be installed");
-        let (tx, rx) = std::sync::mpsc::channel();
-        let turn = Turn {
-            prompt: "Reply with exactly: a & b | c".into(),
-            cwd: std::env::temp_dir(),
-            resume_session: None,
-            permission_mode: PermissionMode::ReadOnly,
-        };
-        let _running = start_turn(Provider::Gemini, &launcher, turn, move |event| {
-            let _ = tx.send(event);
-        })
-        .expect("Gemini CLI should start");
-
-        let events: Vec<AgentEvent> = rx.iter().take_while(|e| !matches!(e, AgentEvent::Exited { .. })).collect();
-        assert!(matches!(events.first(), Some(AgentEvent::Started { .. })), "{events:?}");
-        assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })), "{events:?}");
-        println!("{events:#?}");
-    }
-
     fn run_turn(provider: Provider, turn: Turn) -> Vec<AgentEvent> {
-        let launcher = provider.find().expect("the CLI should be installed");
+        let exe = provider.find().expect("the CLI should be installed");
         let (tx, rx) = std::sync::mpsc::channel();
-        let _running = start_turn(provider, &launcher, turn, move |event| {
+        let _running = start_turn(provider, &exe, turn, move |event| {
             let _ = tx.send(event);
         })
         .expect("the CLI should start");
@@ -420,10 +347,9 @@ mod tests {
     }
 
     #[test]
-    fn gemini_sign_in_failures_explain_the_fix() {
-        let error = exit_error(Provider::Gemini, Some(41), "Invalid auth method selected.\n");
-        assert!(error.starts_with("Gemini CLI isn't signed in."), "{error}");
-        assert!(error.ends_with("Gemini said: Invalid auth method selected."), "{error}");
+    fn saved_gemini_sessions_load_as_antigravity() {
+        let provider: Provider = serde_json::from_str(r#""Gemini""#).unwrap();
+        assert_eq!(provider, Provider::Antigravity);
     }
 
     #[test]

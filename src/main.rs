@@ -7,7 +7,6 @@ mod app;
 mod browser;
 mod chat;
 mod claude;
-mod gemini;
 mod session;
 mod settings;
 mod terminal;
