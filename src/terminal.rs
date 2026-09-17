@@ -9,6 +9,8 @@ use std::thread;
 use eframe::egui::{self, Color32, FontId, Key, Modifiers, Sense, Vec2, text::LayoutJob};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 
+use crate::agent;
+
 const SCROLLBACK_LINES: usize = 5000;
 const FONT_SIZE: f32 = 13.0;
 const PADDING: f32 = 6.0;
@@ -63,18 +65,14 @@ pub struct Terminal {
 }
 
 impl Terminal {
-    pub fn start(cwd: &Path, ctx: egui::Context) -> Result<Self, String> {
+    pub fn start(cwd: &Path, shell: &Path, ctx: egui::Context) -> Result<Self, String> {
         let size = (24, 80);
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(size))
             .map_err(|err| format!("Couldn't open a terminal: {err}"))?;
 
-        let mut cmd = CommandBuilder::new(default_shell());
-        if cfg!(windows) {
-            cmd.arg("-NoLogo");
-        } else {
-            cmd.env("TERM", "xterm-256color");
-        }
+        let mut cmd = CommandBuilder::new(shell);
+        configure(&mut cmd, shell);
         cmd.cwd(cwd);
         let child = pair
             .slave
@@ -129,8 +127,9 @@ impl Terminal {
         self.exited.load(Ordering::Relaxed) || matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
-    /// Draws the terminal. Returns true if the user asked to restart the shell.
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> bool {
+    /// Draws the terminal. `take_keyboard` gives it the keyboard without waiting
+    /// for a click. Returns true if the user asked to restart the shell.
+    pub fn ui(&mut self, ui: &mut egui::Ui, take_keyboard: bool) -> bool {
         let mut restart = false;
         if self.has_exited() {
             ui.horizontal(|ui| {
@@ -152,7 +151,7 @@ impl Terminal {
             self.parser().screen_mut().set_size(rows, cols);
         }
 
-        if response.clicked() {
+        if response.clicked() || take_keyboard {
             response.request_focus();
         }
         let focused = response.has_focus();
@@ -256,16 +255,25 @@ impl Drop for Terminal {
 }
 
 /// Shows the terminal for a session, starting it the first time. `typed` is
-/// text to send to the shell as if the user had typed it.
-pub fn show(ui: &mut egui::Ui, slot: &mut Option<Result<Terminal, String>>, cwd: &Path, typed: Option<String>) {
-    let terminal = slot.get_or_insert_with(|| Terminal::start(cwd, ui.ctx().clone()));
+/// text to send to the shell as if the user had typed it, and `take_keyboard`
+/// puts the cursor in it straight away. Returns true if the shell was restarted,
+/// since the replacement is a new terminal that wants the cursor too.
+pub fn show(
+    ui: &mut egui::Ui,
+    slot: &mut Option<Result<Terminal, String>>,
+    cwd: &Path,
+    shell: &Path,
+    typed: Option<String>,
+    take_keyboard: bool,
+) -> bool {
+    let terminal = slot.get_or_insert_with(|| Terminal::start(cwd, shell, ui.ctx().clone()));
     let restart = match terminal {
         Ok(terminal) => {
             if let Some(text) = typed {
                 terminal.parser().screen_mut().set_scrollback(0);
                 write_all(&terminal.writer, text.as_bytes());
             }
-            terminal.ui(ui)
+            terminal.ui(ui, take_keyboard)
         }
         Err(error) => {
             ui.colored_label(ui.visuals().error_fg_color, error.as_str());
@@ -275,6 +283,7 @@ pub fn show(ui: &mut egui::Ui, slot: &mut Option<Result<Terminal, String>>, cwd:
     if restart {
         *slot = None;
     }
+    restart
 }
 
 fn write_all(writer: &Writer, bytes: &[u8]) {
@@ -287,15 +296,69 @@ fn pty_size((rows, cols): (u16, u16)) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-fn default_shell() -> PathBuf {
+/// A shell Barduino can start a terminal with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shell {
+    /// What Settings calls it.
+    pub name: &'static str,
+    pub path: PathBuf,
+}
+
+/// The shells on this computer, the most preferred first. Only file checks, so
+/// it costs little enough to ask again whenever Settings is opened.
+pub fn available_shells() -> Vec<Shell> {
+    let mut found: Vec<Shell> = Vec::new();
+    let mut add = |name: &'static str, path: Option<PathBuf>| {
+        if let Some(path) = path.filter(|path| path.is_file())
+            && !found.iter().any(|shell| shell.path == path)
+        {
+            found.push(Shell { name, path });
+        }
+    };
+
     if cfg!(windows) {
-        // Prefer PowerShell 7 when it's installed.
-        let pwsh = std::env::var_os("PATH").and_then(|paths| {
-            std::env::split_paths(&paths).map(|dir| dir.join("pwsh.exe")).find(|path| path.is_file())
-        });
-        pwsh.unwrap_or_else(|| PathBuf::from("powershell.exe"))
+        add("PowerShell 7", agent::find_on_path(&["pwsh.exe"]));
+        add("Windows PowerShell", agent::find_on_path(&["powershell.exe"]));
+        add("Command Prompt", agent::find_on_path(&["cmd.exe"]));
+        add("Git Bash", agent::find_on_path(&["bash.exe"]).or_else(git_bash));
     } else {
-        std::env::var_os("SHELL").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/bin/sh"))
+        // The login shell comes first, since it's the one the user chose already.
+        add("Login shell", std::env::var_os("SHELL").map(PathBuf::from));
+        for (name, path) in
+            [("Bash", "/bin/bash"), ("Zsh", "/bin/zsh"), ("Fish", "/usr/bin/fish"), ("sh", "/bin/sh")]
+        {
+            add(name, Some(PathBuf::from(path)));
+        }
+    }
+    found
+}
+
+/// Git for Windows ships bash but doesn't always leave it on PATH. Returns None
+/// anywhere there is no `ProgramFiles`, which is every other platform.
+fn git_bash() -> Option<PathBuf> {
+    let program_files = std::env::var_os("ProgramFiles")?;
+    Some(PathBuf::from(program_files).join("Git").join("bin").join("bash.exe"))
+}
+
+/// The shell a new terminal uses while the user hasn't chosen one in Settings.
+pub fn default_shell() -> PathBuf {
+    match available_shells().into_iter().next() {
+        Some(shell) => shell.path,
+        // Worth trying even when the search came up empty.
+        None => PathBuf::from(if cfg!(windows) { "powershell.exe" } else { "/bin/sh" }),
+    }
+}
+
+/// The flags and environment one particular shell wants. `-NoLogo` is
+/// PowerShell's alone — cmd would take it as a stray argument and bash would
+/// refuse it — so this asks which shell it is rather than which platform.
+fn configure(cmd: &mut CommandBuilder, shell: &Path) {
+    let name = shell.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+    match name.as_str() {
+        "pwsh" | "powershell" => cmd.arg("-NoLogo"),
+        "cmd" => {}
+        // Everything else is happier being told what the terminal can do.
+        _ => cmd.env("TERM", "xterm-256color"),
     }
 }
 
@@ -460,7 +523,8 @@ mod tests {
     fn closing_a_terminal_stops_programs_started_in_it() {
         // An unusual ping count makes the process easy to find.
         const MARKER: &str = "-n 4242";
-        let terminal = Terminal::start(&std::env::temp_dir(), egui::Context::default()).unwrap();
+        let terminal =
+            Terminal::start(&std::env::temp_dir(), &default_shell(), egui::Context::default()).unwrap();
         write_all(&terminal.writer, format!("ping {MARKER} 127.0.0.1\r").as_bytes());
 
         let mut running = Vec::new();

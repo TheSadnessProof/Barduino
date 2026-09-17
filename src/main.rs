@@ -12,6 +12,7 @@ mod codex;
 mod git_diff;
 mod icons;
 mod line_diff;
+mod logo;
 mod models;
 mod plan;
 mod session;
@@ -27,6 +28,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Barduino")
+            .with_icon(logo::window_icon(64))
             .with_inner_size([1400.0, 850.0])
             .with_min_inner_size([900.0, 500.0]),
         ..Default::default()

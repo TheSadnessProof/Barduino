@@ -8,7 +8,9 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{Provider, hidden_command};
+use crate::logo;
 use crate::plan::{self, PlanUsage};
+use crate::terminal::{self, Shell};
 use crate::tools::{BROWSER_SHORTCUT, TERMINAL_SHORTCUT};
 use crate::usage::{self, Period, Usage, UsageLog};
 
@@ -29,7 +31,11 @@ pub struct Settings {
     pub disabled_providers: Vec<Provider>,
     /// Executables the user chose instead of the ones Barduino finds itself.
     pub custom_executables: BTreeMap<Provider, PathBuf>,
+    /// The shell new terminals run, or None to use the first one Barduino finds.
+    #[serde(default)]
+    pub shell: Option<PathBuf>,
 }
+
 
 impl Default for Settings {
     fn default() -> Self {
@@ -37,11 +43,22 @@ impl Default for Settings {
             default_provider: Provider::Claude,
             disabled_providers: Vec::new(),
             custom_executables: BTreeMap::new(),
+            shell: None,
         }
     }
 }
 
 impl Settings {
+    /// The shell a new terminal should run: the chosen one while it is still
+    /// installed, otherwise whatever this computer offers.
+    pub fn shell(&self, available: &[Shell]) -> PathBuf {
+        match &self.shell {
+            Some(chosen) if available.iter().any(|shell| shell.path == *chosen) => chosen.clone(),
+            // A shell that has since been uninstalled shouldn't stop terminals working.
+            _ => terminal::default_shell(),
+        }
+    }
+
     pub fn is_enabled(&self, provider: Provider) -> bool {
         !self.disabled_providers.contains(&provider)
     }
@@ -158,6 +175,8 @@ pub struct PageContext<'a> {
     /// Why a provider's last check didn't work, if it didn't.
     pub plan_errors: &'a BTreeMap<Provider, String>,
     pub session_counts: BTreeMap<Provider, usize>,
+    /// The shells this computer offers for new terminals.
+    pub shells: &'a [Shell],
 }
 
 impl SettingsPage {
@@ -190,6 +209,8 @@ impl SettingsPage {
         {
             ui.add_space(18.0);
             ui.horizontal(|ui| {
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(24.0), egui::Sense::hover());
+                logo::paint(ui.painter(), mark, logo::COLOUR);
                 ui.heading("Settings");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Back to chat").clicked() {
@@ -226,6 +247,12 @@ impl SettingsPage {
             if let Some(clicked) = self.usage_section(ui, context.usage) {
                 *action = clicked;
             }
+
+            ui.add_space(18.0);
+            section_heading(ui, "Terminal", |_ui| {});
+            hint(ui, "Which shell the terminals in the right panel run.");
+            ui.add_space(8.0);
+            shell_card(ui, settings, context.shells);
 
             ui.add_space(18.0);
             section_heading(ui, "Shortcuts", |_ui| {});
@@ -575,6 +602,30 @@ fn hint(ui: &mut egui::Ui, text: &str) {
     ui.label(egui::RichText::new(text).weak());
 }
 
+/// The shell picker: every shell found on this computer, and where it lives.
+fn shell_card(ui: &mut egui::Ui, settings: &mut Settings, shells: &[Shell]) {
+    card(ui, None, |ui| {
+        if shells.is_empty() {
+            hint(ui, "No shell was found on this computer, so terminals may not start.");
+            return;
+        }
+        // The first is what Barduino would pick on its own, so saying so means the
+        // default doesn't need a name of its own in the list.
+        let automatic = format!("Choose for me — currently {}", shells[0].name);
+        if ui.radio(settings.shell.is_none(), automatic).clicked() {
+            settings.shell = None;
+        }
+        for shell in shells {
+            let chosen = settings.shell.as_deref() == Some(shell.path.as_path());
+            if ui.radio(chosen, shell.name).on_hover_text(shell.path.display().to_string()).clicked() {
+                settings.shell = Some(shell.path.clone());
+            }
+        }
+        ui.add_space(2.0);
+        hint(ui, "Terminals already open keep the shell they started with.");
+    });
+}
+
 /// A panel with a soft background, used for every block on the page.
 fn card(ui: &mut egui::Ui, accent: Option<egui::Color32>, contents: impl FnOnce(&mut egui::Ui)) {
     let stroke = match accent {
@@ -714,6 +765,27 @@ fn segmented<T: Copy + PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_chosen_shell_is_used_until_it_stops_being_installed() {
+        let available = vec![
+            Shell { name: "PowerShell 7", path: PathBuf::from(r"C:\pwsh.exe") },
+            Shell { name: "Command Prompt", path: PathBuf::from(r"C:\cmd.exe") },
+        ];
+        let mut settings = Settings::default();
+        // Nothing chosen means Barduino picks, which is what a fresh install does.
+        assert_eq!(settings.shell, None);
+
+        settings.shell = Some(PathBuf::from(r"C:\cmd.exe"));
+        assert_eq!(settings.shell(&available), PathBuf::from(r"C:\cmd.exe"));
+
+        // A shell that has since been uninstalled must not leave terminals broken,
+        // so the choice quietly falls back to whatever this computer has.
+        settings.shell = Some(PathBuf::from(r"C:\nushell-that-went-away.exe"));
+        assert_ne!(settings.shell(&available), PathBuf::from(r"C:\nushell-that-went-away.exe"));
+        assert_eq!(settings.shell(&available), terminal::default_shell());
+        assert_eq!(settings.shell(&[]), terminal::default_shell(), "and so does having no list at all");
+    }
 
     #[test]
     fn the_last_provider_cannot_be_switched_off() {

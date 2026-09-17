@@ -17,6 +17,9 @@ enum Tab {
         terminal: Option<Result<Terminal, String>>,
         /// Typed into the shell once it has started.
         typed: Option<String>,
+        /// Set while this terminal should take the keyboard the next time it is
+        /// drawn, so a terminal you just opened can be typed into right away.
+        focus: bool,
     },
     Changes(Changes),
     /// There is at most one, because it shares the single browser window.
@@ -33,6 +36,18 @@ pub enum ToolsAction {
     Attach(Vec<PickedElement>),
     /// Send these page elements directly to the active session.
     Send(Vec<PickedElement>),
+}
+
+/// What the panel needs from the session it belongs to.
+pub struct PanelContext<'a> {
+    /// The folder terminals start in and changes are read from.
+    pub cwd: &'a Path,
+    /// The shell a new terminal runs.
+    pub shell: &'a Path,
+    /// The one WebView every session takes turns showing.
+    pub browser: &'a mut Browser,
+    /// What this session wants shown in it.
+    pub page: &'a mut BrowserState,
 }
 
 pub struct Tools {
@@ -58,15 +73,26 @@ impl Tools {
     pub fn open_terminal(&mut self, cwd: &Path, typed: Option<String>) {
         let number = self.next_terminal_number;
         self.next_terminal_number += 1;
-        self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed });
+        self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed, focus: true });
         self.active = self.tabs.len() - 1;
     }
 
     /// Shows a terminal in `cwd`: the most recent one that's open, or a new one.
     pub fn show_terminal(&mut self, cwd: &Path) {
         match self.tabs.iter().rposition(|tab| matches!(tab, Tab::Terminal { .. })) {
-            Some(index) => self.active = index,
+            Some(index) => {
+                self.active = index;
+                self.focus_terminal(index);
+            }
             None => self.open_terminal(cwd, None),
+        }
+    }
+
+    /// Puts the cursor in this tab's terminal the next time it's drawn. Anything
+    /// else in that tab ignores it.
+    fn focus_terminal(&mut self, index: usize) {
+        if let Some(Tab::Terminal { focus, .. }) = self.tabs.get_mut(index) {
+            *focus = true;
         }
     }
 
@@ -150,19 +176,18 @@ impl Tools {
         opened
     }
 
-    /// Draws the expanded panel. `browser` is the one WebView every session shares,
-    /// and `page` is what this session wants shown in it. `collapse` is set when the
-    /// user hides the panel.
+    /// Draws the expanded panel. `collapse` is set when the user hides it.
     pub fn ui(
         &mut self,
-        browser: &mut Browser,
-        page: &mut BrowserState,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
-        cwd: &Path,
+        session: PanelContext<'_>,
         collapse: &mut bool,
     ) -> ToolsAction {
+        let PanelContext { cwd, shell, browser, page } = session;
         let mut close = None;
+        // Both are acted on after the strip, which is iterating the tabs.
+        let mut clicked = None;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             for (index, tab) in self.tabs.iter().enumerate() {
@@ -245,6 +270,7 @@ impl Tools {
                     close = Some(index);
                 } else if tab_resp.clicked() {
                     self.active = index;
+                    clicked = Some(index);
                 }
                 tab_resp.on_hover_text(hover);
             }
@@ -256,6 +282,10 @@ impl Tools {
             });
         });
         ui.separator();
+        // Clicking a terminal's tab is asking to type in it, not just to look.
+        if let Some(index) = clicked {
+            self.focus_terminal(index);
+        }
         if let Some(index) = close {
             self.close(index, browser);
             if self.tabs.is_empty() {
@@ -279,8 +309,15 @@ impl Tools {
                     ui.label(egui::RichText::new(keys).small().weak());
                 });
             }
-            Some(Tab::Terminal { number, cwd, terminal, typed }) => {
-                ui.push_id(("terminal", *number), |ui| terminal::show(ui, terminal, cwd, typed.take()));
+            Some(Tab::Terminal { number, cwd, terminal, typed, focus }) => {
+                let (text, take_keyboard) = (typed.take(), std::mem::take(focus));
+                let restarted = ui
+                    .push_id(("terminal", *number), |ui| {
+                        terminal::show(ui, terminal, cwd, shell, text, take_keyboard)
+                    })
+                    .inner;
+                // The restarted shell is a new terminal, so it wants the cursor as well.
+                *focus = restarted;
             }
             Some(Tab::Changes(changes)) => changes.ui(ui),
             Some(Tab::Browser) => {
@@ -314,6 +351,40 @@ mod tests {
         assert_eq!(tools.tabs.len(), 1);
         tools.close(0, &mut Browser::default());
         assert!(tools.tabs.is_empty());
+    }
+
+    /// True while this tab's terminal is still waiting to be given the keyboard.
+    fn waiting_for_keyboard(tools: &Tools, index: usize) -> bool {
+        matches!(tools.tabs.get(index), Some(Tab::Terminal { focus: true, .. }))
+    }
+
+    /// Stands in for drawing the tab, which is what hands the request over.
+    fn draw(tools: &mut Tools, index: usize) {
+        if let Some(Tab::Terminal { focus, .. }) = tools.tabs.get_mut(index) {
+            *focus = false;
+        }
+    }
+
+    #[test]
+    fn a_terminal_asks_for_the_keyboard_when_it_opens_or_is_shown_again() {
+        let mut tools = Tools::default();
+        tools.open_terminal(Path::new("."), None);
+        assert!(waiting_for_keyboard(&tools, 0), "a terminal you just opened takes the cursor");
+
+        draw(&mut tools, 0);
+        assert!(!waiting_for_keyboard(&tools, 0), "and doesn't keep asking for it afterwards");
+
+        // Ctrl+` while a terminal is already open is asking to type in that one.
+        tools.open_browser();
+        assert_eq!(tools.active, 1, "the browser is in front now");
+        tools.show_terminal(Path::new("."));
+        assert_eq!(tools.active, 0, "back to the terminal that was already open");
+        assert!(waiting_for_keyboard(&tools, 0));
+        assert_eq!(tools.tabs.len(), 2, "without opening a second one");
+
+        // Nothing to focus in a browser tab, and asking anyway is harmless.
+        tools.focus_terminal(1);
+        assert!(matches!(tools.tabs.get(1), Some(Tab::Browser)));
     }
 
     #[test]

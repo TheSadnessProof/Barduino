@@ -13,7 +13,8 @@ use crate::plan::{self, PlanUsage};
 use crate::session::Session;
 use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarAction};
-use crate::tools::{Tools, ToolsAction};
+use crate::terminal;
+use crate::tools::{PanelContext, Tools, ToolsAction};
 use crate::usage::UsageLog;
 
 /// What the middle column shows.
@@ -91,6 +92,8 @@ pub struct BarduinoApp {
     tools: std::collections::BTreeMap<u64, Tools>,
     /// The system WebView, which all the panels take turns showing.
     browser: Browser,
+    /// The shells this computer offers, found once and after a rescan.
+    shells: Vec<terminal::Shell>,
     /// Set until the width egui remembers for the right panel has been forgotten.
     forget_panel_width: bool,
     /// Markdown the conversation has already laid out, kept so it isn't redone each frame.
@@ -135,6 +138,7 @@ impl BarduinoApp {
             sidebar: Sidebar::default(),
             tools: std::collections::BTreeMap::new(),
             browser: Browser::default(),
+            shells: terminal::available_shells(),
             markdown: egui_commonmark::CommonMarkCache::default(),
             models: Catalog::default(),
             checked_free_plans: false,
@@ -324,6 +328,7 @@ impl BarduinoApp {
             plan_checks: &self.plan_checks,
             plan_errors: &self.plan_errors,
             session_counts,
+            shells: &self.shells,
         };
         let (page, settings) = (&mut self.settings_page, &mut self.state.settings);
         let action = egui::CentralPanel::default().show(ui, |ui| page.ui(ui, settings, &context)).inner;
@@ -341,6 +346,7 @@ impl BarduinoApp {
             }
             SettingsAction::Rescan => {
                 self.detected = Detected::scan(&self.state.settings, ui.ctx());
+                self.shells = terminal::available_shells();
                 self.plan_from_disk = plan::read_in_background(ui.ctx());
             }
             SettingsAction::ChooseExecutable(provider) => {
@@ -437,6 +443,7 @@ impl BarduinoApp {
             .default_size(default_width)
             .size_range(240.0..=1600.0);
         let cwd = self.tool_cwd();
+        let shell = self.state.settings.shell(&self.shells);
         let index = self.active_index();
         let id = self.state.active_session;
         let (mut collapse, mut expand) = (false, false);
@@ -448,7 +455,8 @@ impl BarduinoApp {
         let page = &mut self.state.sessions[index].browser;
         let action = egui::Panel::show_switched(ui, &mut show, collapsed, expanded, |ui, expanded| {
             if expanded {
-                return tools.ui(browser, page, ui, frame, &cwd, &mut collapse);
+                let session = PanelContext { cwd: &cwd, shell: &shell, browser, page };
+                return tools.ui(ui, frame, session, &mut collapse);
             }
             browser.hide();
             ui.add_space(6.0);
