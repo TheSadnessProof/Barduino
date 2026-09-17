@@ -77,6 +77,8 @@ pub struct BarduinoApp {
     tools: Tools,
     /// Set until the width egui remembers for the right panel has been forgotten.
     forget_panel_width: bool,
+    /// Markdown the conversation has already laid out, kept so it isn't redone each frame.
+    markdown: egui_commonmark::CommonMarkCache,
     /// The models each CLI offers, read in the background when first needed.
     models: Catalog,
     /// Set once this launch has asked the agents that answer for free.
@@ -114,6 +116,7 @@ impl BarduinoApp {
             settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
             tools,
+            markdown: egui_commonmark::CommonMarkCache::default(),
             models: Catalog::default(),
             checked_free_plans: false,
             plan_checks: plan::Checks::default(),
@@ -124,8 +127,7 @@ impl BarduinoApp {
             events_rx,
         };
         if app.state.sessions.is_empty() {
-            let project_dir = std::env::current_dir().unwrap_or_default();
-            app.new_session(project_dir, PermissionMode::ReadOnly);
+            app.new_session(PathBuf::new(), PermissionMode::ReadOnly);
         }
         if !app.state.sessions.iter().any(|s| s.id == app.state.active_session) {
             app.state.active_session = app.state.sessions[0].id;
@@ -137,6 +139,17 @@ impl BarduinoApp {
     fn active_index(&self) -> usize {
         let id = self.state.active_session;
         self.state.sessions.iter().position(|s| s.id == id).unwrap_or(0)
+    }
+
+    /// The folder the tools panel works in: the session's, or where Barduino was
+    /// started from while the session still has none.
+    fn tool_cwd(&self) -> PathBuf {
+        let session = &self.state.sessions[self.active_index()];
+        if session.has_folder() {
+            session.project_dir.clone()
+        } else {
+            std::env::current_dir().unwrap_or_default()
+        }
     }
 
     fn active_session_mut(&mut self) -> &mut Session {
@@ -195,7 +208,7 @@ impl BarduinoApp {
         if !terminal && !browser {
             return;
         }
-        let cwd = self.active_session_mut().project_dir.clone();
+        let cwd = self.tool_cwd();
         if terminal {
             self.tools.show_terminal(&cwd);
         }
@@ -231,9 +244,9 @@ impl BarduinoApp {
                 self.active_session_mut().focus_composer = true;
             }
             SidebarAction::NewSession => {
-                let session = self.active_session_mut();
-                let (project_dir, permission_mode) = (session.project_dir.clone(), session.permission_mode);
-                self.new_session(project_dir, permission_mode);
+                // A new session starts without a folder, so its first step is choosing one.
+                let permission_mode = self.active_session_mut().permission_mode;
+                self.new_session(PathBuf::new(), permission_mode);
             }
             SidebarAction::Rename(id, title) => {
                 if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
@@ -307,7 +320,7 @@ impl BarduinoApp {
             }
             SettingsAction::ResetUsage => self.state.usage.clear(),
             SettingsAction::OpenInTerminal(provider) => {
-                let cwd = self.active_session_mut().project_dir.clone();
+                let cwd = self.tool_cwd();
                 self.tools.open_terminal(&cwd, Some(format!("{}\r", provider.command())));
                 self.state.show_tools = true;
             }
@@ -325,6 +338,7 @@ impl BarduinoApp {
         let session = &mut self.state.sessions[index];
         let settings = &self.state.settings;
         let models = &self.models;
+        let markdown = &mut self.markdown;
 
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
             .show_separator_line(false)
@@ -343,7 +357,7 @@ impl BarduinoApp {
                     open_settings = ui.link("Open Settings").clicked();
                 });
             }
-            chat::conversation(ui, session);
+            chat::conversation(ui, session, markdown);
         });
 
         match composer_action {
@@ -383,7 +397,7 @@ impl BarduinoApp {
             .resizable(true)
             .default_size(default_width)
             .size_range(240.0..=1600.0);
-        let cwd = self.active_session_mut().project_dir.clone();
+        let cwd = self.tool_cwd();
         let tools = &mut self.tools;
         let (mut collapse, mut expand) = (false, false);
         let mut show = self.state.show_tools;

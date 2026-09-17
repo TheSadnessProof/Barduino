@@ -4,6 +4,8 @@ use eframe::egui;
 
 use crate::agent::{PermissionMode, Provider};
 use crate::browser::PickedElement;
+use crate::git_diff::LineKind;
+use crate::line_diff::FileEdit;
 use crate::models::{self, Catalog};
 use crate::session::{Entry, Session};
 use crate::icons::{self, Icon};
@@ -11,6 +13,9 @@ use crate::settings::Settings;
 
 /// The colour for full access, which lets the agent run anything.
 const RISKY: egui::Color32 = egui::Color32::from_rgb(214, 158, 46);
+/// Diff colours, kept close to what the Changes tab uses.
+const ADDED: egui::Color32 = egui::Color32::from_rgb(106, 176, 118);
+const REMOVED: egui::Color32 = egui::Color32::from_rgb(214, 108, 108);
 
 pub enum ComposerAction {
     None,
@@ -31,7 +36,7 @@ pub fn composer(
     // Take Enter before the text box sees it; Shift+Enter still adds a new line.
     let enter_pressed = ui.memory(|m| m.has_focus(composer_id))
         && ui.input_mut(|i| !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-    let can_send = agent_installed && !session.is_running() && session.has_message();
+    let can_send = agent_installed && !session.is_running() && session.has_message() && session.has_folder();
     let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
 
     ui.add_space(8.0);
@@ -76,9 +81,21 @@ pub fn composer(
                 model_picker(ui, session, catalog);
                 effort_picker(ui, session, catalog);
                 permission_picker(ui, session);
-                let folder = ui
-                    .add_enabled(!session.is_running(), egui::Button::new(format!("📁 {}", session.folder_name())).small())
-                    .on_hover_text(format!("{}\nClick to choose another folder", session.project_dir.display()));
+                // Until a folder is chosen this is the one thing the session needs, so it
+                // stands out rather than sitting quietly with the other pickers.
+                let (label, hover) = if session.has_folder() {
+                    (
+                        format!("📁 {}", session.folder_name()),
+                        format!("{}\nClick to choose another folder", session.project_dir.display()),
+                    )
+                } else {
+                    ("📁 Choose a folder".to_owned(), "Pick the project folder this session works in".to_owned())
+                };
+                let mut button = egui::Button::new(egui::RichText::new(label).small());
+                if !session.has_folder() {
+                    button = button.fill(RISKY.gamma_multiply(0.35));
+                }
+                let folder = ui.add_enabled(!session.is_running(), button).on_hover_text(hover);
                 if folder.clicked() {
                     action = ComposerAction::ChangeFolder;
                 }
@@ -224,7 +241,7 @@ fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
         ));
 }
 
-pub fn conversation(ui: &mut egui::Ui, session: &Session) {
+pub fn conversation(ui: &mut egui::Ui, session: &Session, markdown: &mut egui_commonmark::CommonMarkCache) {
     egui::ScrollArea::vertical()
         .id_salt(("conversation", session.id))
         .auto_shrink([false, false])
@@ -233,19 +250,19 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session) {
             if session.entries.is_empty() && session.streaming.is_empty() {
                 ui.add_space(24.0);
                 ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "Ask {} something about {}.",
-                            session.provider.short_name(),
-                            session.folder_name()
-                        ))
-                        .weak(),
-                    );
+                    let prompt = if session.has_folder() {
+                        format!("Ask {} something about {}.", session.provider.short_name(), session.folder_name())
+                    } else {
+                        "Choose a folder under the message box to get started.".to_owned()
+                    };
+                    ui.label(egui::RichText::new(prompt).weak());
                 });
             }
             for (index, entry) in session.entries.iter().enumerate() {
-                show_entry(ui, (session.id, index), entry);
+                show_entry(ui, (session.id, index), entry, markdown);
             }
+            // Text still arriving is left plain: half-written markdown would jump about
+            // as the rest of it comes in.
             if !session.streaming.is_empty() {
                 ui.label(&session.streaming);
             }
@@ -253,7 +270,7 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session) {
         });
 }
 
-fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
+fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut egui_commonmark::CommonMarkCache) {
     match entry {
         Entry::User(message) => {
             ui.add_space(10.0);
@@ -275,19 +292,29 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
                 });
             ui.add_space(4.0);
         }
+        // Agents write in markdown, so headings, lists and code blocks are shown as such.
         Entry::Agent(text) => {
-            ui.label(text);
+            egui_commonmark::CommonMarkViewer::new().show(ui, markdown, text);
         }
-        Entry::Tool { name, detail } => {
-            ui.label(egui::RichText::new(format!("{name}: {detail}")).monospace().weak());
+        Entry::Tool { name, detail, edit } => {
+            tool_row(ui, name, detail);
+            if let Some(edit) = edit {
+                edit_view(ui, id, edit);
+            }
         }
         Entry::ToolOutput { text, is_error } => {
-            let title = if *is_error { "Tool error" } else { "Tool output" };
-            egui::CollapsingHeader::new(egui::RichText::new(title).small().weak())
-                .id_salt(("tool_output", id))
-                .show(ui, |ui| {
-                    ui.label(egui::RichText::new(text).monospace().small());
-                });
+            let (title, colour) = if *is_error {
+                ("Failed", ui.visuals().error_fg_color)
+            } else {
+                ("Output", ui.visuals().weak_text_color())
+            };
+            let lines = text.lines().count();
+            let header = format!("{title} · {lines} {}", if lines == 1 { "line" } else { "lines" });
+            indented(ui, colour, |ui| {
+                egui::CollapsingHeader::new(egui::RichText::new(header).small().color(colour))
+                    .id_salt(("tool_output", id))
+                    .show(ui, |ui| output_text(ui, text));
+            });
         }
         Entry::Notice(text) => {
             ui.label(egui::RichText::new(text).italics().weak());
@@ -296,6 +323,99 @@ fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry) {
             ui.colored_label(ui.visuals().error_fg_color, text);
         }
     }
+}
+
+/// What a tool is doing: its name, then what it is working on.
+fn tool_row(ui: &mut egui::Ui, name: &str, detail: &str) {
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        egui::Frame::new()
+            .fill(ui.visuals().widgets.inactive.bg_fill)
+            .corner_radius(4.0)
+            .inner_margin(egui::Margin::symmetric(6, 1))
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new(name).small().strong());
+            });
+        ui.add(egui::Label::new(egui::RichText::new(detail).monospace().small().weak()).truncate());
+    });
+}
+
+/// The change an editing tool is about to make, as a diff.
+fn edit_view(ui: &mut egui::Ui, id: (u64, usize), edit: &FileEdit) {
+    let lines = edit.lines();
+    if lines.is_empty() {
+        return;
+    }
+    let (added, removed) = edit.counts();
+    let summary = format!("{}  +{added} −{removed}", edit.path);
+    indented(ui, ui.visuals().selection.bg_fill, |ui| {
+        egui::CollapsingHeader::new(egui::RichText::new(summary).small().monospace())
+            .id_salt(("edit", id))
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::Frame::new()
+                    .fill(ui.visuals().extreme_bg_color)
+                    .corner_radius(6.0)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        for line in &lines {
+                            diff_line(ui, line.kind, &line.text);
+                        }
+                    });
+            });
+    });
+}
+
+/// One line of a diff: a sign in the margin and the line itself, tinted to match.
+fn diff_line(ui: &mut egui::Ui, kind: LineKind, text: &str) {
+    let (sign, colour) = match kind {
+        LineKind::Added => ("+", ADDED),
+        LineKind::Removed => ("−", REMOVED),
+        LineKind::Context => (" ", ui.visuals().text_color()),
+        // Stands in for the lines left out between changes.
+        LineKind::NoNewline => ("", ui.visuals().weak_text_color()),
+    };
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
+        ui.label(egui::RichText::new(sign).monospace().color(colour));
+        ui.label(egui::RichText::new(text).monospace().color(colour));
+    });
+}
+
+/// Tool output, with diff lines picked out when a command printed a diff.
+fn output_text(ui: &mut egui::Ui, text: &str) {
+    let looks_like_diff = text.lines().any(|line| line.starts_with("@@ ") || line.starts_with("diff --git"));
+    if !looks_like_diff {
+        ui.label(egui::RichText::new(text).monospace().small());
+        return;
+    }
+    for line in text.lines() {
+        let colour = match line.chars().next() {
+            Some('+') if !line.starts_with("+++") => ADDED,
+            Some('-') if !line.starts_with("---") => REMOVED,
+            Some('@') => ui.visuals().selection.stroke.color,
+            _ => ui.visuals().weak_text_color(),
+        };
+        ui.label(egui::RichText::new(line).monospace().small().color(colour));
+    }
+}
+
+/// Puts a block under the tool it belongs to, behind a coloured line down the left.
+fn indented(ui: &mut egui::Ui, colour: egui::Color32, contents: impl FnOnce(&mut egui::Ui)) {
+    const INDENT: f32 = 10.0;
+    ui.horizontal(|ui| {
+        ui.add_space(INDENT);
+        let line = ui.cursor().min;
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            contents(ui);
+        });
+        // Drawn after the contents, so it can be exactly as tall as they turned out.
+        let bottom = ui.min_rect().bottom();
+        ui.painter().vline(line.x - 4.0, line.y..=bottom, egui::Stroke::new(1.5, colour.gamma_multiply(0.7)));
+    });
 }
 
 /// A small card for a page element attached to a message, with an × to remove

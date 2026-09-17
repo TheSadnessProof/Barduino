@@ -82,7 +82,7 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             vec![AgentEvent::Started { session_id: string(&msg["thread_id"]), model: String::new() }]
         }
         "item.started" => match tool_name(&msg["item"]) {
-            Some(name) => vec![AgentEvent::ToolUse { name, detail: item_detail(&msg["item"]) }],
+            Some(name) => vec![AgentEvent::ToolUse { name, detail: item_detail(&msg["item"]), edit: None }],
             None => Vec::new(),
         },
         "item.completed" => completed_item(&msg["item"]),
@@ -243,7 +243,7 @@ mod tests {
                 model: String::new(),
             })
         );
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
             if name == "Shell" && detail.contains("Get-Content"))));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, is_error: false }
             if text.contains("hello from barduino"))));
@@ -264,7 +264,7 @@ mod tests {
     #[test]
     fn parses_recorded_file_change() {
         let events = events(include_str!("../testdata/codex_edit_file.jsonl"));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
             if name == "Edit" && detail == "update C:\\Users\\ditob\\Documents\\barduino-codex-probe\\notes.txt")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, is_error: false }
             if text.ends_with("notes.txt"))));
@@ -371,7 +371,7 @@ mod tests {
         let completed = r#"{"type":"item.completed","item":{"id":"i1","type":"mcp_tool_call","server":"node_repl","tool":"js","arguments":{},"result":{"content":[{"type":"text","text":"2"}]},"error":null,"status":"completed"}}"#;
         assert_eq!(
             parse_line(started),
-            vec![AgentEvent::ToolUse { name: "node_repl.js".into(), detail: "Add two numbers".into() }]
+            vec![AgentEvent::ToolUse { name: "node_repl.js".into(), detail: "Add two numbers".into(), edit: None }]
         );
         assert_eq!(parse_line(completed), vec![AgentEvent::ToolResult { text: "2".into(), is_error: false }]);
     }

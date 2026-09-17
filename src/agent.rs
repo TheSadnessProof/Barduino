@@ -11,6 +11,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::line_diff::FileEdit;
 use crate::plan::PlanUsage;
 use crate::usage::Usage;
 use crate::{antigravity, claude, codex};
@@ -82,7 +83,12 @@ pub enum AgentEvent {
     TextDelta(String),
     /// A finished block of text. Replaces any streamed text before it.
     Text(String),
-    ToolUse { name: String, detail: String },
+    ToolUse {
+        name: String,
+        detail: String,
+        /// What the tool is about to change, when it says enough for a diff.
+        edit: Option<FileEdit>,
+    },
     ToolResult { text: String, is_error: bool },
     /// What the CLI says about the account's plan limits, which belongs to the
     /// provider rather than to this session.

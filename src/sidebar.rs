@@ -84,11 +84,14 @@ impl Sidebar {
         ui.add_space(4.0);
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            // Newest first.
-            for session in sessions.iter().rev() {
-                if let Some(row_action) = self.row(ui, session, active == Some(session.id)) {
-                    action = row_action;
+            for workspace in group_by_workspace(sessions) {
+                workspace_heading(ui, &workspace);
+                for session in workspace.sessions {
+                    if let Some(row_action) = self.row(ui, session, active == Some(session.id)) {
+                        action = row_action;
+                    }
                 }
+                ui.add_space(8.0);
             }
         });
         action
@@ -133,7 +136,7 @@ impl Sidebar {
                                     .selectable(false),
                             );
                             let failed = !session.is_running() && matches!(session.entries.last(), Some(Entry::Error(_)));
-                            let mut detail = format!("{} · {}", session.folder_name(), session.provider.short_name());
+                            let mut detail = session.provider.short_name().to_owned();
                             if failed {
                                 detail.push_str(" · error");
                             }
@@ -199,6 +202,41 @@ impl Sidebar {
     }
 }
 
+/// The sessions that share one project folder, newest first.
+pub struct Workspace<'a> {
+    /// The folder's name, or a stand-in for sessions that have none yet.
+    pub name: String,
+    /// The full path, for the tooltip. None while no folder has been chosen.
+    pub path: Option<String>,
+    pub sessions: Vec<&'a Session>,
+}
+
+/// Groups sessions by the folder they work in, so one project's work stays together.
+/// Workspaces are ordered by their newest session, and so are the sessions inside them.
+pub fn group_by_workspace(sessions: &[Session]) -> Vec<Workspace<'_>> {
+    let mut workspaces: Vec<Workspace<'_>> = Vec::new();
+    for session in sessions.iter().rev() {
+        let path = session.has_folder().then(|| session.project_dir.display().to_string());
+        match workspaces.iter_mut().find(|workspace| workspace.path == path) {
+            Some(workspace) => workspace.sessions.push(session),
+            None => workspaces.push(Workspace { name: session.folder_name(), path, sessions: vec![session] }),
+        }
+    }
+    workspaces
+}
+
+/// The folder name above a group of sessions.
+fn workspace_heading(ui: &mut egui::Ui, workspace: &Workspace<'_>) {
+    ui.add_space(2.0);
+    let name = egui::RichText::new(&workspace.name).small().strong().color(ui.visuals().weak_text_color());
+    let heading = ui.add(egui::Label::new(name).truncate().selectable(false));
+    match &workspace.path {
+        Some(path) => heading.on_hover_text(path),
+        None => heading.on_hover_text("These sessions still need a folder"),
+    };
+    ui.add_space(2.0);
+}
+
 /// A text box for renaming. Returns `Some(Some(name))` when saved, `Some(None)`
 /// when cancelled, and `None` while the user is still typing.
 fn rename_row(ui: &mut egui::Ui, id: u64, name: &mut String) -> Option<Option<String>> {
@@ -215,4 +253,42 @@ fn rename_row(ui: &mut egui::Ui, id: u64, name: &mut String) -> Option<Option<St
         return Some((!name.is_empty()).then_some(name));
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::agent::{PermissionMode, Provider};
+
+    fn session(id: u64, folder: &str) -> Session {
+        Session::new(id, PathBuf::from(folder), Provider::Claude, PermissionMode::ReadOnly)
+    }
+
+    #[test]
+    fn sessions_are_grouped_by_their_folder() {
+        let sessions = vec![
+            session(1, "C:\\work\\alpha"),
+            session(2, "C:\\work\\beta"),
+            session(3, "C:\\work\\alpha"),
+        ];
+        let workspaces = group_by_workspace(&sessions);
+        // Beta holds the newest session that isn't alpha's, but alpha's newest is newer.
+        let names: Vec<&str> = workspaces.iter().map(|workspace| workspace.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta"]);
+        let alpha_ids: Vec<u64> = workspaces[0].sessions.iter().map(|session| session.id).collect();
+        assert_eq!(alpha_ids, [3, 1], "newest first inside a workspace");
+        assert_eq!(workspaces[0].path.as_deref(), Some("C:\\work\\alpha"));
+    }
+
+    #[test]
+    fn sessions_without_a_folder_share_one_group() {
+        let sessions = vec![session(1, ""), session(2, "C:\\work\\alpha"), session(3, "")];
+        let workspaces = group_by_workspace(&sessions);
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0].path, None, "the newest session has no folder yet");
+        assert_eq!(workspaces[0].sessions.len(), 2);
+        assert_eq!(workspaces[0].name, crate::session::NO_FOLDER);
+    }
 }

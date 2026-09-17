@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
 use crate::browser::PickedElement;
+use crate::line_diff::FileEdit;
 
 /// Tool output longer than this is cut off in the chat so huge outputs don't slow the UI.
 const MAX_TOOL_OUTPUT_CHARS: usize = 4000;
 const UNTITLED: &str = "New session";
+/// Stands in for the folder name until one is chosen.
+pub const NO_FOLDER: &str = "No folder yet";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub enum Entry {
@@ -15,7 +18,13 @@ pub enum Entry {
     /// A reply from the agent. Sessions saved when only Claude was supported call it `Claude`.
     #[serde(alias = "Claude")]
     Agent(String),
-    Tool { name: String, detail: String },
+    Tool {
+        name: String,
+        detail: String,
+        /// The change the tool is about to make, when the agent described it.
+        #[serde(default)]
+        edit: Option<FileEdit>,
+    },
     ToolOutput { text: String, is_error: bool },
     Notice(String),
     Error(String),
@@ -154,8 +163,17 @@ impl Session {
         }
     }
 
+    /// Whether a project folder has been chosen. A new session starts without one,
+    /// so nothing is sent to an agent before the user says where it should work.
+    pub fn has_folder(&self) -> bool {
+        !self.project_dir.as_os_str().is_empty()
+    }
+
     /// The folder's name, for showing in the session list.
     pub fn folder_name(&self) -> String {
+        if !self.has_folder() {
+            return NO_FOLDER.to_owned();
+        }
         self.project_dir
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
@@ -165,7 +183,8 @@ impl Session {
     /// Sends the message box contents to the agent. `on_event` is called from a
     /// background thread for everything that happens during the turn.
     pub fn send(&mut self, exe: &Path, on_event: impl Fn(AgentEvent) + Send + 'static) {
-        if !self.has_message() || self.is_running() {
+        // An agent is always run inside a folder, so there is nothing to send without one.
+        if !self.has_message() || self.is_running() || !self.has_folder() {
             return;
         }
         let message = UserMessage { text: self.input.trim().to_owned(), elements: self.elements.clone() };
@@ -226,9 +245,9 @@ impl Session {
                     self.entries.push(Entry::Agent(text));
                 }
             }
-            AgentEvent::ToolUse { name, detail } => {
+            AgentEvent::ToolUse { name, detail, edit } => {
                 self.keep_streamed_text();
-                self.entries.push(Entry::Tool { name, detail });
+                self.entries.push(Entry::Tool { name, detail, edit });
             }
             AgentEvent::ToolResult { text, is_error } => {
                 let cut_off = text.chars().count() > MAX_TOOL_OUTPUT_CHARS;
@@ -333,14 +352,14 @@ mod tests {
         // Antigravity never sends a finished block, only pieces.
         let mut s = session(Provider::Antigravity);
         s.handle_event(AgentEvent::TextDelta("Let me look.".into()));
-        s.handle_event(AgentEvent::ToolUse { name: "read_file".into(), detail: "a.txt".into() });
+        s.handle_event(AgentEvent::ToolUse { name: "read_file".into(), detail: "a.txt".into(), edit: None });
         s.handle_event(AgentEvent::TextDelta("Done.".into()));
         s.handle_event(AgentEvent::Finished { session_id: None, error: None, denied_tools: Vec::new(), usage: None });
         assert_eq!(
             s.entries,
             vec![
                 Entry::Agent("Let me look.".into()),
-                Entry::Tool { name: "read_file".into(), detail: "a.txt".into() },
+                Entry::Tool { name: "read_file".into(), detail: "a.txt".into(), edit: None },
                 Entry::Agent("Done.".into()),
             ]
         );
@@ -425,6 +444,20 @@ mod tests {
             height: 36,
             note: None,
         }
+    }
+
+    #[test]
+    fn a_session_without_a_folder_says_so() {
+        let mut fresh = Session::new(1, PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
+        assert!(!fresh.has_folder());
+        assert_eq!(fresh.folder_name(), NO_FOLDER);
+
+        // Nothing is sent before a folder is picked, even with a message ready.
+        fresh.input = "do something".into();
+        assert!(fresh.has_message());
+        fresh.send(Path::new("claude"), |_| {});
+        assert!(fresh.entries.is_empty(), "no message is sent without a folder");
+        assert!(!fresh.is_running());
     }
 
     #[test]

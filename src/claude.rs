@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::agent::{self, AgentEvent, PermissionMode, Turn, string, tool_detail};
+use crate::line_diff::FileEdit;
 use crate::usage::Usage;
 
 /// Finds the `claude` executable on PATH or in the usual install locations.
@@ -86,6 +87,7 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 "tool_use" => Some(AgentEvent::ToolUse {
                     name: string(&block["name"]),
                     detail: tool_detail(&block["input"]),
+                    edit: file_edit(block["name"].as_str().unwrap_or_default(), &block["input"]),
                 }),
                 _ => None,
             })
@@ -124,6 +126,35 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
             }]
         }
         _ => Vec::new(),
+    }
+}
+
+/// The change an editing tool is about to make. Claude sends the text on both
+/// sides, so the chat can show a diff without reading the file.
+fn file_edit(tool: &str, input: &Value) -> Option<FileEdit> {
+    let path = input["file_path"].as_str()?.to_owned();
+    match tool {
+        "Edit" => Some(FileEdit {
+            path,
+            old: string(&input["old_string"]),
+            new: string(&input["new_string"]),
+        }),
+        // A write replaces the file, so everything in it counts as added.
+        "Write" => Some(FileEdit { path, old: String::new(), new: string(&input["content"]) }),
+        // Several edits to one file, shown as the run of changes they make.
+        "MultiEdit" => {
+            let edits = input["edits"].as_array()?;
+            let mut old = String::new();
+            let mut new = String::new();
+            for edit in edits {
+                old.push_str(&string(&edit["old_string"]));
+                old.push('\n');
+                new.push_str(&string(&edit["new_string"]));
+                new.push('\n');
+            }
+            Some(FileEdit { path, old, new })
+        }
+        _ => None,
     }
 }
 
@@ -193,6 +224,27 @@ mod tests {
     }
 
     #[test]
+    fn an_edit_carries_both_sides_of_the_change() {
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"C:\\work\\a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]},"parent_tool_use_id":null}"#;
+        let [AgentEvent::ToolUse { edit: Some(edit), .. }] = &parse_line(line)[..] else {
+            panic!("an edit should come through")
+        };
+        assert_eq!(edit.path, "C:\\work\\a.rs");
+        assert_eq!(edit.counts(), (1, 1));
+
+        // A write has nothing on the old side, so it reads as a new file.
+        let write = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t2","name":"Write","input":{"file_path":"new.txt","content":"one\ntwo"}}]},"parent_tool_use_id":null}"#;
+        let [AgentEvent::ToolUse { edit: Some(edit), .. }] = &parse_line(write)[..] else {
+            panic!("a write should come through")
+        };
+        assert_eq!(edit.counts(), (2, 0));
+
+        // Reading a file changes nothing, so there is no diff to show.
+        let read = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t3","name":"Read","input":{"file_path":"a.rs"}}]},"parent_tool_use_id":null}"#;
+        assert!(matches!(&parse_line(read)[..], [AgentEvent::ToolUse { edit: None, .. }]));
+    }
+
+    #[test]
     fn parses_init() {
         let line = r#"{"type":"system","subtype":"init","cwd":"C:\\x","session_id":"abc","model":"claude-opus-5[1m]","permissionMode":"default"}"#;
         assert_eq!(
@@ -215,7 +267,7 @@ mod tests {
         let result = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"README.md"}],"is_error":false}]},"parent_tool_use_id":null}"#;
         assert_eq!(
             parse_line(tool_use),
-            vec![AgentEvent::ToolUse { name: "Bash".into(), detail: "ls -la…".into() }]
+            vec![AgentEvent::ToolUse { name: "Bash".into(), detail: "ls -la…".into(), edit: None }]
         );
         assert_eq!(
             parse_line(result),

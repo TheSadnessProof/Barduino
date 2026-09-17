@@ -128,7 +128,10 @@ fn parse_step(step: &Value) -> Vec<AgentEvent> {
         "tool" => {
             let info = &step["tool_info"];
             match state {
+                // agy names the file it changes but not the text either side, so
+                // there is no diff to pass on.
                 "ACTIVE" => vec![AgentEvent::ToolUse {
+                    edit: None,
                     name: string(&step["tool_name"]),
                     detail: tool_detail(&info["parameters"]),
                 }],
@@ -172,7 +175,7 @@ mod tests {
             Some(&AgentEvent::Started { session_id: "b1752c20-bb81-4047-b2e1-480c12c67d6e".into(), model: String::new() })
         );
         assert!(events.contains(&AgentEvent::ToolResult { text: "note.txt".into(), is_error: false }));
-        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail }
+        assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
             if name == "view_file" && detail.ends_with("note.txt"))));
         let text: String = events
             .iter()

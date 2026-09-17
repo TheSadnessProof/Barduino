@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 eframe = { version = "0.36.2", features = ["persistence"] }
+egui_commonmark = { version = "0.25.0", default-features = false, features = ["pulldown_cmark"] }
 portable-pty = "0.9.0"
 rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
