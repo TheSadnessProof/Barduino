@@ -129,6 +129,8 @@ pub enum BrowserAction {
     None,
     /// Attach these elements to the message being written.
     Attach(Vec<PickedElement>),
+    /// Send these elements directly to the active session.
+    Send(Vec<PickedElement>),
 }
 
 pub struct Browser {
@@ -336,6 +338,7 @@ impl Browser {
     fn comment_list(&mut self, ui: &mut egui::Ui, commands: &mut Vec<native::Command>) -> Option<BrowserAction> {
         let mut action = None;
         let mut remove = None;
+        let mut send_single = None;
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
@@ -348,15 +351,28 @@ impl Browser {
                     let heading = if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") };
                     ui.label(egui::RichText::new(heading).strong().small());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let send = ui
-                            .button("Add to message")
-                            .on_hover_text("Puts every comment in the message box, ready to send");
-                        if send.clicked() {
+                        let send_direct = ui
+                            .button(egui::RichText::new("Send directly").small().strong())
+                            .on_hover_text("Sends all comments directly to the session");
+                        if send_direct.clicked() {
                             let elements = self.comments.drain(..).map(Comment::into_element).collect();
                             commands.push(native::Command::ClearPins);
+                            self.mode = Mode::Off;
+                            commands.push(native::Command::Comment(false, 1));
+                            action = Some(BrowserAction::Send(elements));
+                        }
+                        let add_label = if count == 1 { "Add comment" } else { "Add comments" };
+                        let add_btn = ui
+                            .button(egui::RichText::new(add_label).small())
+                            .on_hover_text("Accumulates comments in the message box to send together later");
+                        if add_btn.clicked() {
+                            let elements = self.comments.drain(..).map(Comment::into_element).collect();
+                            commands.push(native::Command::ClearPins);
+                            self.mode = Mode::Off;
+                            commands.push(native::Command::Comment(false, 1));
                             action = Some(BrowserAction::Attach(elements));
                         }
-                        if ui.button("Clear").clicked() {
+                        if ui.button(egui::RichText::new("Clear").small()).clicked() {
                             self.comments.clear();
                             commands.push(native::Command::ClearPins);
                         }
@@ -370,7 +386,7 @@ impl Browser {
                             pin_number(ui, comment.number);
                             let note = ui.add(
                                 egui::TextEdit::singleline(&mut comment.note)
-                                    .desired_width(ui.available_width() - 120.0)
+                                    .desired_width((ui.available_width() - 170.0).max(60.0))
                                     .hint_text("What should change here?"),
                             );
                             // The note for a fresh pin takes the keyboard, so the user can just type.
@@ -389,12 +405,30 @@ impl Browser {
                                 if icons::button(ui, Icon::Close, "Remove this comment").clicked() {
                                     remove = Some(comment.number);
                                 }
+                                if ui
+                                    .small_button("Send")
+                                    .on_hover_text("Send this comment directly to the session")
+                                    .clicked()
+                                {
+                                    send_single = Some(comment.number);
+                                }
                             });
                         });
                     }
                 });
             });
 
+        if let Some(number) = send_single
+            && let Some(pos) = self.comments.iter().position(|c| c.number == number)
+        {
+            let comment = self.comments.remove(pos);
+            commands.push(native::Command::RemovePin(number));
+            if self.comments.is_empty() {
+                self.mode = Mode::Off;
+                commands.push(native::Command::Comment(false, 1));
+            }
+            action = Some(BrowserAction::Send(vec![comment.into_element()]));
+        }
         if let Some(number) = remove {
             self.comments.retain(|comment| comment.number != number);
             commands.push(native::Command::RemovePin(number));

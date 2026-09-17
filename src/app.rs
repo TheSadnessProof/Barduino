@@ -424,13 +424,24 @@ impl BarduinoApp {
             ui.ctx().request_repaint();
         }
 
-        if let ToolsAction::Attach(elements) = action {
-            let session = self.active_session_mut();
-            for element in elements {
-                session.attach(element);
+        match action {
+            ToolsAction::Attach(elements) => {
+                let session = self.active_session_mut();
+                for element in elements {
+                    session.attach(element);
+                }
+                session.focus_composer = true;
+                self.view = View::Chat;
             }
-            session.focus_composer = true;
-            self.view = View::Chat;
+            ToolsAction::Send(elements) => {
+                let session = self.active_session_mut();
+                for element in elements {
+                    session.attach(element);
+                }
+                self.view = View::Chat;
+                self.send(ui.ctx());
+            }
+            ToolsAction::None => {}
         }
     }
 }

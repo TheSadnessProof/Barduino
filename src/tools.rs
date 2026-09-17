@@ -31,6 +31,8 @@ pub enum ToolsAction {
     None,
     /// Attach these page elements to the active session's message.
     Attach(Vec<PickedElement>),
+    /// Send these page elements directly to the active session.
+    Send(Vec<PickedElement>),
 }
 
 pub struct Tools {
@@ -272,8 +274,10 @@ impl Tools {
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.
                 let page_visible = !egui::Popup::is_any_open(ui.ctx());
-                if let BrowserAction::Attach(elements) = self.browser.ui(ui, frame, page_visible) {
-                    action = ToolsAction::Attach(elements);
+                match self.browser.ui(ui, frame, page_visible) {
+                    BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
+                    BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
+                    BrowserAction::None => {}
                 }
             }
         }
