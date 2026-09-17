@@ -2,12 +2,12 @@
 
 use eframe::egui;
 
-use crate::agent::{PermissionMode, Provider};
+use crate::agent::Provider;
 use crate::browser::PickedElement;
 use crate::commands::{self, CommandSource, SlashCommand};
 use crate::git_diff::LineKind;
 use crate::line_diff::FileEdit;
-use crate::models::{self, Catalog};
+use crate::models::Catalog;
 use crate::session::{Entry, Session};
 use crate::icons::{self, Icon};
 use crate::settings::Settings;
@@ -22,7 +22,6 @@ pub enum ComposerAction {
     None,
     Send,
     Stop,
-    ChangeFolder,
 }
 
 /// Actions returned from the conversation area (e.g. empty session controls).
@@ -35,12 +34,12 @@ pub enum ConversationAction {
 /// Claude signature terracotta/coral accent for primary actions and focus states.
 const CLAUDE_CORAL: egui::Color32 = egui::Color32::from_rgb(217, 119, 87);
 
-/// The message box, styled with Claude's signature aesthetics, hosting model, effort,
-/// and permission controls along its bottom edge.
+/// The message box, styled with Claude's signature aesthetics, hosting prompt input,
+/// autocomplete popups, and turn execution controls.
 pub fn composer(
     ui: &mut egui::Ui,
     session: &mut Session,
-    catalog: &Catalog,
+    _catalog: &Catalog,
     agent_installed: bool,
 ) -> ComposerAction {
     let composer_id = egui::Id::new(("composer", session.id));
@@ -144,17 +143,7 @@ pub fn composer(
                 slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
                 ui.add_space(6.0);
             }
-            let hint = if session.has_folder() {
-                format!(
-                    "Message {}…  (Enter to send, Shift+Enter for a new line)",
-                    session.provider.short_name()
-                )
-            } else {
-                format!(
-                    "Message {}…  (Select a workspace folder above to begin)",
-                    session.provider.short_name()
-                )
-            };
+            let hint = format!("Message {}…", session.provider.short_name());
             let response = ui.add(
                 egui::TextEdit::multiline(&mut session.input)
                     .id(composer_id)
@@ -169,29 +158,8 @@ pub fn composer(
                 response.request_focus();
             }
 
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                model_picker(ui, session, catalog);
-                effort_picker(ui, session, catalog);
-                permission_picker(ui, session);
-
-                // Subtle compact folder pill
-                if session.has_folder() {
-                    let folder_chip = egui::Button::new(
-                        egui::RichText::new(format!("📁 {}", session.folder_name())).small().weak(),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .corner_radius(6.0);
-                    let folder_btn = ui.add(folder_chip).on_hover_text(format!(
-                        "Working in {}\nClick to choose another folder",
-                        session.project_dir.display()
-                    ));
-                    if folder_btn.clicked() {
-                        action = ComposerAction::ChangeFolder;
-                    }
-                }
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let running = session.is_running();
                     if running {
@@ -230,113 +198,11 @@ pub fn composer(
                             action = ComposerAction::Send;
                         }
                     }
-                    if !running
-                        && session.chosen_model.is_none()
-                        && let Some(model) = &session.model
-                    {
-                        ui.label(egui::RichText::new(model).small().weak());
-                    }
                 });
             });
         });
     ui.add_space(8.0);
     action
-}
-
-/// Which model answers in this session. The list comes from the CLI itself, so
-/// it may still be loading the first time it's opened.
-fn model_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
-    let provider = session.provider;
-    let selected = match &session.chosen_model {
-        Some(id) => catalog.label_for(provider, id),
-        None => "Default model".to_owned(),
-    };
-    egui::ComboBox::from_id_salt(("model", session.id))
-        .selected_text(egui::RichText::new(selected).small())
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut session.chosen_model, None, "Default model")
-                .on_hover_text("Whichever model the CLI is set to use");
-            let models = catalog.models(provider);
-            if models.is_empty() {
-                ui.horizontal(|ui| {
-                    if catalog.is_loading(provider) {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("Reading the model list…").small().weak());
-                    } else {
-                        ui.label(egui::RichText::new("No other models reported.").small().weak());
-                    }
-                });
-            }
-            for model in models {
-                ui.selectable_value(&mut session.chosen_model, Some(model.id.clone()), &model.label)
-                    .on_hover_text(&model.id);
-            }
-        })
-        .response
-        .on_hover_text("Which model this session uses. Applies from the next message.");
-}
-
-/// How hard the model should work. The levels are the provider's own.
-fn effort_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
-    let levels = catalog.efforts(session.provider, session.chosen_model.as_deref());
-    // A level the provider no longer offers would otherwise be stuck in the session.
-    if let Some(effort) = &session.effort
-        && !levels.iter().any(|level| level == effort)
-    {
-        session.effort = None;
-    }
-    let selected = match &session.effort {
-        Some(effort) => models::effort_label(effort),
-        None => "Default effort".to_owned(),
-    };
-    egui::ComboBox::from_id_salt(("effort", session.id))
-        .selected_text(egui::RichText::new(selected).small())
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut session.effort, None, "Default effort");
-            for level in levels {
-                let label = models::effort_label(&level);
-                ui.selectable_value(&mut session.effort, Some(level), label);
-            }
-        })
-        .response
-        .on_hover_text(
-            "How much thinking the model puts in. More effort means slower, more thorough \
-             answers that use more of your plan.",
-        );
-}
-
-fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
-    let current = session.permission_mode;
-    let (dot, dot_color) = match current {
-        PermissionMode::ReadOnly => ("●", egui::Color32::from_rgb(140, 160, 180)),
-        PermissionMode::AcceptEdits => ("●", egui::Color32::from_rgb(70, 165, 120)),
-        PermissionMode::Full => ("●", RISKY),
-        PermissionMode::Plan => ("●", egui::Color32::from_rgb(150, 110, 210)),
-    };
-    let label = egui::RichText::new(format!("{dot} {}", current.label()))
-        .small()
-        .color(if current.is_risky() { RISKY } else { dot_color });
-
-    egui::ComboBox::from_id_salt(("permission_mode", session.id))
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            for mode in PermissionMode::ALL {
-                let (dot, dot_color) = match mode {
-                    PermissionMode::ReadOnly => ("●", egui::Color32::from_rgb(140, 160, 180)),
-                    PermissionMode::AcceptEdits => ("●", egui::Color32::from_rgb(70, 165, 120)),
-                    PermissionMode::Full => ("●", RISKY),
-                    PermissionMode::Plan => ("●", egui::Color32::from_rgb(150, 110, 210)),
-                };
-                let label = egui::RichText::new(format!("{dot} {}", mode.label()))
-                    .color(if mode.is_risky() { RISKY } else { dot_color });
-                ui.selectable_value(&mut session.permission_mode, mode, label).on_hover_text(mode.description());
-            }
-        })
-        .response
-        .on_hover_text(format!(
-            "What the agent may do without asking. Applies from the next message.\n\n{}",
-            current.description()
-        ));
 }
 
 pub fn conversation(
@@ -1277,6 +1143,7 @@ fn shorten_note(note: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PermissionMode;
 
     /// The card and the Copy button must never disagree: whatever the parser puts on
     /// screen is exactly what the clipboard gets. The old stripper concatenated every

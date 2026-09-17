@@ -118,6 +118,8 @@ pub enum PermissionMode {
     Plan,
 }
 
+// Permission mode descriptors retained for slash command expansions (/permissions, /mode).
+#[allow(dead_code)]
 impl PermissionMode {
     /// In the order they appear in the picker, from least to most it may do.
     pub const ALL: [PermissionMode; 4] = [Self::Plan, Self::ReadOnly, Self::AcceptEdits, Self::Full];

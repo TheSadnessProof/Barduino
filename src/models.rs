@@ -32,7 +32,9 @@ fn default_efforts(provider: Provider) -> Vec<String> {
     levels.iter().map(|level| (*level).to_owned()).collect()
 }
 
-/// How an effort level is written in the picker.
+/// How an effort level is written in sentences and tooltips.
+// Effort formatting retained for slash command /effort expansions.
+#[allow(dead_code)]
 pub fn effort_label(effort: &str) -> String {
     match effort {
         "xhigh" => "Extra high".to_owned(),
@@ -121,6 +123,8 @@ pub struct Catalog {
     loading: Arc<Mutex<BTreeMap<Provider, bool>>>,
 }
 
+// Model catalogue query methods retained for slash command expansions (/model, /effort).
+#[allow(dead_code)]
 impl Catalog {
     /// The models known for a provider. Empty while the list is still being read,
     /// which `start` sets going.
