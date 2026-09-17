@@ -387,12 +387,12 @@ impl BarduinoApp {
 
         let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
             .show_separator_line(false)
-            .show(ui, |ui| chat::composer(ui, session, settings, models, installed))
+            .show(ui, |ui| chat::composer(ui, session, models, installed))
             .inner;
         // Checked again after the composer, which is where the provider can change.
         let installed = self.detected.get(session.provider).is_some();
         let mut open_settings = false;
-        egui::CentralPanel::default().show(ui, |ui| {
+        let conv_action = egui::CentralPanel::default().show(ui, |ui| {
             if !installed {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(
@@ -402,8 +402,26 @@ impl BarduinoApp {
                     open_settings = ui.link("Open Settings").clicked();
                 });
             }
-            chat::conversation(ui, session, markdown);
-        });
+            chat::conversation(ui, session, settings, markdown)
+        }).inner;
+
+        match conv_action {
+            chat::ConversationAction::ChangeFolder => self.change_folder(),
+            chat::ConversationAction::SelectProvider(p) => {
+                let session = self.active_session_mut();
+                if session.can_change_provider() && session.provider != p {
+                    session.provider = p;
+                    session.chosen_model = None;
+                    session.effort = None;
+                }
+            }
+            chat::ConversationAction::InsertPrompt(prompt) => {
+                let session = self.active_session_mut();
+                session.input = prompt;
+                session.focus_composer = true;
+            }
+            chat::ConversationAction::None => {}
+        }
 
         match composer_action {
             ComposerAction::Send => self.send(ui.ctx()),

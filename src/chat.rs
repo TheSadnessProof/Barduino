@@ -25,11 +25,22 @@ pub enum ComposerAction {
     ChangeFolder,
 }
 
-/// The message box, with the agent, permission and folder pickers along its bottom edge.
+/// Actions returned from the conversation area (e.g. empty session controls).
+pub enum ConversationAction {
+    None,
+    ChangeFolder,
+    SelectProvider(Provider),
+    InsertPrompt(String),
+}
+
+/// Claude signature terracotta/coral accent for primary actions and focus states.
+const CLAUDE_CORAL: egui::Color32 = egui::Color32::from_rgb(217, 119, 87);
+
+/// The message box, styled with Claude's signature aesthetics, hosting model, effort,
+/// and permission controls along its bottom edge.
 pub fn composer(
     ui: &mut egui::Ui,
     session: &mut Session,
-    settings: &Settings,
     catalog: &Catalog,
     agent_installed: bool,
 ) -> ComposerAction {
@@ -103,12 +114,18 @@ pub fn composer(
     let can_send = agent_installed && !session.is_running() && session.has_message() && session.has_folder();
     let mut action = if enter_pressed && can_send { ComposerAction::Send } else { ComposerAction::None };
 
+    let border_stroke = if has_focus {
+        egui::Stroke::new(1.5, CLAUDE_CORAL.gamma_multiply(0.85))
+    } else {
+        egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+    };
+
     ui.add_space(8.0);
     egui::Frame::new()
         .fill(ui.visuals().extreme_bg_color)
-        .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-        .corner_radius(10.0)
-        .inner_margin(egui::Margin::symmetric(10, 8))
+        .stroke(border_stroke)
+        .corner_radius(12.0)
+        .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
             if !session.elements.is_empty() {
                 let mut remove = None;
@@ -128,56 +145,89 @@ pub fn composer(
                 slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
                 ui.add_space(6.0);
             }
+            let hint = if session.has_folder() {
+                format!(
+                    "Message {}…  (Enter to send, Shift+Enter for a new line)",
+                    session.provider.short_name()
+                )
+            } else {
+                format!(
+                    "Message {}…  (Select a workspace folder above to begin)",
+                    session.provider.short_name()
+                )
+            };
             let response = ui.add(
                 egui::TextEdit::multiline(&mut session.input)
                     .id(composer_id)
                     .frame(egui::Frame::NONE)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
-                    .hint_text(format!(
-                        "Ask {}…  (Enter to send, Shift+Enter for a new line)",
-                        session.provider.short_name()
-                    )),
+                    .hint_text(hint),
             );
             if std::mem::take(&mut session.focus_composer) {
                 response.request_focus();
             }
 
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                provider_picker(ui, session, settings);
+                ui.spacing_mut().item_spacing.x = 6.0;
                 model_picker(ui, session, catalog);
                 effort_picker(ui, session, catalog);
                 permission_picker(ui, session);
-                // Until a folder is chosen this is the one thing the session needs, so it
-                // stands out rather than sitting quietly with the other pickers.
-                let (label, hover) = if session.has_folder() {
-                    (
-                        format!("📁 {}", session.folder_name()),
-                        format!("{}\nClick to choose another folder", session.project_dir.display()),
+
+                // Subtle compact folder pill
+                if session.has_folder() {
+                    let folder_chip = egui::Button::new(
+                        egui::RichText::new(format!("📁 {}", session.folder_name())).small().weak(),
                     )
-                } else {
-                    ("📁 Choose a folder".to_owned(), "Pick the project folder this session works in".to_owned())
-                };
-                let mut button = egui::Button::new(egui::RichText::new(label).small());
-                if !session.has_folder() {
-                    button = button.fill(RISKY.gamma_multiply(0.35));
-                }
-                let folder = ui.add_enabled(!session.is_running(), button).on_hover_text(hover);
-                if folder.clicked() {
-                    action = ComposerAction::ChangeFolder;
+                    .fill(egui::Color32::TRANSPARENT)
+                    .corner_radius(6.0);
+                    let folder_btn = ui.add(folder_chip).on_hover_text(format!(
+                        "Working in {}\nClick to choose another folder",
+                        session.project_dir.display()
+                    ));
+                    if folder_btn.clicked() {
+                        action = ComposerAction::ChangeFolder;
+                    }
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let running = session.is_running();
                     if running {
-                        if ui.button("Stop").clicked() {
+                        let stop_btn = egui::Button::new(
+                            egui::RichText::new("Stop").strong().small().color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(205, 65, 65))
+                        .corner_radius(8.0)
+                        .min_size(egui::vec2(60.0, 28.0));
+
+                        if ui.add(stop_btn).clicked() {
                             action = ComposerAction::Stop;
                         }
-                        ui.label(egui::RichText::new(format!("{} is working…", session.provider.short_name())).weak());
+                        ui.label(egui::RichText::new(format!("{} is working…", session.provider.short_name())).weak().small());
                         ui.spinner();
-                    } else if ui.add_enabled(can_send, egui::Button::new("Send")).clicked() {
-                        action = ComposerAction::Send;
+                    } else {
+                        let send_fill = if can_send {
+                            CLAUDE_CORAL
+                        } else {
+                            ui.visuals().widgets.inactive.bg_fill
+                        };
+                        let send_text_color = if can_send {
+                            egui::Color32::WHITE
+                        } else {
+                            ui.visuals().widgets.inactive.text_color()
+                        };
+
+                        let send_btn = egui::Button::new(
+                            egui::RichText::new("Send  ↑").strong().small().color(send_text_color),
+                        )
+                        .fill(send_fill)
+                        .corner_radius(8.0)
+                        .min_size(egui::vec2(68.0, 28.0));
+
+                        if ui.add_enabled(can_send, send_btn).clicked() {
+                            action = ComposerAction::Send;
+                        }
                     }
                     if !running
                         && session.chosen_model.is_none()
@@ -190,33 +240,6 @@ pub fn composer(
         });
     ui.add_space(8.0);
     action
-}
-
-fn provider_picker(ui: &mut egui::Ui, session: &mut Session, settings: &Settings) {
-    let was = session.provider;
-    ui.add_enabled_ui(session.can_change_provider(), |ui| {
-        egui::ComboBox::from_id_salt(("provider", session.id))
-            // The short name keeps the row of pickers from crowding the Send button.
-            .selected_text(session.provider.short_name())
-            .show_ui(ui, |ui| {
-                let mut choices: Vec<Provider> = settings.enabled_providers().collect();
-                if !choices.contains(&session.provider) {
-                    choices.push(session.provider);
-                }
-                for provider in choices {
-                    ui.selectable_value(&mut session.provider, provider, provider.label());
-                }
-            });
-    })
-    .response
-    .on_hover_text("Which agent answers in this session")
-    .on_disabled_hover_text("A conversation stays with one agent. Start a new session to use another.");
-
-    // Another agent has its own models, so a choice made for the old one can't stand.
-    if session.provider != was {
-        session.chosen_model = None;
-        session.effort = None;
-    }
 }
 
 /// Which model answers in this session. The list comes from the CLI itself, so
@@ -283,49 +306,60 @@ fn effort_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
 
 fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
     let current = session.permission_mode;
-    let selected = if current.is_risky() {
-        egui::RichText::new(current.label()).color(RISKY)
-    } else {
-        egui::RichText::new(current.label())
+    let (dot, dot_color) = match current {
+        PermissionMode::ReadOnly => ("●", egui::Color32::from_rgb(140, 160, 180)),
+        PermissionMode::AcceptEdits => ("●", egui::Color32::from_rgb(70, 165, 120)),
+        PermissionMode::Full => ("●", RISKY),
+        PermissionMode::Plan => ("●", egui::Color32::from_rgb(150, 110, 210)),
     };
+    let label = egui::RichText::new(format!("{dot} {}", current.label()))
+        .small()
+        .color(if current.is_risky() { RISKY } else { dot_color });
+
     egui::ComboBox::from_id_salt(("permission_mode", session.id))
-        .selected_text(selected)
+        .selected_text(label)
         .show_ui(ui, |ui| {
             for mode in PermissionMode::ALL {
-                let label = if mode.is_risky() {
-                    egui::RichText::new(mode.label()).color(RISKY)
-                } else {
-                    egui::RichText::new(mode.label())
+                let (dot, dot_color) = match mode {
+                    PermissionMode::ReadOnly => ("●", egui::Color32::from_rgb(140, 160, 180)),
+                    PermissionMode::AcceptEdits => ("●", egui::Color32::from_rgb(70, 165, 120)),
+                    PermissionMode::Full => ("●", RISKY),
+                    PermissionMode::Plan => ("●", egui::Color32::from_rgb(150, 110, 210)),
                 };
+                let label = egui::RichText::new(format!("{dot} {}", mode.label()))
+                    .color(if mode.is_risky() { RISKY } else { dot_color });
                 ui.selectable_value(&mut session.permission_mode, mode, label).on_hover_text(mode.description());
             }
         })
         .response
         .on_hover_text(format!(
-            "What the agent may do without asking. Applies from the next message.
-
-{}",
+            "What the agent may do without asking. Applies from the next message.\n\n{}",
             current.description()
         ));
 }
 
-pub fn conversation(ui: &mut egui::Ui, session: &Session, markdown: &mut egui_commonmark::CommonMarkCache) {
+pub fn conversation(
+    ui: &mut egui::Ui,
+    session: &Session,
+    settings: &Settings,
+    markdown: &mut egui_commonmark::CommonMarkCache,
+) -> ConversationAction {
+    if session.entries.is_empty() && session.streaming.is_empty() {
+        let mut action = ConversationAction::None;
+        egui::ScrollArea::vertical()
+            .id_salt(("empty_scroll", session.id))
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                action = empty_session_ui(ui, session, settings);
+            });
+        return action;
+    }
+
     egui::ScrollArea::vertical()
         .id_salt(("conversation", session.id))
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            if session.entries.is_empty() && session.streaming.is_empty() {
-                ui.add_space(24.0);
-                ui.vertical_centered(|ui| {
-                    let prompt = if session.has_folder() {
-                        format!("Ask {} something about {}.", session.provider.short_name(), session.folder_name())
-                    } else {
-                        "Choose a folder under the message box to get started.".to_owned()
-                    };
-                    ui.label(egui::RichText::new(prompt).weak());
-                });
-            }
             for (index, entry) in session.entries.iter().enumerate() {
                 show_entry(ui, (session.id, index), entry, markdown);
             }
@@ -336,6 +370,220 @@ pub fn conversation(ui: &mut egui::Ui, session: &Session, markdown: &mut egui_co
             }
             ui.add_space(8.0);
         });
+
+    ConversationAction::None
+}
+
+/// The welcome setup screen displayed in the center of an empty session.
+/// Houses agent selection and project workspace setup before the conversation begins.
+fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -> ConversationAction {
+    let mut action = ConversationAction::None;
+
+    ui.vertical_centered(|ui| {
+        ui.add_space((ui.available_height() * 0.1).clamp(20.0, 60.0));
+
+        ui.label(egui::RichText::new("What would you like to build?").size(22.0).strong());
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new("Select an agent and project workspace to get started.").weak());
+
+        ui.add_space(28.0);
+
+        let max_w: f32 = 560.0_f32.min((ui.available_width() - 32.0).max(280.0));
+        ui.allocate_ui_with_layout(
+            egui::vec2(max_w, 0.0),
+            egui::Layout::top_down(egui::Align::Center),
+            |ui| {
+                ui.set_max_width(max_w);
+
+                // --- 1. Agent Selection ---
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("SELECT AGENT").size(11.0).strong().weak());
+                });
+                ui.add_space(8.0);
+
+                let providers: Vec<Provider> = settings.enabled_providers().collect();
+                let spacing = 8.0;
+                let num_cards = providers.len().max(1) as f32;
+                let card_w = ((max_w - (num_cards - 1.0) * spacing) / num_cards).floor();
+
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = spacing;
+                    for provider in &providers {
+                        let selected = session.provider == *provider;
+                        let (desc, icon) = match provider {
+                            Provider::Claude => ("Anthropic agentic CLI", "🟣"),
+                            Provider::Antigravity => ("Google autonomous CLI", "🔵"),
+                            Provider::Codex => ("OpenAI coding CLI", "🟢"),
+                        };
+
+                        let item_id = egui::Id::new(("empty_agent_card", session.id, provider.short_name()));
+                        let row = ui.scope_builder(
+                            egui::UiBuilder::new().id_salt(item_id).sense(egui::Sense::click()),
+                            |ui| {
+                                let resp = ui.response();
+                                let hovered = resp.hovered();
+
+                                let fill = if selected {
+                                    CLAUDE_CORAL.gamma_multiply(0.15)
+                                } else if hovered {
+                                    ui.visuals().faint_bg_color
+                                } else {
+                                    ui.visuals().extreme_bg_color
+                                };
+
+                                let stroke = if selected {
+                                    egui::Stroke::new(1.5, CLAUDE_CORAL)
+                                } else if hovered {
+                                    egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
+                                } else {
+                                    egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color)
+                                };
+
+                                egui::Frame::new()
+                                    .fill(fill)
+                                    .stroke(stroke)
+                                    .corner_radius(10.0)
+                                    .inner_margin(egui::Margin::symmetric(12, 10))
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_w);
+                                        ui.horizontal(|ui| {
+                                            ui.label(egui::RichText::new(icon).size(15.0));
+                                            let mut title = egui::RichText::new(provider.short_name()).strong();
+                                            if selected {
+                                                title = title.color(CLAUDE_CORAL);
+                                            }
+                                            ui.label(title);
+                                        });
+                                        ui.add_space(4.0);
+                                        ui.add(egui::Label::new(egui::RichText::new(desc).small().weak()).truncate());
+                                    });
+                            },
+                        );
+
+                        if row.response.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if row.response.clicked() {
+                            action = ConversationAction::SelectProvider(*provider);
+                        }
+                    }
+                });
+
+                ui.add_space(22.0);
+
+                // --- 2. Workspace Folder Selection ---
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("WORKSPACE FOLDER").size(11.0).strong().weak());
+                });
+                ui.add_space(8.0);
+
+                let folder_id = egui::Id::new(("empty_folder_card", session.id));
+                let folder_resp = ui.scope_builder(
+                    egui::UiBuilder::new().id_salt(folder_id).sense(egui::Sense::click()),
+                    |ui| {
+                        let resp = ui.response();
+                        let hovered = resp.hovered();
+
+                        let (fill, stroke) = if !session.has_folder() {
+                            let fill = if hovered {
+                                RISKY.gamma_multiply(0.2)
+                            } else {
+                                RISKY.gamma_multiply(0.12)
+                            };
+                            let stroke = egui::Stroke::new(1.2, RISKY.gamma_multiply(0.65));
+                            (fill, stroke)
+                        } else {
+                            let fill = if hovered {
+                                ui.visuals().faint_bg_color
+                            } else {
+                                ui.visuals().extreme_bg_color
+                            };
+                            let stroke = egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color);
+                            (fill, stroke)
+                        };
+
+                        egui::Frame::new()
+                            .fill(fill)
+                            .stroke(stroke)
+                            .corner_radius(10.0)
+                            .inner_margin(egui::Margin::symmetric(14, 12))
+                            .show(ui, |ui| {
+                                ui.set_width(max_w);
+                                ui.horizontal(|ui| {
+                                    ui.label(egui::RichText::new("📁").size(20.0));
+                                    ui.add_space(4.0);
+                                    ui.vertical(|ui| {
+                                        if session.has_folder() {
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new(session.folder_name()).strong());
+                                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                    ui.label(egui::RichText::new("Change folder").small().weak());
+                                                });
+                                            });
+                                            ui.add(egui::Label::new(egui::RichText::new(session.project_dir.display().to_string()).small().weak()).truncate());
+                                        } else {
+                                            ui.label(egui::RichText::new("Choose a project folder").strong().color(RISKY));
+                                            ui.label(egui::RichText::new("Click to select the repository or directory for this session").small().weak());
+                                        }
+                                    });
+                                });
+                            });
+                    },
+                );
+
+                if folder_resp.response.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                if folder_resp.response.clicked() {
+                    action = ConversationAction::ChangeFolder;
+                }
+
+                ui.add_space(26.0);
+
+                // --- 3. Quick Actions ---
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(egui::RichText::new("SUGGESTED ACTIONS").size(11.0).strong().weak());
+                });
+                ui.add_space(8.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    let starters: &[(&str, &str)] = match session.provider {
+                        Provider::Claude => &[
+                            ("/review", "Review recent changes"),
+                            ("/compact", "Compact context"),
+                            ("/help", "List CLI commands"),
+                        ],
+                        Provider::Antigravity => &[
+                            ("/goal", "Run autonomous task"),
+                            ("/schedule", "Set background timer"),
+                            ("/help", "List CLI commands"),
+                        ],
+                        Provider::Codex => &[
+                            ("/review", "Review recent changes"),
+                            ("/fix", "Diagnose & fix errors"),
+                            ("/explain", "Explain code structure"),
+                        ],
+                    };
+
+                    for &(cmd, hint) in starters {
+                        let chip_btn = egui::Button::new(
+                            egui::RichText::new(format!("{cmd}  {hint}")).small()
+                        )
+                        .corner_radius(6.0)
+                        .fill(ui.visuals().faint_bg_color)
+                        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color));
+
+                        if ui.add(chip_btn).on_hover_text(format!("Insert {cmd} into message box")).clicked() {
+                            action = ConversationAction::InsertPrompt(format!("{cmd} "));
+                        }
+                    }
+                });
+            },
+        );
+    });
+
+    action
 }
 
 fn show_entry(ui: &mut egui::Ui, id: (u64, usize), entry: &Entry, markdown: &mut egui_commonmark::CommonMarkCache) {
@@ -945,5 +1193,33 @@ mod tests {
         assert!(!is_slash("/goal solve this"), "space closes autocomplete for argument typing");
         assert!(!is_slash("please look at /path/to/file"), "normal prompt with slash does not trigger autocomplete");
         assert!(!is_slash(""), "empty input does not trigger autocomplete");
+    }
+
+    #[test]
+    fn empty_session_quick_starters_cover_all_providers() {
+        for &provider in &Provider::ALL {
+            let starters: &[(&str, &str)] = match provider {
+                Provider::Claude => &[
+                    ("/review", "Review recent changes"),
+                    ("/compact", "Compact context"),
+                    ("/help", "List CLI commands"),
+                ],
+                Provider::Antigravity => &[
+                    ("/goal", "Run autonomous task"),
+                    ("/schedule", "Set background timer"),
+                    ("/help", "List CLI commands"),
+                ],
+                Provider::Codex => &[
+                    ("/review", "Review recent changes"),
+                    ("/fix", "Diagnose & fix errors"),
+                    ("/explain", "Explain code structure"),
+                ],
+            };
+            assert!(!starters.is_empty());
+            for &(cmd, hint) in starters {
+                assert!(cmd.starts_with('/'));
+                assert!(!hint.is_empty());
+            }
+        }
     }
 }
