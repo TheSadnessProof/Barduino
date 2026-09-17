@@ -119,20 +119,93 @@ pub struct Turn {
 /// A turn whose CLI process is still running.
 pub struct RunningTurn {
     child: Arc<Mutex<Child>>,
+    /// Everything the CLI starts, such as commands its tools run.
+    tree: ProcessTree,
 }
 
 impl RunningTurn {
+    fn new(child: Child) -> Self {
+        let tree = ProcessTree::new(&child);
+        Self { child: Arc::new(Mutex::new(child)), tree }
+    }
+
+    /// Stops the CLI and every program it started.
     pub fn stop(&self) {
+        self.tree.kill();
         let mut child = self.child.lock().unwrap_or_else(PoisonError::into_inner);
         let _ = child.kill();
     }
 }
 
 impl Drop for RunningTurn {
-    // Deleting a session or closing the app shouldn't leave the agent running in the background.
+    // Deleting a session or closing the app mid-turn shouldn't leave the agent, or anything
+    // it started, running in the background. A turn that already finished is left alone,
+    // since the agent may have started something on purpose, like a dev server.
     fn drop(&mut self) {
-        self.stop();
+        let finished = matches!(self.child.lock().unwrap_or_else(PoisonError::into_inner).try_wait(), Ok(Some(_)));
+        if !finished {
+            self.stop();
+        }
     }
+}
+
+/// On Windows, killing a process leaves the programs it started running, so the
+/// CLI goes into a job object: programs it starts join the same job, and the whole
+/// job can be ended at once.
+#[cfg(windows)]
+struct ProcessTree(Option<windows::Win32::Foundation::HANDLE>);
+
+// The job handle is only used to end the job or close it, which is safe from any thread.
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTree {}
+
+#[cfg(windows)]
+impl ProcessTree {
+    fn new(child: &Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+
+        let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }.ok();
+        let job = job.filter(|job| {
+            let assigned = unsafe { AssignProcessToJobObject(*job, HANDLE(child.as_raw_handle())) }.is_ok();
+            if !assigned {
+                let _ = unsafe { CloseHandle(*job) };
+            }
+            assigned
+        });
+        Self(job)
+    }
+
+    fn kill(&self) {
+        if let Some(job) = self.0 {
+            let _ = unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) };
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+        }
+    }
+}
+
+/// Elsewhere only the CLI itself is stopped for now.
+#[cfg(not(windows))]
+struct ProcessTree;
+
+#[cfg(not(windows))]
+impl ProcessTree {
+    fn new(_child: &Child) -> Self {
+        Self
+    }
+
+    fn kill(&self) {}
 }
 
 /// Starts one turn of the conversation. `on_event` is called from a background
@@ -163,7 +236,7 @@ pub fn start_turn(
     let mut stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
-    let child = Arc::new(Mutex::new(child));
+    let running = RunningTurn::new(child);
 
     // Claude reads the prompt from stdin, which avoids command-line quoting and length
     // limits. Dropping stdin afterwards tells the CLI the prompt is complete.
@@ -178,7 +251,7 @@ pub fn start_turn(
         String::from_utf8_lossy(&bytes).into_owned()
     });
 
-    let waiter = Arc::clone(&child);
+    let waiter = Arc::clone(&running.child);
     thread::spawn(move || {
         for line in BufReader::new(stdout).split(b'\n') {
             let Ok(line) = line else { break };
@@ -197,7 +270,7 @@ pub fn start_turn(
         on_event(AgentEvent::Exited { error });
     });
 
-    Ok(RunningTurn { child })
+    Ok(running)
 }
 
 /// A command for a background program that doesn't flash a console window on Windows.
@@ -355,6 +428,45 @@ mod tests {
         let reply: String =
             second.iter().filter_map(|e| if let AgentEvent::TextDelta(t) = e { Some(t.as_str()) } else { None }).collect();
         assert!(reply.contains("PINEAPPLE"), "the second turn should remember the first: {reply:?}");
+    }
+
+    /// Stands in for an agent whose tool started a long-running program, then
+    /// checks that stopping the turn stops that program too.
+    #[cfg(windows)]
+    #[test]
+    fn stopping_a_turn_stops_programs_the_agent_started() {
+        // An unusual ping count makes the process easy to find.
+        const MARKER: &str = "-n 4747";
+        let find = || {
+            let script = format!(
+                "Get-CimInstance Win32_Process | Where-Object {{ $_.Name -eq 'PING.EXE' -and $_.CommandLine -like '*{MARKER}*' }} | ForEach-Object ProcessId"
+            );
+            let output = hidden_command("powershell.exe").args(["-NoProfile", "-Command", &script]).output().unwrap();
+            String::from_utf8_lossy(&output.stdout).split_whitespace().map(str::to_owned).collect::<Vec<_>>()
+        };
+
+        let child = hidden_command("powershell.exe")
+            .args(["-NoProfile", "-Command", &format!("ping {MARKER} 127.0.0.1")])
+            .spawn()
+            .unwrap();
+        let turn = RunningTurn::new(child);
+        let mut started = Vec::new();
+        for _ in 0..40 {
+            started = find();
+            if !started.is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        assert!(!started.is_empty(), "the program should have started");
+
+        turn.stop();
+        thread::sleep(Duration::from_secs(1));
+        let left = find();
+        for pid in &left {
+            let _ = Command::new("taskkill").args(["/F", "/PID", pid]).output();
+        }
+        assert!(left.is_empty(), "still running after Stop: {left:?}");
     }
 
     #[test]

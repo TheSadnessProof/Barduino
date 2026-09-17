@@ -441,6 +441,46 @@ fn key_sequence(key: Key, modifiers: Modifiers, app_cursor: bool) -> Option<Vec<
 mod tests {
     use super::*;
 
+    /// Process ids of running processes whose command line contains `marker`.
+    #[cfg(windows)]
+    fn processes_with(marker: &str) -> Vec<String> {
+        let script = format!(
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{marker}*' -and $_.Name -ne 'powershell.exe' }} | ForEach-Object {{ \"$($_.ProcessId) $($_.Name)\" }}"
+        );
+        let output = crate::agent::hidden_command("powershell.exe").args(["-NoProfile", "-Command", &script]).output().unwrap();
+        String::from_utf8_lossy(&output.stdout).lines().map(str::to_owned).filter(|l| !l.is_empty()).collect()
+    }
+
+    /// Starts a long-running program inside a terminal, closes the terminal, and
+    /// checks that the program was stopped too. Only runs when asked for:
+    /// `cargo test -- --ignored closing_a_terminal --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore]
+    fn closing_a_terminal_stops_programs_started_in_it() {
+        // An unusual ping count makes the process easy to find.
+        const MARKER: &str = "-n 4242";
+        let terminal = Terminal::start(&std::env::temp_dir(), egui::Context::default()).unwrap();
+        write_all(&terminal.writer, format!("ping {MARKER} 127.0.0.1\r").as_bytes());
+
+        let mut running = Vec::new();
+        for _ in 0..40 {
+            running = processes_with(MARKER);
+            if !running.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        println!("before closing: {running:?}");
+        assert!(!running.is_empty(), "ping should have started inside the terminal");
+
+        drop(terminal);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let left = processes_with(MARKER);
+        println!("after closing: {left:?}");
+        assert!(left.is_empty(), "still running after the terminal closed: {left:?}");
+    }
+
     #[test]
     fn special_keys_map_to_escape_sequences() {
         let none = Modifiers::NONE;
