@@ -462,7 +462,6 @@ impl BarduinoApp {
         match composer_action {
             ComposerAction::Send => self.send(ui.ctx()),
             ComposerAction::Stop => self.active_session_mut().stop(),
-            ComposerAction::ChangeFolder => self.change_folder(),
             ComposerAction::Apply(setting) => self.apply_setting(setting),
             ComposerAction::Notice(message) => self.notice = Some(message),
             ComposerAction::None => {}

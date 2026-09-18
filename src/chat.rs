@@ -34,7 +34,6 @@ pub enum ComposerAction {
     None,
     Send,
     Stop,
-    ChangeFolder,
     /// A slash command Barduino carries out itself instead of sending, because a
     /// headless CLI has no interactive session for it to change.
     Apply(SlashAction),
@@ -140,21 +139,22 @@ pub fn composer(
     let mut action =
         if enter_pressed && can_send { send_or_apply(session, catalog) } else { ComposerAction::None };
 
-    // Warm, sophisticated palette inspired by Claude's signature desktop and web interface.
+    // Warm, sophisticated palette tailored to the current provider and visual style.
+    let accent = provider_accent(session.provider);
     let (card_bg, border_stroke, hint_color) = if ui.visuals().dark_mode {
         let border = if has_focus {
-            CLAUDE_CORAL.gamma_multiply(0.85)
+            accent.gamma_multiply(0.85)
         } else {
-            egui::Color32::from_rgb(58, 56, 52)
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 14)
         };
         (
-            egui::Color32::from_rgb(36, 35, 33),
+            egui::Color32::from_rgb(26, 27, 31),
             egui::Stroke::new(if has_focus { 1.5 } else { 1.0 }, border),
-            egui::Color32::from_rgb(148, 142, 134),
+            egui::Color32::from_rgb(140, 142, 150),
         )
     } else {
         let border = if has_focus {
-            CLAUDE_CORAL
+            accent
         } else {
             egui::Color32::from_rgb(222, 218, 212)
         };
@@ -174,7 +174,7 @@ pub fn composer(
         egui::Frame::new()
             .fill(card_bg)
             .stroke(border_stroke)
-            .corner_radius(16.0)
+            .corner_radius(14.0)
             .inner_margin(egui::Margin { left: 16, right: 12, top: 12, bottom: 10 })
             .show(ui, |ui| {
                 if !session.elements.is_empty() {
@@ -220,10 +220,10 @@ pub fn composer(
                     response.request_focus();
                 }
 
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     // Send and the context take their width from the right first, so
-                    // a long model name crowds the chips rather than the controls.
+                    // long controls crowd the empty space rather than pushing the send button.
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let running = session.is_running();
                         if running {
@@ -242,9 +242,9 @@ pub fn composer(
                             ui.spinner();
                         } else {
                             let (send_bg, send_fg) = if can_send {
-                                (CLAUDE_CORAL, egui::Color32::WHITE)
+                                (accent, egui::Color32::WHITE)
                             } else if ui.visuals().dark_mode {
-                                (egui::Color32::from_rgb(48, 46, 43), egui::Color32::from_rgb(110, 105, 98))
+                                (egui::Color32::from_rgb(40, 42, 48), egui::Color32::from_rgb(110, 112, 120))
                             } else {
                                 (egui::Color32::from_rgb(230, 226, 220), egui::Color32::from_rgb(160, 155, 148))
                             };
@@ -273,11 +273,9 @@ pub fn composer(
                             context_chip(ui, session);
                         }
 
-                        // Whatever is left over, filled from the left as usual.
+                        // Pickers and controls on the left.
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                            if settings_row(ui, session, catalog) {
-                                action = ComposerAction::ChangeFolder;
-                            }
+                            settings_row(ui, session, catalog);
                         });
                     });
                 });
@@ -303,35 +301,18 @@ fn send_or_apply(session: &mut Session, catalog: &Catalog) -> ComposerAction {
     }
 }
 
-/// The row under the message box: what the next turn will run as, and how much of
-/// the conversation the model is already carrying. Returns true if the folder chip
-/// was clicked.
-fn settings_row(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) -> bool {
-    // Scoped, because the restyling below would otherwise reach the send button
-    // drawn after it in the same row.
-    ui.scope(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
-        // Quiet chips rather than form controls, so the row stays out of the way
-        // until it is wanted. Only the fill changes, so nothing moves on hover.
-        let quiet = if ui.visuals().dark_mode {
-            egui::Color32::from_rgb(46, 44, 41)
-        } else {
-            egui::Color32::from_rgb(243, 240, 235)
-        };
-        ui.visuals_mut().widgets.inactive.weak_bg_fill = quiet;
-        ui.visuals_mut().widgets.inactive.bg_fill = quiet;
-
-        model_picker(ui, session, catalog);
-        effort_picker(ui, session, catalog);
-        permission_picker(ui, session);
-        folder_chip(ui, session)
-    })
-    .inner
+/// The row under the message box: model, reasoning effort, and permission mode.
+fn settings_row(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
+    ui.spacing_mut().item_spacing.x = 6.0;
+    ui.spacing_mut().button_padding = egui::vec2(9.0, 4.0);
+    model_picker(ui, session, catalog);
+    effort_picker(ui, session, catalog);
+    permission_picker(ui, session);
 }
 
-/// A picker label short enough that four of them still fit on one row. Model names
+/// A picker label short enough that chips still fit on one row. Model names
 /// come from the CLI and can be long — "gemini-3-pro-preview-high" — and an
-/// unbounded one would push the send button off the card on a narrow window.
+/// unbounded one would push other controls off the card on a narrow window.
 fn short_label(label: &str, max: usize) -> String {
     if label.chars().count() <= max {
         return label.to_owned();
@@ -340,136 +321,250 @@ fn short_label(label: &str, max: usize) -> String {
     label.chars().take(max.saturating_sub(1)).collect::<String>() + "…"
 }
 
-/// Which model answers in this session. The list comes from the CLI itself, so it
-/// may still be loading the first time it's opened.
-fn model_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
-    let provider = session.provider;
-    let selected = match &session.chosen_model {
-        Some(id) => short_label(&catalog.label_for(provider, id), MAX_CHIP_CHARS),
-        None => "Default model".to_owned(),
-    };
-    // "Default" doesn't say which, so the one the CLI actually answered with goes
-    // in the tooltip rather than being guessed at in the label.
-    let answering = match &session.model {
-        Some(model) if session.chosen_model.is_none() => format!("\n\nThe CLI last answered with {model}."),
-        _ => String::new(),
-    };
-    egui::ComboBox::from_id_salt(("model", session.id))
-        .selected_text(egui::RichText::new(selected).small())
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut session.chosen_model, None, "Default model")
-                .on_hover_text("Whichever model the CLI is set to use");
-            let models = catalog.models(provider);
-            if models.is_empty() {
-                ui.horizontal(|ui| {
-                    if catalog.is_loading(provider) {
-                        ui.spinner();
-                        ui.label(egui::RichText::new("Reading the model list…").small().weak());
-                    } else {
-                        ui.label(egui::RichText::new("No other models reported.").small().weak());
-                    }
-                });
-            }
-            for model in models {
-                ui.selectable_value(&mut session.chosen_model, Some(model.id.clone()), &model.label)
-                    .on_hover_text(&model.id);
-            }
-        })
-        .response
-        .on_hover_text(format!("Which model this session uses. Applies from the next message.{answering}"));
+/// Characteristic accent color for a provider in the composer.
+fn provider_accent(provider: Provider) -> egui::Color32 {
+    match provider {
+        Provider::Claude => CLAUDE_CORAL,
+        Provider::Codex => egui::Color32::from_rgb(16, 185, 129),
+        Provider::Antigravity => egui::Color32::from_rgb(59, 130, 246),
+    }
 }
 
-/// How hard the model should work. The levels are the provider's own.
+/// A sleek pill button for the composer toolbar that opens a popup menu on click.
+fn pill_selector(
+    ui: &mut egui::Ui,
+    dot: Option<egui::Color32>,
+    icon: Option<&str>,
+    text: &str,
+    tooltip: &str,
+) -> egui::Response {
+    let (bg, stroke, fg) = if ui.visuals().dark_mode {
+        (
+            egui::Color32::from_rgba_premultiplied(255, 255, 255, 10),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 15)),
+            egui::Color32::from_rgb(215, 215, 222),
+        )
+    } else {
+        (
+            egui::Color32::from_rgba_premultiplied(0, 0, 0, 6),
+            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 14)),
+            egui::Color32::from_rgb(60, 60, 68),
+        )
+    };
+
+    let mut content = String::new();
+    if let Some(ic) = icon {
+        content.push_str(ic);
+        content.push(' ');
+    }
+    content.push_str(text);
+    content.push_str(" ▾");
+
+    let rich = if let Some(dot_col) = dot {
+        egui::RichText::new(format!("● {content}")).color(dot_col).small()
+    } else {
+        egui::RichText::new(content).color(fg).small()
+    };
+
+    let btn = egui::Button::new(rich)
+        .fill(bg)
+        .stroke(stroke)
+        .corner_radius(8.0);
+
+    ui.add(btn).on_hover_text(tooltip)
+}
+
+/// Which model answers in this session.
+fn model_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
+    ui.scope_builder(egui::UiBuilder::new().id_salt(("model_picker", session.id)), |ui| {
+        let provider = session.provider;
+        let selected = match &session.chosen_model {
+            Some(id) => short_label(&catalog.label_for(provider, id), MAX_CHIP_CHARS),
+            None => "Default model".to_owned(),
+        };
+        let answering = match &session.model {
+            Some(model) if session.chosen_model.is_none() => format!("\n\nThe CLI last answered with {model}."),
+            _ => String::new(),
+        };
+        let tooltip = format!("Which model this session uses. Applies from the next message.{answering}");
+        let dot = Some(provider_accent(provider));
+        let response = pill_selector(ui, dot, None, &selected, &tooltip);
+
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(220.0);
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(egui::RichText::new("SELECT MODEL").size(10.0).weak().strong());
+            ui.add_space(2.0);
+
+            let is_default = session.chosen_model.is_none();
+            let default_label = if is_default { "✓  Default model" } else { "    Default model" };
+            if ui.button(default_label).on_hover_text("Whichever model the CLI is set to use").clicked() {
+                session.chosen_model = None;
+                ui.close();
+            }
+
+            let models = catalog.models(provider);
+            if models.is_empty() {
+                if catalog.is_loading(provider) {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Loading models…").small().weak());
+                    });
+                } else {
+                    ui.label(egui::RichText::new("No other models reported").small().weak());
+                }
+            } else {
+                ui.separator();
+                for model in models {
+                    let is_sel = session.chosen_model.as_deref() == Some(&model.id);
+                    let prefix = if is_sel { "✓  " } else { "    " };
+                    let label = format!("{prefix}{}", model.label);
+                    let btn = egui::Button::new(egui::RichText::new(label).small());
+                    if ui.add(btn).on_hover_text(&model.id).clicked() {
+                        session.chosen_model = Some(model.id);
+                        ui.close();
+                    }
+                }
+            }
+        });
+    });
+}
+
+/// How hard the model should work. Shown only when the model supports reasoning levels.
 fn effort_picker(ui: &mut egui::Ui, session: &mut Session, catalog: &Catalog) {
     let levels = catalog.efforts(session.provider, session.chosen_model.as_deref());
-    // A level the provider no longer offers would otherwise be stuck in the session.
     if let Some(effort) = &session.effort
         && !levels.iter().any(|level| level == effort)
     {
         session.effort = None;
     }
-    let selected = match &session.effort {
-        Some(effort) => models::effort_label(effort),
-        None => "Default effort".to_owned(),
-    };
-    egui::ComboBox::from_id_salt(("effort", session.id))
-        .selected_text(egui::RichText::new(selected).small())
-        .show_ui(ui, |ui| {
-            ui.selectable_value(&mut session.effort, None, "Default effort");
-            for level in levels {
-                let label = models::effort_label(&level);
-                ui.selectable_value(&mut session.effort, Some(level), label);
+    // Only display reasoning effort if the provider/model offers levels or one is chosen.
+    if levels.is_empty() && session.effort.is_none() {
+        return;
+    }
+
+    ui.scope_builder(egui::UiBuilder::new().id_salt(("effort_picker", session.id)), |ui| {
+        let selected = match &session.effort {
+            Some(effort) => models::effort_label(effort),
+            None => "Default effort".to_owned(),
+        };
+        let tooltip = "How much thinking the model puts in. More effort means slower, more thorough answers.";
+        let response = pill_selector(ui, None, Some("🧠"), &selected, tooltip);
+
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(180.0);
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(egui::RichText::new("REASONING EFFORT").size(10.0).weak().strong());
+            ui.add_space(2.0);
+
+            let is_default = session.effort.is_none();
+            let prefix = if is_default { "✓  " } else { "    " };
+            if ui.button(format!("{prefix}Default effort")).clicked() {
+                session.effort = None;
+                ui.close();
             }
-        })
-        .response
-        .on_hover_text(
-            "How much thinking the model puts in. More effort means slower, more thorough \
-             answers that use more of your plan.",
-        );
+            if !levels.is_empty() {
+                ui.separator();
+                for level in levels {
+                    let is_sel = session.effort.as_deref() == Some(&level);
+                    let prefix = if is_sel { "✓  " } else { "    " };
+                    let label = format!("{prefix}{}", models::effort_label(&level));
+                    if ui.button(label).clicked() {
+                        session.effort = Some(level);
+                        ui.close();
+                    }
+                }
+            }
+        });
+    });
 }
 
 /// The colour each mode is marked with, from the most cautious to the one that
 /// gives up the safety net.
 fn mode_dot(mode: PermissionMode) -> egui::Color32 {
     match mode {
-        PermissionMode::Plan => egui::Color32::from_rgb(150, 110, 210),
-        PermissionMode::ReadOnly => egui::Color32::from_rgb(140, 160, 180),
-        PermissionMode::AcceptEdits => egui::Color32::from_rgb(70, 165, 120),
+        PermissionMode::Plan => egui::Color32::from_rgb(168, 130, 235),
+        PermissionMode::ReadOnly => egui::Color32::from_rgb(130, 160, 195),
+        PermissionMode::AcceptEdits => egui::Color32::from_rgb(52, 199, 89),
         PermissionMode::Full => RISKY,
+    }
+}
+
+/// A short descriptive icon and label for each permission mode.
+fn mode_icon_and_name(mode: PermissionMode) -> (&'static str, &'static str) {
+    match mode {
+        PermissionMode::Plan => ("📋", "Plan"),
+        PermissionMode::ReadOnly => ("🛡️", "Read-only"),
+        PermissionMode::AcceptEdits => ("📝", "Accept edits"),
+        PermissionMode::Full => ("⚡", "Full access"),
     }
 }
 
 /// What the agent may do without being asked.
 fn permission_picker(ui: &mut egui::Ui, session: &mut Session) {
-    let current = session.permission_mode;
-    let label = egui::RichText::new(format!("● {}", current.label())).small().color(mode_dot(current));
-    egui::ComboBox::from_id_salt(("permission_mode", session.id))
-        .selected_text(label)
-        .show_ui(ui, |ui| {
-            for mode in PermissionMode::ALL {
-                let label = egui::RichText::new(format!("● {}", mode.label())).color(mode_dot(mode));
-                ui.selectable_value(&mut session.permission_mode, mode, label).on_hover_text(mode.description());
-            }
-        })
-        .response
-        .on_hover_text(format!(
-            "What the agent may do without asking. Applies from the next message.\n\n{}",
-            current.description()
-        ));
-}
+    ui.scope_builder(egui::UiBuilder::new().id_salt(("permission_picker", session.id)), |ui| {
+        let current = session.permission_mode;
+        let (icon, name) = mode_icon_and_name(current);
+        let dot = mode_dot(current);
+        let tooltip = format!("What the agent may do without asking:\n\n{}", current.description());
+        let response = pill_selector(ui, Some(dot), Some(icon), name, &tooltip);
 
-/// The folder this session works in, and a way to change it without leaving the
-/// message box. Returns true when it is clicked.
-fn folder_chip(ui: &mut egui::Ui, session: &Session) -> bool {
-    if !session.has_folder() {
-        return false;
-    }
-    let name = short_label(&session.folder_name(), MAX_CHIP_CHARS);
-    let chip = egui::Button::new(egui::RichText::new(format!("📁 {name}")).small().weak())
-        .fill(egui::Color32::TRANSPARENT)
-        .corner_radius(6.0);
-    ui.add(chip)
-        .on_hover_text(format!("Working in {}\nClick to choose another folder", session.project_dir.display()))
-        .clicked()
+        egui::Popup::menu(&response).show(|ui| {
+            ui.set_min_width(230.0);
+            ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(egui::RichText::new("AGENT PERMISSION").size(10.0).weak().strong());
+            ui.add_space(2.0);
+
+            for mode in PermissionMode::ALL {
+                let is_sel = session.permission_mode == mode;
+                let dot = mode_dot(mode);
+                let (icon, name) = mode_icon_and_name(mode);
+                let check = if is_sel { "✓ " } else { "   " };
+                let label = format!("{check}{icon}  {name}");
+                let rich = egui::RichText::new(label).color(dot).small();
+
+                let resp = ui.button(rich).on_hover_text(mode.description());
+                if resp.clicked() {
+                    session.permission_mode = mode;
+                    ui.close();
+                }
+            }
+        });
+    });
 }
 
 /// How much of the conversation the model is carrying, once a turn has finished
-/// and said so. No CLI reports the size of its context window, so this is the
-/// count on its own rather than a share of a number we'd have to invent.
+/// and said so.
 fn context_chip(ui: &mut egui::Ui, session: &Session) {
     let Some(last) = session.last_usage else { return };
     let tokens = last.context_tokens();
     if tokens == 0 {
         return;
     }
-    ui.label(egui::RichText::new(format!("{} context", usage::short_count(tokens))).small().weak()).on_hover_text(
-        format!(
-            "The conversation so far, as the model read it on the last turn: {} tokens in, {} out.\n\
-             /clear starts a fresh session in the same folder.",
-            usage::short_count(tokens),
-            usage::short_count(last.output)
-        ),
-    );
+    let chip_bg = if ui.visuals().dark_mode {
+        egui::Color32::from_rgba_premultiplied(255, 255, 255, 8)
+    } else {
+        egui::Color32::from_rgba_premultiplied(0, 0, 0, 5)
+    };
+    egui::Frame::new()
+        .fill(chip_bg)
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(7, 3))
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new(format!("{} context", usage::short_count(tokens))).small().weak());
+        })
+        .response
+        .on_hover_text(
+            format!(
+                "The conversation so far, as the model read it on the last turn: {} tokens in, {} out.\n\
+                 /clear starts a fresh session in the same folder.",
+                usage::short_count(tokens),
+                usage::short_count(last.output)
+            ),
+        );
 }
 
 pub fn conversation(
@@ -564,71 +659,84 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                 let spacing = 8.0;
                 let num_cards = providers.len().max(1) as f32;
                 let card_w = ((max_w - (num_cards - 1.0) * spacing) / num_cards).floor();
+                let card_h = 62.0;
 
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = spacing;
                     for provider in &providers {
                         let selected = session.provider == *provider;
+                        let accent = provider_accent(*provider);
                         let (desc, icon) = match provider {
                             Provider::Claude => ("Anthropic agentic CLI", "🟣"),
                             Provider::Antigravity => ("Google autonomous CLI", "🔵"),
                             Provider::Codex => ("OpenAI coding CLI", "🟢"),
                         };
 
-                        let item_id = egui::Id::new(("empty_agent_card", session.id, provider.short_name()));
-                        let row = ui.scope_builder(
-                            egui::UiBuilder::new().id_salt(item_id).sense(egui::Sense::click()),
-                            |ui| {
-                                let resp = ui.response();
-                                let hovered = resp.hovered();
-
-                                let fill = if selected {
-                                    CLAUDE_CORAL.gamma_multiply(0.15)
-                                } else if hovered {
-                                    if ui.visuals().dark_mode { egui::Color32::from_rgb(46, 44, 41) } else { ui.visuals().faint_bg_color }
-                                } else if ui.visuals().dark_mode {
-                                    egui::Color32::from_rgb(36, 35, 33)
-                                } else {
-                                    egui::Color32::WHITE
-                                };
-
-                                let stroke = if selected {
-                                    egui::Stroke::new(1.5, CLAUDE_CORAL)
-                                } else if hovered {
-                                    egui::Stroke::new(1.0, ui.visuals().widgets.hovered.bg_stroke.color)
-                                } else if ui.visuals().dark_mode {
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 56, 52))
-                                } else {
-                                    egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
-                                };
-
-                                egui::Frame::new()
-                                    .fill(fill)
-                                    .stroke(stroke)
-                                    .corner_radius(10.0)
-                                    .inner_margin(egui::Margin::symmetric(12, 10))
-                                    .show(ui, |ui| {
-                                        ui.set_width(card_w);
-                                        ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new(icon).size(15.0));
-                                            let mut title = egui::RichText::new(provider.short_name()).strong();
-                                            if selected {
-                                                title = title.color(CLAUDE_CORAL);
-                                            }
-                                            ui.label(title);
-                                        });
-                                        ui.add_space(4.0);
-                                        ui.add(egui::Label::new(egui::RichText::new(desc).small().weak()).truncate());
-                                    });
-                            },
+                        let (rect, response) = ui.allocate_exact_size(
+                            egui::vec2(card_w, card_h),
+                            egui::Sense::click(),
                         );
 
-                        if row.response.hovered() {
+                        let hovered = response.hovered();
+                        if hovered {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
-                        if row.response.clicked() {
+                        if response.clicked() {
                             action = ConversationAction::SelectProvider(*provider);
                         }
+
+                        let fill = if selected {
+                            accent.gamma_multiply(0.18)
+                        } else if hovered {
+                            if ui.visuals().dark_mode { egui::Color32::from_rgb(38, 40, 46) } else { ui.visuals().faint_bg_color }
+                        } else if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(28, 29, 34)
+                        } else {
+                            egui::Color32::WHITE
+                        };
+
+                        let stroke = if selected {
+                            egui::Stroke::new(1.5, accent)
+                        } else if hovered {
+                            egui::Stroke::new(1.0, accent.gamma_multiply(0.5))
+                        } else if ui.visuals().dark_mode {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 14))
+                        } else {
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
+                        };
+
+                        let painter = ui.painter_at(rect);
+                        painter.rect(rect, 10.0, fill, stroke, egui::StrokeKind::Inside);
+
+                        let title_color = if selected {
+                            accent
+                        } else if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(230, 230, 235)
+                        } else {
+                            egui::Color32::from_rgb(30, 30, 35)
+                        };
+
+                        let desc_color = if ui.visuals().dark_mode {
+                            egui::Color32::from_rgb(140, 140, 150)
+                        } else {
+                            egui::Color32::from_rgb(120, 120, 130)
+                        };
+
+                        painter.text(
+                            egui::pos2(rect.min.x + 13.0, rect.min.y + 12.0),
+                            egui::Align2::LEFT_TOP,
+                            format!("{icon}  {}", provider.short_name()),
+                            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                            title_color,
+                        );
+
+                        painter.text(
+                            egui::pos2(rect.min.x + 13.0, rect.min.y + 35.0),
+                            egui::Align2::LEFT_TOP,
+                            desc,
+                            egui::FontId::proportional(11.0),
+                            desc_color,
+                        );
                     }
                 });
 
@@ -677,22 +785,22 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                             .corner_radius(10.0)
                             .inner_margin(egui::Margin::symmetric(14, 12))
                             .show(ui, |ui| {
-                                ui.set_width(max_w);
+                                ui.set_width(max_w - 28.0);
                                 ui.horizontal(|ui| {
-                                    ui.label(egui::RichText::new("📁").size(20.0));
+                                    ui.add(egui::Label::new(egui::RichText::new("📁").size(20.0)).selectable(false));
                                     ui.add_space(4.0);
                                     ui.vertical(|ui| {
                                         if session.has_folder() {
                                             ui.horizontal(|ui| {
-                                                ui.label(egui::RichText::new(session.folder_name()).strong());
+                                                ui.add(egui::Label::new(egui::RichText::new(session.folder_name()).strong()).selectable(false));
                                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                    ui.label(egui::RichText::new("Change folder").small().weak());
+                                                    ui.add(egui::Label::new(egui::RichText::new("Change folder").small().weak()).selectable(false));
                                                 });
                                             });
-                                            ui.add(egui::Label::new(egui::RichText::new(session.project_dir.display().to_string()).small().weak()).truncate());
+                                            ui.add(egui::Label::new(egui::RichText::new(session.project_dir.display().to_string()).small().weak()).truncate().selectable(false));
                                         } else {
-                                            ui.label(egui::RichText::new("Choose a project folder").strong().color(RISKY));
-                                            ui.label(egui::RichText::new("Click to select the repository or directory for this session").small().weak());
+                                            ui.add(egui::Label::new(egui::RichText::new("Choose a project folder").strong().color(RISKY)).selectable(false));
+                                            ui.add(egui::Label::new(egui::RichText::new("Click to select the repository or directory for this session").small().weak()).selectable(false));
                                         }
                                     });
                                 });
@@ -700,10 +808,14 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                     },
                 );
 
-                if folder_resp.response.hovered() {
+                let folder_full_resp = ui.interact(folder_resp.response.rect, folder_id.with("hit"), egui::Sense::click());
+                let folder_hovered = folder_resp.response.hovered() || folder_full_resp.hovered();
+                let folder_clicked = folder_resp.response.clicked() || folder_full_resp.clicked();
+
+                if folder_hovered {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                 }
-                if folder_resp.response.clicked() {
+                if folder_clicked {
                     action = ConversationAction::ChangeFolder;
                 }
             },
