@@ -65,6 +65,25 @@ pub fn session_detail(session: &Session) -> String {
     }
 }
 
+/// The background tint for a session card in the sidebar.
+pub fn session_card_fill(selected: bool, hovered: bool, dark_mode: bool) -> egui::Color32 {
+    if selected {
+        if dark_mode {
+            egui::Color32::from_white_alpha(20)
+        } else {
+            egui::Color32::from_black_alpha(16)
+        }
+    } else if hovered {
+        if dark_mode {
+            egui::Color32::from_white_alpha(10)
+        } else {
+            egui::Color32::from_black_alpha(8)
+        }
+    } else {
+        egui::Color32::TRANSPARENT
+    }
+}
+
 /// Sidebar state that only lasts while the app is open.
 #[derive(Default)]
 pub struct Sidebar {
@@ -361,22 +380,7 @@ impl Sidebar {
             |ui| {
                 let response = ui.response();
                 let hovered = response.hovered();
-
-                let fill = if selected {
-                    if ui.visuals().dark_mode {
-                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 20)
-                    } else {
-                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 16)
-                    }
-                } else if hovered {
-                    if ui.visuals().dark_mode {
-                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 10)
-                    } else {
-                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 8)
-                    }
-                } else {
-                    egui::Color32::TRANSPARENT
-                };
+                let fill = session_card_fill(selected, hovered, ui.visuals().dark_mode);
 
                 let card_frame = egui::Frame::new()
                     .fill(fill)
@@ -403,7 +407,7 @@ impl Sidebar {
                                 ui.painter().circle_filled(
                                     center,
                                     outer_r,
-                                    egui::Color32::from_rgba_premultiplied(34, 197, 94, alpha),
+                                    egui::Color32::from_rgba_unmultiplied(34, 197, 94, alpha),
                                 );
                                 ui.painter().circle_filled(center, 2.8, egui::Color32::from_rgb(34, 197, 94));
                                 ui.ctx().request_repaint();
@@ -786,5 +790,29 @@ mod tests {
 
         s.chosen_model = Some("claude-3-7-sonnet".into());
         assert_eq!(session_detail(&s), "Claude · claude-3-7-sonnet");
+    }
+
+    #[test]
+    fn session_card_fill_is_a_subtle_tint_not_solid_white() {
+        // In dark mode, selected and hovered cards must use a subtle alpha tint,
+        // never additive solid white.
+        let selected_dark = session_card_fill(true, false, true);
+        assert_ne!(selected_dark.r(), 255, "selected card must not max out red");
+        assert_ne!(selected_dark.g(), 255, "selected card must not max out green");
+        assert_ne!(selected_dark.b(), 255, "selected card must not max out blue");
+        assert_eq!(selected_dark, egui::Color32::from_white_alpha(20));
+
+        let hovered_dark = session_card_fill(false, true, true);
+        assert_ne!(hovered_dark.r(), 255, "hovered card must not max out red");
+        assert_eq!(hovered_dark, egui::Color32::from_white_alpha(10));
+
+        let selected_light = session_card_fill(true, false, false);
+        assert_eq!(selected_light, egui::Color32::from_black_alpha(16));
+
+        let hovered_light = session_card_fill(false, true, false);
+        assert_eq!(hovered_light, egui::Color32::from_black_alpha(8));
+
+        let idle = session_card_fill(false, false, true);
+        assert_eq!(idle, egui::Color32::TRANSPARENT);
     }
 }
