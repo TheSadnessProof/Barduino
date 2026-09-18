@@ -238,6 +238,11 @@ impl Terminal {
         self.exited.load(Ordering::Relaxed) || matches!(self.child.try_wait(), Ok(Some(_)))
     }
 
+    /// Whether the shell process is still active and has not exited.
+    pub fn is_running(&self) -> bool {
+        !self.exited.load(Ordering::Relaxed)
+    }
+
     /// Draws the terminal. `take_keyboard` gives it the keyboard without waiting
     /// for a click. Returns true if the user asked to restart the shell.
     pub fn ui(&mut self, ui: &mut egui::Ui, take_keyboard: bool) -> bool {

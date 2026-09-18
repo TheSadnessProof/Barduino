@@ -37,6 +37,10 @@ pub enum Icon {
     External,
     /// Two curved arrows forming a loop, for auto-refreshing live preview.
     AutoRefresh,
+    /// A terminal prompt `>_` with a chevron and underscore cursor.
+    Terminal,
+    /// A window split into top and bottom panes.
+    SplitView,
 }
 
 const SIZE: f32 = 26.0;
@@ -267,6 +271,26 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             );
             painter.line_segment([tip_bot, tip_bot + vec2(h * 0.2, h)], stroke);
             painter.line_segment([tip_bot, tip_bot + vec2(h, h * 0.2)], stroke);
+        }
+        Icon::Terminal => {
+            let d = r * 0.45;
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(c.x - r * 0.7, c.y - d),
+                    pos2(c.x - r * 0.1, c.y),
+                    pos2(c.x - r * 0.7, c.y + d),
+                ],
+                stroke,
+            ));
+            painter.line_segment(
+                [pos2(c.x + r * 0.1, c.y + d), pos2(c.x + r * 0.7, c.y + d)],
+                Stroke::new(1.8, color),
+            );
+        }
+        Icon::SplitView => {
+            let frame = Rect::from_center_size(c, vec2(r * 1.9, r * 1.6));
+            painter.rect_stroke(frame, 1.5, stroke, egui::StrokeKind::Inside);
+            painter.line_segment([pos2(frame.left(), c.y), pos2(frame.right(), c.y)], stroke);
         }
     }
 }

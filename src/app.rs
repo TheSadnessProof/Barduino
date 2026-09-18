@@ -8,7 +8,6 @@ use crate::agent::{AgentEvent, ApprovalDecision, PermissionMode, Provider};
 use crate::browser::{Browser, BrowserState};
 use crate::chat::{self, ComposerAction};
 use crate::commands::SlashAction;
-use crate::icons::{self, Icon};
 use crate::models::Catalog;
 use crate::plan::{self, PlanUsage};
 use crate::preview;
@@ -702,11 +701,7 @@ impl ViperApp {
                 return tools.ui(ui, frame, session, &mut collapse);
             }
             browser.hide();
-            ui.add_space(6.0);
-            ui.vertical_centered(|ui| {
-                expand |= icons::button(ui, Icon::SidebarRight, "Show terminal and browser").clicked();
-                expand |= tools.add_menu(ui, &cwd);
-            });
+            expand |= tools.collapsed_rail(ui, &cwd);
             ToolsAction::None
         })
         .inner;
