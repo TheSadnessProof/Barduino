@@ -22,6 +22,16 @@ const RISKY: egui::Color32 = egui::Color32::from_rgb(214, 158, 46);
 /// How tall the message box may grow before it scrolls instead, in rows. Beyond
 /// this a long message would start pushing the conversation off the screen.
 const MAX_COMPOSER_ROWS: f32 = 12.0;
+/// The maximum reading width for the middle conversation and composer.
+/// Clamping to 820px keeps lines comfortable to read on wide monitors
+/// and matches Claude Code's centered chat column.
+pub const MAX_CHAT_WIDTH: f32 = 820.0;
+
+/// The width the middle chat column should take given the space available.
+/// Clamps to `MAX_CHAT_WIDTH` (820px) on wide screens and scales down on narrow ones.
+pub fn chat_column_width(available: f32) -> f32 {
+    MAX_CHAT_WIDTH.min((available - 32.0).max(280.0))
+}
 /// How long a label on one of the chips under the message box may be.
 const MAX_CHIP_CHARS: usize = 18;
 /// How long a path in a tool's row may be before the front of it is cut away.
@@ -153,8 +163,7 @@ pub fn composer(
     };
     let hint_color = ui.visuals().weak_text_color();
 
-    let available_w = ui.available_width();
-    let max_w = 820.0_f32.min((available_w - 32.0).max(280.0));
+    let max_w = chat_column_width(ui.available_width());
 
     ui.add_space(8.0);
     ui.vertical_centered(|ui| {
@@ -562,69 +571,79 @@ pub fn conversation(
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
-            let model = session.model.as_deref().or(session.chosen_model.as_deref());
-            let clip = ui.clip_rect();
-            const CULL_MARGIN: f32 = 400.0;
-            let visible_min_y = clip.min.y - CULL_MARGIN;
-            let visible_max_y = clip.max.y + CULL_MARGIN;
+            let max_w = chat_column_width(ui.available_width());
+            ui.vertical_centered(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(max_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_max_width(max_w);
+                        let model = session.model.as_deref().or(session.chosen_model.as_deref());
+                        let clip = ui.clip_rect();
+                        const CULL_MARGIN: f32 = 400.0;
+                        let visible_min_y = clip.min.y - CULL_MARGIN;
+                        let visible_max_y = clip.max.y + CULL_MARGIN;
 
-            for (index, entry) in session.entries.iter().enumerate() {
-                let entry_id = egui::Id::new(("entry_height", session.id, index));
-                let prev_height: Option<f32> = ui.ctx().data_mut(|d| d.get_persisted(entry_id));
-                let cursor_y = ui.cursor().top();
+                        for (index, entry) in session.entries.iter().enumerate() {
+                            let entry_id = egui::Id::new(("entry_height", session.id, index));
+                            let prev_height: Option<f32> = ui.ctx().data_mut(|d| d.get_persisted(entry_id));
+                            let cursor_y = ui.cursor().top();
 
-                let is_offscreen = match prev_height {
-                    Some(height) => (cursor_y + height < visible_min_y) || (cursor_y > visible_max_y),
-                    None => false,
-                };
+                            let is_offscreen = match prev_height {
+                                Some(height) => (cursor_y + height < visible_min_y) || (cursor_y > visible_max_y),
+                                None => false,
+                            };
 
-                if let Some(height) = prev_height
-                    && is_offscreen
-                {
-                    ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
-                } else {
-                    let show_agent_header = if index == 0 {
-                        true
-                    } else {
-                        !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
-                    };
-                    let mut entry_action = ConversationAction::None;
-                    let resp = ui
-                        .scope(|ui| {
-                            entry_action = show_entry(
+                            if let Some(height) = prev_height
+                                && is_offscreen
+                            {
+                                ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
+                            } else {
+                                let show_agent_header = if index == 0 {
+                                    true
+                                } else {
+                                    !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
+                                };
+                                let mut entry_action = ConversationAction::None;
+                                let resp = ui
+                                    .scope(|ui| {
+                                        entry_action = show_entry(
+                                            ui,
+                                            (session.id, index),
+                                            entry,
+                                            session.provider,
+                                            model,
+                                            show_agent_header,
+                                            session.working_dir(),
+                                        );
+                                    })
+                                    .response;
+                                if entry_action != ConversationAction::None {
+                                    action = entry_action;
+                                }
+                                ui.ctx().data_mut(|d| d.insert_persisted(entry_id, resp.rect.height()));
+                            }
+                        }
+                        if !session.streaming.is_empty() {
+                            let show_agent_header = if session.entries.is_empty() {
+                                true
+                            } else {
+                                !matches!(session.entries.last(), Some(Entry::Agent(_)))
+                            };
+                            markdown::show_agent_turn(
                                 ui,
-                                (session.id, index),
-                                entry,
+                                egui::Id::new(("streaming", session.id)),
+                                &session.streaming,
                                 session.provider,
                                 model,
+                                true,
                                 show_agent_header,
-                                session.working_dir(),
                             );
-                        })
-                        .response;
-                    if entry_action != ConversationAction::None {
-                        action = entry_action;
-                    }
-                    ui.ctx().data_mut(|d| d.insert_persisted(entry_id, resp.rect.height()));
-                }
-            }
-            if !session.streaming.is_empty() {
-                let show_agent_header = if session.entries.is_empty() {
-                    true
-                } else {
-                    !matches!(session.entries.last(), Some(Entry::Agent(_)))
-                };
-                markdown::show_agent_turn(
-                    ui,
-                    egui::Id::new(("streaming", session.id)),
-                    &session.streaming,
-                    session.provider,
-                    model,
-                    true,
-                    show_agent_header,
+                        }
+                        ui.add_space(8.0);
+                    },
                 );
-            }
-            ui.add_space(8.0);
+            });
         });
 
     action
@@ -1802,6 +1821,20 @@ fn shorten_note(note: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::PermissionMode;
+
+    #[test]
+    fn chat_column_width_is_capped_on_wide_screens() {
+        assert_eq!(chat_column_width(1920.0), MAX_CHAT_WIDTH);
+        assert_eq!(chat_column_width(1200.0), MAX_CHAT_WIDTH);
+        assert_eq!(chat_column_width(852.0), 820.0);
+    }
+
+    #[test]
+    fn chat_column_width_shrinks_gracefully_on_narrow_screens() {
+        assert_eq!(chat_column_width(500.0), 468.0);
+        assert_eq!(chat_column_width(300.0), 280.0);
+        assert_eq!(chat_column_width(200.0), 280.0);
+    }
 
     /// The card and the Copy button must never disagree: whatever the parser puts on
     /// screen is exactly what the clipboard gets. The old stripper concatenated every
