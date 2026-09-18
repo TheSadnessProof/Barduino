@@ -20,6 +20,10 @@ pub enum Viewport {
     Fixed,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Browser choices that are saved between launches.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(from = "SavedBrowserState")]
@@ -28,11 +32,13 @@ pub struct BrowserState {
     pub viewport: Viewport,
     /// The size the `Fixed` viewport shows the page at, in CSS pixels.
     pub size: [u32; 2],
+    #[serde(default = "default_true")]
+    pub auto_refresh: bool,
 }
 
 impl Default for BrowserState {
     fn default() -> Self {
-        Self { address: String::new(), viewport: Viewport::Desktop, size: [1280, 800] }
+        Self { address: String::new(), viewport: Viewport::Desktop, size: [1280, 800], auto_refresh: true }
     }
 }
 
@@ -48,12 +54,14 @@ struct SavedBrowserState {
     /// The size the pixel boxes chose. Zeroes mean the save predates them, and
     /// zeroes rather than an `Option` because RON insists on `Some(…)` for those.
     size: [u32; 2],
+    #[serde(default = "default_true")]
+    auto_refresh: bool,
 }
 
 impl Default for SavedBrowserState {
     fn default() -> Self {
-        let BrowserState { address, size, .. } = BrowserState::default();
-        Self { address, viewport: SavedViewport::Desktop, custom_size: size, size: [0, 0] }
+        let BrowserState { address, size, auto_refresh, .. } = BrowserState::default();
+        Self { address, viewport: SavedViewport::Desktop, custom_size: size, size: [0, 0], auto_refresh }
     }
 }
 
@@ -76,7 +84,7 @@ impl From<SavedBrowserState> for BrowserState {
             SavedViewport::Mobile => (Viewport::Fixed, MOBILE_SIZE),
             SavedViewport::Custom | SavedViewport::Fixed => (Viewport::Fixed, chosen),
         };
-        Self { address: saved.address, viewport, size }
+        Self { address: saved.address, viewport, size, auto_refresh: saved.auto_refresh }
     }
 }
 
@@ -190,6 +198,7 @@ pub struct Browser {
     showing: Option<(u64, u64)>,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
+    pending_reload: bool,
 }
 
 impl Default for Browser {
@@ -203,6 +212,7 @@ impl Default for Browser {
             showing: None,
             #[cfg(any(windows, target_os = "macos"))]
             native: None,
+            pending_reload: false,
         }
     }
 }
@@ -213,10 +223,22 @@ impl Browser {
         self.forget_marks();
         self.loaded.clear();
         self.showing = None;
+        self.pending_reload = false;
         #[cfg(any(windows, target_os = "macos"))]
         {
             self.native = None;
         }
+    }
+
+    /// Asks the WebView to reload the active page.
+    pub fn reload(&mut self) {
+        self.pending_reload = true;
+    }
+
+    /// Whether a reload is pending.
+    #[cfg(test)]
+    pub fn is_reload_pending(&self) -> bool {
+        self.pending_reload
     }
 
     /// Drops what was left on the page: the comments, the pins they go with, and
@@ -236,6 +258,7 @@ impl Browser {
         _frame: &eframe::Frame,
         _page_visible: bool,
     ) -> BrowserAction {
+        self.pending_reload = false;
         ui.label("The built-in browser isn't available on this platform yet.");
         BrowserAction::None
     }
@@ -261,6 +284,11 @@ impl Browser {
 
         let mut commands = Vec::new();
         let mut result = BrowserAction::None;
+
+        if self.pending_reload {
+            commands.push(Command::Reload);
+            self.pending_reload = false;
+        }
 
         // Comments and picking belong to the tab they were left on, even when the
         // next one happens to point at the same address.
@@ -636,11 +664,33 @@ fn page_rect(area: egui::Rect, viewport: Viewport, size: [u32; 2]) -> (egui::Rec
 }
 
 /// Turns what the user typed into a URL the WebView can load.
-fn normalize_url(input: &str) -> String {
+pub fn normalize_url(input: &str) -> String {
     let input = input.trim();
     if input.is_empty() {
-        "about:blank".to_owned()
-    } else if input.contains("://") || input.starts_with("about:") {
+        return "about:blank".to_owned();
+    }
+    // file:// URLs: ensure canonical format
+    if let Some(stripped) = input.strip_prefix("file://") {
+        if let Some(path) = crate::preview::file_url_to_path(input) {
+            return crate::preview::path_to_file_url(&path);
+        }
+        return format!("file://{stripped}");
+    }
+    // Local paths: Windows drive letters (C:\... or C:/...), UNC paths (\\...), Unix absolute paths (/...), or existing files
+    let bytes = input.as_bytes();
+    let is_drive = bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes.len() == 2 || bytes[2] == b'/' || bytes[2] == b'\\');
+    let is_unc = input.starts_with(r"\\") || input.starts_with("//");
+    let is_unix_abs = input.starts_with('/') && std::path::Path::new(input).is_absolute();
+    let is_existing_file = std::path::Path::new(input).is_file();
+
+    if is_drive || is_unc || is_unix_abs || is_existing_file {
+        return crate::preview::path_to_file_url(std::path::Path::new(input));
+    }
+
+    if input.contains("://") || input.starts_with("about:") {
         input.to_owned()
     } else if input.starts_with("localhost") || input.starts_with("127.0.0.1") || input.starts_with("[::1]") {
         format!("http://{input}")
@@ -860,11 +910,32 @@ mod tests {
 
         // The app saves in RON, which is stricter than JSON, so the round trip is
         // what actually has to hold.
-        let chosen = BrowserState { address: "x".into(), viewport: Viewport::Fixed, size: [430, 932] };
+        let chosen = BrowserState { address: "x".into(), viewport: Viewport::Fixed, size: [430, 932], auto_refresh: true };
         let written = ron::to_string(&chosen).expect("should save");
         assert_eq!(ron::from_str::<BrowserState>(&written).expect(&written), chosen);
         let old = "(address: \"x\", viewport: Mobile, custom_size: (1280, 800))";
         assert_eq!(ron::from_str::<BrowserState>(old).expect(old).size, MOBILE_SIZE);
+        assert!(ron::from_str::<BrowserState>(old).expect(old).auto_refresh, "older save defaults to auto_refresh true");
+
+        let toggled = BrowserState { address: "y".into(), viewport: Viewport::Desktop, size: [1280, 800], auto_refresh: false };
+        let written_toggled = ron::to_string(&toggled).expect("should save toggled");
+        assert_eq!(ron::from_str::<BrowserState>(&written_toggled).expect(&written_toggled), toggled);
+    }
+
+    #[test]
+    fn normalizes_local_files_and_web_urls() {
+        assert_eq!(normalize_url(""), "about:blank");
+        assert_eq!(normalize_url("   "), "about:blank");
+        assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
+        assert_eq!(normalize_url("https://example.com"), "https://example.com");
+        assert_eq!(normalize_url("example.com"), "https://example.com");
+
+        #[cfg(windows)]
+        {
+            assert_eq!(normalize_url(r"C:\work\index.html"), "file:///C:/work/index.html");
+            assert_eq!(normalize_url("C:/work/index.html"), "file:///C:/work/index.html");
+            assert_eq!(normalize_url("file:///C:/work/index.html"), "file:///C:/work/index.html");
+        }
     }
 
     #[test]

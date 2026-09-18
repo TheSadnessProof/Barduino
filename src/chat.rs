@@ -4,7 +4,7 @@ use std::path::Path;
 
 use eframe::egui;
 
-use crate::agent::{PermissionMode, Provider};
+use crate::agent::{ApprovalStatus, PermissionMode, Provider};
 use crate::browser::PickedElement;
 use crate::commands::{self, CommandSource, Handling, SlashAction, SlashCommand};
 use crate::git_diff::LineKind;
@@ -41,11 +41,15 @@ pub enum ComposerAction {
     Notice(String),
 }
 
-/// Actions returned from the conversation area (e.g. empty session controls).
+/// Actions returned from the conversation area (e.g. empty session controls, approvals).
+#[derive(Debug, PartialEq, Eq)]
 pub enum ConversationAction {
     None,
     ChangeFolder,
     SelectProvider(Provider),
+    Approve(String),
+    Deny(String),
+    Preview(std::path::PathBuf),
 }
 
 /// Claude signature terracotta/coral accent for primary actions and focus states.
@@ -552,6 +556,7 @@ pub fn conversation(
         return action;
     }
 
+    let mut action = ConversationAction::None;
     egui::ScrollArea::vertical()
         .id_salt(("conversation", session.id))
         .auto_shrink([false, false])
@@ -583,19 +588,23 @@ pub fn conversation(
                     } else {
                         !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
                     };
+                    let mut entry_action = ConversationAction::None;
                     let resp = ui
                         .scope(|ui| {
-                            show_entry(
+                            entry_action = show_entry(
                                 ui,
                                 (session.id, index),
                                 entry,
                                 session.provider,
                                 model,
                                 show_agent_header,
-                                &session.project_dir,
+                                session.working_dir(),
                             );
                         })
                         .response;
+                    if entry_action != ConversationAction::None {
+                        action = entry_action;
+                    }
                     ui.ctx().data_mut(|d| d.insert_persisted(entry_id, resp.rect.height()));
                 }
             }
@@ -618,7 +627,7 @@ pub fn conversation(
             ui.add_space(8.0);
         });
 
-    ConversationAction::None
+    action
 }
 
 /// The welcome setup screen displayed in the center of an empty session.
@@ -809,7 +818,7 @@ fn show_entry(
     model: Option<&str>,
     show_agent_header: bool,
     project_dir: &Path,
-) {
+) -> ConversationAction {
     match entry {
         Entry::User(message) => {
             ui.add_space(10.0);
@@ -835,6 +844,7 @@ fn show_entry(
                     }
                 });
             ui.add_space(4.0);
+            ConversationAction::None
         }
         // Agents write in markdown, formatted with Claude Code and Codex visuals.
         Entry::Agent(text) => {
@@ -847,12 +857,16 @@ fn show_entry(
                 false,
                 show_agent_header,
             );
+            ConversationAction::None
         }
         Entry::Tool { name, detail, edit } => {
-            tool_row(ui, name, detail, project_dir);
+            let mut action = ConversationAction::None;
+            let preview_path = crate::preview::previewable_path_from_tool(edit.as_ref(), detail, project_dir);
+            tool_row(ui, name, detail, project_dir, preview_path.as_deref(), &mut action);
             if let Some(edit) = edit {
                 edit_view(ui, id, edit);
             }
+            action
         }
         Entry::ToolOutput { text, is_error } => {
             let (title, colour) = if *is_error {
@@ -870,12 +884,154 @@ fn show_entry(
                     .default_open(*is_error)
                     .show(ui, |ui| output_text(ui, text));
             });
+            ConversationAction::None
         }
         Entry::Notice(text) => {
             ui.label(egui::RichText::new(text).italics().weak());
+            ConversationAction::None
         }
         Entry::Error(text) => {
             ui.colored_label(ui.visuals().error_fg_color, text);
+            ConversationAction::None
+        }
+        Entry::Approval(request) => {
+            let mut action = ConversationAction::None;
+            ui.add_space(8.0);
+            let frame_color = if request.is_pending() {
+                RISKY.gamma_multiply(0.18)
+            } else {
+                ui.visuals().faint_bg_color
+            };
+            let stroke_color = if request.is_pending() {
+                RISKY
+            } else {
+                ui.visuals().widgets.noninteractive.bg_stroke.color
+            };
+
+            egui::Frame::group(ui.style())
+                .fill(frame_color)
+                .stroke(egui::Stroke::new(1.0, stroke_color))
+                .corner_radius(6.0)
+                .inner_margin(egui::Margin::symmetric(10, 8))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+
+                    let described = tool_call::describe(&request.tool_name);
+                    let (tool_label, tool_col) = match described {
+                        Some((kind, verb)) => (verb, kind_colour(kind)),
+                        None => (request.tool_name.as_str(), ui.visuals().weak_text_color()),
+                    };
+
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+
+                        // Tool verb badge
+                        egui::Frame::new()
+                            .fill(tool_col.gamma_multiply(0.22))
+                            .corner_radius(4.0)
+                            .inner_margin(egui::Margin::symmetric(6, 2))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(tool_label).small().strong().color(tool_col));
+                            });
+
+                        // Status badge
+                        match request.status {
+                            ApprovalStatus::Pending => {
+                                egui::Frame::new()
+                                    .fill(RISKY.gamma_multiply(0.22))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("Permission Request")
+                                                .small()
+                                                .strong()
+                                                .color(RISKY),
+                                        );
+                                    });
+                            }
+                            ApprovalStatus::Approved => {
+                                egui::Frame::new()
+                                    .fill(ADDED.gamma_multiply(0.22))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("✓ Approved")
+                                                .small()
+                                                .strong()
+                                                .color(ADDED),
+                                        );
+                                    });
+                            }
+                            ApprovalStatus::Denied => {
+                                egui::Frame::new()
+                                    .fill(REMOVED.gamma_multiply(0.22))
+                                    .corner_radius(4.0)
+                                    .inner_margin(egui::Margin::symmetric(6, 2))
+                                    .show(ui, |ui| {
+                                        ui.label(
+                                            egui::RichText::new("✕ Denied")
+                                                .small()
+                                                .strong()
+                                                .color(REMOVED),
+                                        );
+                                    });
+                            }
+                        }
+                    });
+
+                    ui.add_space(4.0);
+
+                    // Action description / detail
+                    let (phrase, body) = tool_call::split_detail(&request.detail);
+                    let phrase = readable_detail(described.map(|(kind, _)| kind), phrase, project_dir);
+                    ui.add(egui::Label::new(egui::RichText::new(&phrase).monospace().small()).truncate())
+                        .on_hover_text(&phrase);
+                    if !body.is_empty() {
+                        indented(ui, tool_col.gamma_multiply(0.5), |ui| {
+                            for line in body {
+                                ui.add(egui::Label::new(egui::RichText::new(line).small().weak()).truncate());
+                            }
+                        });
+                    }
+
+                    // Diff preview if edit is present
+                    if let Some(edit) = &request.edit {
+                        ui.add_space(4.0);
+                        edit_view(ui, id, edit);
+                    }
+
+                    // Action buttons when pending
+                    if request.is_pending() {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+
+                            let approve_btn = egui::Button::new(
+                                egui::RichText::new("✓ Approve").strong().color(egui::Color32::WHITE),
+                            )
+                            .fill(ADDED)
+                            .corner_radius(4.0);
+
+                            if ui.add(approve_btn).on_hover_text("Allow the agent to perform this action").clicked() {
+                                action = ConversationAction::Approve(request.id.clone());
+                            }
+
+                            let deny_btn = egui::Button::new(
+                                egui::RichText::new("✕ Deny").color(ui.visuals().text_color()),
+                            )
+                            .fill(ui.visuals().widgets.inactive.bg_fill)
+                            .corner_radius(4.0);
+
+                            if ui.add(deny_btn).on_hover_text("Reject this action").clicked() {
+                                action = ConversationAction::Deny(request.id.clone());
+                            }
+                        });
+                    }
+                });
+            ui.add_space(4.0);
+            action
         }
     }
 }
@@ -914,7 +1070,14 @@ fn readable_detail(kind: Option<ToolKind>, detail: &str, project_dir: &Path) -> 
 
 /// What a tool did: the verb it did it with, then what it worked on. A tool that
 /// reported a list — a plan, a to-do list — has it underneath.
-fn tool_row(ui: &mut egui::Ui, name: &str, detail: &str, project_dir: &Path) {
+fn tool_row(
+    ui: &mut egui::Ui,
+    name: &str,
+    detail: &str,
+    project_dir: &Path,
+    preview_path: Option<&Path>,
+    action: &mut ConversationAction,
+) {
     let described = tool_call::describe(name);
     // An unrecognised tool keeps its own name. A wrong verb would be worse than
     // the CLI's own word for it, and MCP servers bring names nobody can predict.
@@ -937,6 +1100,12 @@ fn tool_row(ui: &mut egui::Ui, name: &str, detail: &str, project_dir: &Path) {
             });
         ui.add(egui::Label::new(egui::RichText::new(&phrase).monospace().small().weak()).truncate())
             .on_hover_text(&phrase);
+        if let Some(path) = preview_path {
+            let btn = egui::Button::new(egui::RichText::new("👁 Preview").small()).small();
+            if ui.add(btn).on_hover_text("Open live preview in tools panel").clicked() {
+                *action = ConversationAction::Preview(path.to_path_buf());
+            }
+        }
     });
     if !body.is_empty() {
         indented(ui, colour.gamma_multiply(0.5), |ui| {
@@ -1823,5 +1992,17 @@ mod tests {
     fn empty_session_without_folder_is_detected() {
         let session = Session::new(1, std::path::PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
         assert!(!session.has_folder(), "new session with empty path has no folder");
+    }
+
+    #[test]
+    fn previewable_tool_entries_produce_preview_action() {
+        let project = Path::new(r"C:\work\demo");
+        let edit = crate::line_diff::FileEdit::new("web/index.html", "", "<h1>Hello</h1>");
+        let path = crate::preview::previewable_path_from_tool(Some(&edit), "write index.html", project);
+        assert_eq!(path, Some(std::path::PathBuf::from(r"C:\work\demo\web\index.html")));
+
+        let non_web_edit = crate::line_diff::FileEdit::new("src/main.rs", "", "fn main() {}");
+        let no_path = crate::preview::previewable_path_from_tool(Some(&non_web_edit), "src/main.rs", project);
+        assert_eq!(no_path, None);
     }
 }

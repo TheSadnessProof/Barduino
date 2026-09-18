@@ -17,6 +17,7 @@ mod logo;
 mod markdown;
 mod models;
 mod plan;
+mod preview;
 mod session;
 mod settings;
 mod sidebar;
@@ -24,6 +25,7 @@ mod terminal;
 mod tool_call;
 mod tools;
 mod usage;
+mod worktree;
 
 use eframe::egui;
 

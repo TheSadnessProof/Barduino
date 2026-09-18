@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{self, AgentEvent, PermissionMode, Provider, RunningTurn, Turn};
+use crate::agent::{
+    self, AgentEvent, ApprovalDecision, ApprovalRequest, PermissionMode, Provider, RunningTurn,
+    Turn,
+};
 use crate::browser::{BrowserState, PickedElement};
 use crate::line_diff::FileEdit;
 use crate::usage::Usage;
@@ -29,6 +32,8 @@ pub enum Entry {
     ToolOutput { text: String, is_error: bool },
     Notice(String),
     Error(String),
+    /// An interactive approval request waiting on or resolved by the user.
+    Approval(ApprovalRequest),
 }
 
 /// What the user sent: their text and any page elements attached to it.
@@ -85,6 +90,15 @@ pub struct Session {
     pub id: u64,
     pub title: String,
     pub project_dir: PathBuf,
+    /// The isolated worktree directory for this session, if configured.
+    #[serde(default)]
+    pub worktree_dir: Option<PathBuf>,
+    /// The git branch dedicated to this session's isolated changes.
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
+    /// The base branch or ref the worktree branch was created from.
+    #[serde(default)]
+    pub worktree_base: Option<String>,
     /// Which CLI answers in this session. Sessions saved before this existed used Claude.
     #[serde(default)]
     pub provider: Provider,
@@ -148,6 +162,9 @@ impl Session {
             id,
             title: UNTITLED.to_owned(),
             project_dir,
+            worktree_dir: None,
+            worktree_branch: None,
+            worktree_base: None,
             provider,
             permission_mode,
             chosen_model: None,
@@ -213,6 +230,17 @@ impl Session {
             .unwrap_or_else(|| self.project_dir.display().to_string())
     }
 
+    /// The active directory an agent or terminal runs inside: the isolated worktree
+    /// directory if one is active, or the root project directory.
+    pub fn working_dir(&self) -> &Path {
+        self.worktree_dir.as_deref().unwrap_or(&self.project_dir)
+    }
+
+    /// Previewable web artifacts (HTML, SVG, XHTML) generated or modified in this session.
+    pub fn previewable_artifacts(&self) -> Vec<PathBuf> {
+        crate::preview::extract_previewable_artifacts(&self.entries, self.working_dir())
+    }
+
     /// Sends the message box contents to the agent. `on_event` is called from a
     /// background thread for everything that happens during the turn.
     pub fn send(&mut self, exe: &Path, on_event: impl Fn(AgentEvent) + Send + 'static) {
@@ -224,7 +252,7 @@ impl Session {
 
         let turn = Turn {
             prompt: message.prompt(),
-            cwd: self.project_dir.clone(),
+            cwd: self.working_dir().to_path_buf(),
             resume_session: self.agent_session_id.clone(),
             permission_mode: self.permission_mode,
             model: self.chosen_model.clone(),
@@ -260,6 +288,39 @@ impl Session {
         }
     }
 
+    /// Returns true if any approval request in this session is still waiting for a response.
+    pub fn has_pending_approval(&self) -> bool {
+        self.pending_approval().is_some()
+    }
+
+    /// Returns the most recent pending approval request, if any.
+    pub fn pending_approval(&self) -> Option<&ApprovalRequest> {
+        self.entries.iter().rev().find_map(|e| match e {
+            Entry::Approval(r) if r.is_pending() => Some(r),
+            _ => None,
+        })
+    }
+
+    /// Resolves an approval request and notifies the running turn if active.
+    pub fn resolve_approval(&mut self, id: &str, decision: ApprovalDecision) -> bool {
+        let mut resolved = false;
+        for entry in &mut self.entries {
+            if let Entry::Approval(req) = entry
+                && req.id == id
+                && req.is_pending()
+            {
+                resolved = req.resolve(decision);
+                break;
+            }
+        }
+        if resolved
+            && let Some(turn) = &self.turn
+        {
+            turn.respond_approval(id, decision);
+        }
+        resolved
+    }
+
     pub fn handle_event(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Started { session_id, model } => {
@@ -289,6 +350,10 @@ impl Session {
                     text.push_str("\n… (cut off)");
                 }
                 self.entries.push(Entry::ToolOutput { text, is_error });
+            }
+            AgentEvent::ApprovalRequest(request) => {
+                self.keep_streamed_text();
+                self.entries.push(Entry::Approval(request));
             }
             AgentEvent::Finished { session_id, error, mut denied_tools, .. } => {
                 self.keep_streamed_text();
@@ -412,6 +477,7 @@ fn title_from(prompt: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::ApprovalStatus;
 
     fn session(provider: Provider) -> Session {
         Session::new(1, PathBuf::from("C:\\work\\demo"), provider, PermissionMode::ReadOnly)
@@ -640,4 +706,497 @@ Element on http://localhost:3000/"));
         s.entries.push(Entry::User(UserMessage { text: "hi".into(), elements: Vec::new() }));
         assert!(!s.can_change_provider());
     }
+
+    #[test]
+    fn session_handles_approval_request_event_and_updates_entries() {
+        let mut s = session(Provider::Claude);
+        s.streaming.push_str("Thinking about changes...");
+        let req = ApprovalRequest::new("req-1", "bash", "cargo test", None);
+        s.handle_event(AgentEvent::ApprovalRequest(req.clone()));
+
+        assert!(s.streaming.is_empty(), "streamed text must be flushed before approval entry");
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(s.entries[0], Entry::Agent("Thinking about changes...".into()));
+        assert_eq!(s.entries[1], Entry::Approval(req));
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().map(|r| r.id.as_str()), Some("req-1"));
+    }
+
+    #[test]
+    fn resolving_session_approval_updates_entry_and_relays_to_turn() {
+        let mut s = session(Provider::Claude);
+        let req = ApprovalRequest::new("req-42", "edit_file", "src/main.rs", None);
+        s.entries.push(Entry::Approval(req));
+        assert!(s.has_pending_approval());
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 2" } else { "sleep 2" };
+        let child = std::process::Command::new(cmd).args([arg, script]).spawn().unwrap();
+        s.turn = Some(RunningTurn::with_approval_channel(child, Some(tx)));
+
+        let resolved = s.resolve_approval("req-42", ApprovalDecision::Approved);
+        assert!(resolved, "approval should be resolved");
+        assert!(!s.has_pending_approval(), "pending state should be cleared");
+        assert_eq!(s.pending_approval(), None);
+
+        let Entry::Approval(updated) = &s.entries[0] else {
+            panic!("expected Entry::Approval");
+        };
+        assert_eq!(updated.status, ApprovalStatus::Approved);
+
+        let relayed = rx.recv().expect("relay channel should receive response");
+        assert_eq!(relayed.id, "req-42");
+        assert_eq!(relayed.decision, ApprovalDecision::Approved);
+        s.stop();
+    }
+
+    #[test]
+    fn resolving_nonexistent_or_already_resolved_approval_returns_false() {
+        let mut s = session(Provider::Claude);
+        let req = ApprovalRequest::new("req-1", "bash", "cargo build", None);
+        s.entries.push(Entry::Approval(req));
+
+        assert!(!s.resolve_approval("nonexistent", ApprovalDecision::Approved));
+        assert!(s.resolve_approval("req-1", ApprovalDecision::Denied));
+        assert!(!s.resolve_approval("req-1", ApprovalDecision::Approved), "cannot resolve twice");
+
+        let Entry::Approval(updated) = &s.entries[0] else {
+            panic!("expected Entry::Approval");
+        };
+        assert_eq!(updated.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn approval_entries_round_trip_cleanly_through_ron() {
+        let req = ApprovalRequest::new("req-ron", "bash", "git status", None);
+        let entry = Entry::Approval(req);
+        let serialized = ron::to_string(&entry).unwrap();
+        let deserialized: Entry = ron::from_str(&serialized).unwrap();
+        assert_eq!(entry, deserialized);
+
+        let mut resolved_req = ApprovalRequest::new("req-2", "edit", "README.md", None);
+        resolved_req.resolve(ApprovalDecision::Approved);
+        let entry2 = Entry::Approval(resolved_req);
+        let serialized2 = ron::to_string(&entry2).unwrap();
+        let deserialized2: Entry = ron::from_str(&serialized2).unwrap();
+        assert_eq!(entry2, deserialized2);
+    }
+
+    #[test]
+    fn existing_saved_sessions_without_approvals_still_deserialize() {
+        let old_ron = r#"[
+            User("Hello"),
+            Agent("I am ready to help."),
+            Notice("Working..."),
+            Error("Something failed.")
+        ]"#;
+        let entries: Vec<Entry> = ron::from_str(old_ron).unwrap();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0], Entry::User(UserMessage { text: "Hello".into(), elements: Vec::new() }));
+        assert_eq!(entries[1], Entry::Agent("I am ready to help.".into()));
+        assert_eq!(entries[2], Entry::Notice("Working...".into()));
+        assert_eq!(entries[3], Entry::Error("Something failed.".into()));
+    }
+
+    #[test]
+    fn session_approval_lifecycle_and_edge_cases() {
+        let mut s = session(Provider::Claude);
+
+        // 1. Initial state: no pending approvals
+        assert!(!s.has_pending_approval());
+        assert_eq!(s.pending_approval(), None);
+
+        // 2. Empty ID and Unicode IDs
+        let req_empty = ApprovalRequest::new("", "tool", "detail", None);
+        s.entries.push(Entry::Approval(req_empty));
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "");
+        assert!(s.resolve_approval("", ApprovalDecision::Approved));
+        assert!(!s.has_pending_approval());
+
+        let req_unicode = ApprovalRequest::new("⚡-rocket-🚀", "bash", "deploy", None);
+        s.entries.push(Entry::Approval(req_unicode));
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "⚡-rocket-🚀");
+        assert!(s.resolve_approval("⚡-rocket-🚀", ApprovalDecision::Denied));
+        assert!(!s.has_pending_approval());
+
+        // 3. Multiple approvals in same session, resolved out-of-order
+        let r1 = ApprovalRequest::new("req-1", "tool1", "d1", None);
+        let r2 = ApprovalRequest::new("req-2", "tool2", "d2", None);
+        let r3 = ApprovalRequest::new("req-3", "tool3", "d3", None);
+        s.entries.push(Entry::Approval(r1));
+        s.entries.push(Entry::Approval(r2));
+        s.entries.push(Entry::Approval(r3));
+
+        // pending_approval returns the latest pending approval (LIFO / newest)
+        assert_eq!(s.pending_approval().unwrap().id, "req-3");
+
+        // Resolve the middle one first
+        assert!(s.resolve_approval("req-2", ApprovalDecision::Approved));
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-3");
+
+        // Resolve req-3
+        assert!(s.resolve_approval("req-3", ApprovalDecision::Denied));
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-1");
+
+        // Resolve req-1
+        assert!(s.resolve_approval("req-1", ApprovalDecision::Approved));
+        assert!(!s.has_pending_approval());
+        assert_eq!(s.pending_approval(), None);
+
+        // Double resolution of any of them must fail
+        assert!(!s.resolve_approval("req-1", ApprovalDecision::Approved));
+        assert!(!s.resolve_approval("req-2", ApprovalDecision::Denied));
+        assert!(!s.resolve_approval("req-3", ApprovalDecision::Approved));
+    }
+
+    #[test]
+    fn duplicate_approval_ids_across_turns_behavior() {
+        let mut s = session(Provider::Claude);
+        let mut req1 = ApprovalRequest::new("call-1", "bash", "ls", None);
+        req1.resolve(ApprovalDecision::Approved);
+        s.entries.push(Entry::Approval(req1));
+
+        let req2 = ApprovalRequest::new("call-1", "bash", "cat file", None);
+        s.entries.push(Entry::Approval(req2));
+
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().detail, "cat file");
+
+        // With the Challenger M1 fix (matching req.is_pending()), resolve_approval skips the
+        // already-resolved entry and resolves the pending entry with the same ID:
+        let resolved = s.resolve_approval("call-1", ApprovalDecision::Approved);
+        assert!(resolved, "pending entry is resolved even if an earlier resolved entry shared the same id");
+        assert!(!s.has_pending_approval(), "no approvals remain pending");
+        let Entry::Approval(ref r2) = s.entries[1] else { panic!("expected approval entry") };
+        assert_eq!(r2.status, ApprovalStatus::Approved);
+    }
+
+    #[test]
+    fn older_session_and_saved_state_ron_formats_deserialize_cleanly() {
+        let legacy_session_ron = r#"(
+            id: 101,
+            title: "Legacy Session Title",
+            project_dir: "C:\\projects\\legacy",
+            provider: Claude,
+            permission_mode: Plan,
+            entries: [
+                User("Please review our architecture"),
+                Agent("Here is the architectural review: everything looks sound."),
+                Tool(
+                    name: "read_file",
+                    detail: "src/main.rs",
+                    edit: None,
+                ),
+                ToolOutput(
+                    text: "fn main() { println!(\"hello\"); }",
+                    is_error: false,
+                ),
+                Notice("Session completed cleanly"),
+                Error("Non-fatal legacy notice"),
+            ],
+            input: "draft follow-up",
+        )"#;
+
+        let session: Session = ron::from_str(legacy_session_ron).expect("legacy session must deserialize cleanly");
+        assert_eq!(session.id, 101);
+        assert_eq!(session.title, "Legacy Session Title");
+        assert_eq!(session.entries.len(), 6);
+        assert!(!session.has_pending_approval(), "legacy session has no pending approvals");
+        assert_eq!(session.pending_approval(), None);
+
+        let thin_approval_ron = r#"Approval((
+            id: "thin-req-1",
+            tool_name: "bash",
+            detail: "cargo check",
+        ))"#;
+        let entry: Entry = ron::from_str(thin_approval_ron).expect("thin approval must deserialize");
+        let Entry::Approval(req) = entry else { panic!("expected Entry::Approval") };
+        assert_eq!(req.id, "thin-req-1");
+        assert_eq!(req.tool_name, "bash");
+        assert_eq!(req.detail, "cargo check");
+        assert_eq!(req.edit, None);
+        assert_eq!(req.status, ApprovalStatus::Pending);
+    }
+
+    #[test]
+    fn multi_approval_fifo_and_arbitrary_ordering_lifecycle() {
+        let mut s = session(Provider::Claude);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 2" } else { "sleep 2" };
+        let child = std::process::Command::new(cmd).args([arg, script]).spawn().unwrap();
+        s.turn = Some(RunningTurn::with_approval_channel(child, Some(tx)));
+
+        for i in 1..=5 {
+            s.entries.push(Entry::Approval(ApprovalRequest::new(
+                format!("req-{i}"),
+                format!("tool-{i}"),
+                format!("detail {i}"),
+                None,
+            )));
+        }
+
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-5", "pending_approval returns most recent");
+
+        // Arbitrary resolution: resolve req-3 (middle)
+        assert!(s.resolve_approval("req-3", ApprovalDecision::Approved));
+        let relay = rx.recv().expect("relay channel receives req-3 response");
+        assert_eq!(relay.id, "req-3");
+        assert_eq!(relay.decision, ApprovalDecision::Approved);
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-5");
+
+        // FIFO resolution: resolve req-1 (first)
+        assert!(s.resolve_approval("req-1", ApprovalDecision::Denied));
+        let relay = rx.recv().expect("relay channel receives req-1 response");
+        assert_eq!(relay.id, "req-1");
+        assert_eq!(relay.decision, ApprovalDecision::Denied);
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-5");
+
+        // Resolve req-5 (latest)
+        assert!(s.resolve_approval("req-5", ApprovalDecision::Approved));
+        let relay = rx.recv().expect("relay channel receives req-5 response");
+        assert_eq!(relay.id, "req-5");
+        assert_eq!(relay.decision, ApprovalDecision::Approved);
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-4", "req-4 is now latest pending");
+
+        // Double-resolving already resolved approvals returns false and does NOT relay
+        assert!(!s.resolve_approval("req-3", ApprovalDecision::Denied));
+        assert!(!s.resolve_approval("req-1", ApprovalDecision::Approved));
+        assert!(!s.resolve_approval("req-5", ApprovalDecision::Denied));
+        assert!(rx.try_recv().is_err(), "no spurious responses relayed for redundant calls");
+
+        // Resolve remaining in arbitrary order: req-4, then req-2
+        assert!(s.resolve_approval("req-4", ApprovalDecision::Denied));
+        let relay = rx.recv().expect("relay channel receives req-4 response");
+        assert_eq!(relay.id, "req-4");
+        assert_eq!(relay.decision, ApprovalDecision::Denied);
+        assert!(s.has_pending_approval());
+        assert_eq!(s.pending_approval().unwrap().id, "req-2");
+
+        assert!(s.resolve_approval("req-2", ApprovalDecision::Approved));
+        let relay = rx.recv().expect("relay channel receives req-2 response");
+        assert_eq!(relay.id, "req-2");
+        assert_eq!(relay.decision, ApprovalDecision::Approved);
+
+        // All 5 approvals now resolved
+        assert!(!s.has_pending_approval(), "no approvals should remain pending");
+        assert_eq!(s.pending_approval(), None);
+
+        let statuses: Vec<(String, ApprovalStatus)> = s.entries.iter().filter_map(|e| match e {
+            Entry::Approval(r) => Some((r.id.clone(), r.status)),
+            _ => None,
+        }).collect();
+        assert_eq!(statuses, vec![
+            ("req-1".into(), ApprovalStatus::Denied),
+            ("req-2".into(), ApprovalStatus::Approved),
+            ("req-3".into(), ApprovalStatus::Approved),
+            ("req-4".into(), ApprovalStatus::Denied),
+            ("req-5".into(), ApprovalStatus::Approved),
+        ]);
+
+        s.stop();
+    }
+
+    #[test]
+    fn session_state_transitions_between_waiting_running_and_idle_under_multi_entry_flow() {
+        use crate::sidebar::{session_state, SessionState};
+
+        let mut s = session(Provider::Claude);
+
+        // 1. Fresh session starts Idle
+        assert_eq!(session_state(&s), SessionState::Idle);
+
+        // 2. Turn starts: Running
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 2" } else { "sleep 2" };
+        let child = std::process::Command::new(cmd).args([arg, script]).spawn().unwrap();
+        s.turn = Some(RunningTurn::with_approval_channel(child, None));
+        assert_eq!(session_state(&s), SessionState::Running);
+
+        // 3. Approval 1 arrives: WaitingForApproval
+        s.entries.push(Entry::Approval(ApprovalRequest::new("app-1", "bash", "ls", None)));
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+
+        // 4. Intermediate tool entries arrive: still WaitingForApproval
+        s.entries.push(Entry::Tool { name: "bash".into(), detail: "pwd".into(), edit: None });
+        s.entries.push(Entry::ToolOutput { text: "/root".into(), is_error: false });
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+
+        // 5. Approval 2 arrives: still WaitingForApproval
+        s.entries.push(Entry::Approval(ApprovalRequest::new("app-2", "edit", "main.rs", None)));
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+
+        // 6. User resolves app-1: still WaitingForApproval because app-2 is pending
+        assert!(s.resolve_approval("app-1", ApprovalDecision::Approved));
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+
+        // 7. User resolves app-2: transitions back to Running (turn is active)
+        assert!(s.resolve_approval("app-2", ApprovalDecision::Approved));
+        assert_eq!(session_state(&s), SessionState::Running);
+
+        // 8. Approval 3 arrives and is Denied: transitions WaitingForApproval -> Running
+        s.entries.push(Entry::Approval(ApprovalRequest::new("app-3", "bash", "rm -rf", None)));
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+        assert!(s.resolve_approval("app-3", ApprovalDecision::Denied));
+        assert_eq!(session_state(&s), SessionState::Running);
+
+        // 9. Turn finishes with normal Agent reply: transitions to Idle
+        s.stop();
+        s.turn = None;
+        s.entries.push(Entry::Agent("Done with all tasks".into()));
+        assert_eq!(session_state(&s), SessionState::Idle);
+
+        // 10. Turn finishes with Error: transitions to Failed
+        s.entries.push(Entry::Error("Process exited with code 1".into()));
+        assert_eq!(session_state(&s), SessionState::Failed);
+    }
+
+    #[test]
+    fn working_dir_falls_back_to_project_dir_when_worktree_none() {
+        let s = session(Provider::Claude);
+        assert_eq!(s.worktree_dir, None);
+        assert_eq!(s.working_dir(), s.project_dir.as_path());
+    }
+
+    #[test]
+    fn working_dir_uses_worktree_dir_when_present() {
+        let mut s = session(Provider::Claude);
+        let isolated = PathBuf::from(r"C:\projects\repo\.viper\worktrees\99");
+        s.worktree_dir = Some(isolated.clone());
+        assert_eq!(s.working_dir(), isolated.as_path());
+    }
+
+    #[test]
+    fn sessions_without_worktree_fields_deserialize_cleanly_with_defaults() {
+        let ron_text = r#"(
+            id: 200,
+            title: "Pre-Worktree Session",
+            project_dir: "C:\\projects\\old_repo",
+            provider: Codex,
+            permission_mode: Full,
+            entries: [],
+        )"#;
+        let s: Session = ron::from_str(ron_text).expect("older sessions without worktree fields must deserialize");
+        assert_eq!(s.id, 200);
+        assert_eq!(s.worktree_dir, None);
+        assert_eq!(s.worktree_branch, None);
+        assert_eq!(s.worktree_base, None);
+        assert_eq!(s.working_dir(), Path::new(r"C:\projects\old_repo"));
+    }
+
+    #[test]
+    fn sessions_with_worktree_fields_roundtrip_and_partial_defaults() {
+        // Only worktree_dir present, branch and base missing:
+        let partial_ron = r#"(
+            id: 201,
+            title: "Partial Worktree",
+            project_dir: "C:\\projects\\repo",
+            worktree_dir: Some("C:\\projects\\repo\\.viper\\worktrees\\201"),
+            provider: Claude,
+            permission_mode: Full,
+            entries: [],
+        )"#;
+        let s: Session = ron::from_str(partial_ron).expect("partial worktree fields deserialize");
+        assert_eq!(s.worktree_dir, Some(PathBuf::from(r"C:\projects\repo\.viper\worktrees\201")));
+        assert_eq!(s.worktree_branch, None);
+        assert_eq!(s.worktree_base, None);
+        assert_eq!(s.working_dir(), Path::new(r"C:\projects\repo\.viper\worktrees\201"));
+
+        // Full worktree fields roundtrip
+        let mut full = Session::new(202, PathBuf::from(r"C:\work\alpha"), Provider::Antigravity, PermissionMode::Plan);
+        full.worktree_dir = Some(PathBuf::from(r"C:\work\alpha\.viper\worktrees\202"));
+        full.worktree_branch = Some("viper/session-202".into());
+        full.worktree_base = Some("main".into());
+
+        let ron_str = ron::to_string(&full).expect("session serializes");
+        let restored: Session = ron::from_str(&ron_str).expect("session deserializes");
+        assert_eq!(restored.worktree_dir, full.worktree_dir);
+        assert_eq!(restored.worktree_branch, full.worktree_branch);
+        assert_eq!(restored.worktree_base, full.worktree_base);
+        assert_eq!(restored.working_dir(), Path::new(r"C:\work\alpha\.viper\worktrees\202"));
+    }
+
+    #[test]
+    fn session_extracts_previewable_artifacts_from_working_dir() {
+        let mut s = Session::new(301, PathBuf::from(r"C:\work\app"), Provider::Claude, PermissionMode::Full);
+        s.entries.push(Entry::Tool {
+            name: "write_to_file".into(),
+            detail: "preview.html".into(),
+            edit: None,
+        });
+        s.entries.push(Entry::Tool {
+            name: "Edit".into(),
+            detail: "update svg".into(),
+            edit: Some(FileEdit::new("logo.svg", "", "<svg></svg>")),
+        });
+
+        let artifacts = s.previewable_artifacts();
+        assert_eq!(artifacts.len(), 2);
+        assert_eq!(artifacts[0], PathBuf::from(r"C:\work\app\logo.svg"));
+        assert_eq!(artifacts[1], PathBuf::from(r"C:\work\app\preview.html"));
+    }
+
+    #[test]
+    fn sessions_without_auto_refresh_deserialize_cleanly_with_defaults() {
+        let legacy_ron = r#"(
+            id: 302,
+            title: "Legacy Browser Session",
+            project_dir: "C:\\work\\app",
+            provider: Codex,
+            permission_mode: Plan,
+            entries: [],
+            browser: (
+                address: "http://localhost:5173",
+                viewport: Desktop,
+                custom_size: (1280, 800),
+            ),
+        )"#;
+        let s: Session = ron::from_str(legacy_ron).expect("legacy session without auto_refresh must deserialize");
+        assert_eq!(s.id, 302);
+        assert_eq!(s.browser.address, "http://localhost:5173");
+        assert!(s.browser.auto_refresh, "older session without auto_refresh defaults to true");
+
+        // Even older session with no browser field at all
+        let bare_ron = r#"(
+            id: 303,
+            title: "Bare Session",
+            project_dir: "C:\\work\\bare",
+            provider: Claude,
+            permission_mode: ReadOnly,
+            entries: [],
+        )"#;
+        let bare: Session = ron::from_str(bare_ron).expect("bare session must deserialize");
+        assert!(bare.browser.auto_refresh);
+    }
+
+    #[test]
+    fn session_with_explicit_auto_refresh_false_roundtrips_through_ron() {
+        let mut s = Session::new(304, PathBuf::from(r"C:\work\roundtrip"), Provider::Antigravity, PermissionMode::Full);
+        s.browser.auto_refresh = false;
+        s.browser.address = "file:///C:/work/roundtrip/index.html".into();
+        s.worktree_dir = Some(PathBuf::from(r"C:\work\roundtrip\.viper\worktrees\304"));
+        s.worktree_branch = Some("viper/session-304".into());
+        s.worktree_base = Some("main".into());
+
+        let ron_str = ron::to_string(&s).expect("session with auto_refresh=false serializes");
+        let restored: Session = ron::from_str(&ron_str).expect("session with auto_refresh=false deserializes");
+        assert!(!restored.browser.auto_refresh);
+        assert_eq!(restored.browser.address, "file:///C:/work/roundtrip/index.html");
+        assert_eq!(restored.worktree_dir, s.worktree_dir);
+        assert_eq!(restored.worktree_branch, s.worktree_branch);
+        assert_eq!(restored.worktree_base, s.worktree_base);
+    }
 }
+

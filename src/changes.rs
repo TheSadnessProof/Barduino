@@ -12,6 +12,12 @@ use crate::git_diff::{self, FileDiff, FileStatus, LineKind};
 pub enum Source {
     /// Uncommitted changes in the project folder's git repository.
     Project(PathBuf),
+    /// Branch worktree changes compared to a base ref.
+    Branch {
+        dir: PathBuf,
+        branch: String,
+        base: String,
+    },
     /// Two files chosen by the user.
     Files { old: PathBuf, new: PathBuf },
 }
@@ -35,6 +41,7 @@ impl Changes {
     pub fn title(&self) -> String {
         match &self.source {
             Source::Project(_) => "Changes".to_owned(),
+            Source::Branch { branch, .. } => format!("Changes ({branch})"),
             Source::Files { .. } => "Compare".to_owned(),
         }
     }
@@ -46,6 +53,7 @@ impl Changes {
         std::thread::spawn(move || {
             let files = match &source {
                 Source::Project(dir) => git_diff::working_tree_changes(dir),
+                Source::Branch { dir, base, .. } => git_diff::branch_changes(dir, base),
                 Source::Files { old, new } => git_diff::compare_files(old, new),
             };
             *result.lock().unwrap_or_else(PoisonError::into_inner) = Some(files);
@@ -56,7 +64,11 @@ impl Changes {
 
     /// Whether this tab shows the project in `dir`, so it should refresh after an agent works there.
     pub fn watches(&self, dir: &Path) -> bool {
-        matches!(&self.source, Source::Project(project) if project == dir)
+        match &self.source {
+            Source::Project(project) => project == dir || dir.starts_with(project),
+            Source::Branch { dir: worktree, .. } => worktree == dir || worktree.starts_with(dir),
+            Source::Files { .. } => false,
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -71,6 +83,10 @@ impl Changes {
                 Source::Project(dir) => {
                     let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                     ui.label(RichText::new(format!("Uncommitted changes in {name}")).strong())
+                        .on_hover_text(dir.display().to_string());
+                }
+                Source::Branch { dir, branch, base } => {
+                    ui.label(RichText::new(format!("Changes in {branch} vs {base}")).strong())
                         .on_hover_text(dir.display().to_string());
                 }
                 Source::Files { old, new } => {
@@ -265,4 +281,54 @@ fn diff_view(ui: &mut egui::Ui, file: &FileDiff) {
             ui.allocate_space(egui::vec2(content_width, row_height * range.len() as f32));
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn branch_source_title_and_watches_match_worktree_and_project() {
+        let wt = PathBuf::from(r"C:\work\project\.viper\worktrees\42");
+        let project = PathBuf::from(r"C:\work\project");
+        let other = PathBuf::from(r"C:\work\other");
+
+        let source = Source::Branch {
+            dir: wt.clone(),
+            branch: "viper/session-42".into(),
+            base: "main".into(),
+        };
+
+        let changes = Changes {
+            source,
+            files: None,
+            loading: None,
+            selected: None,
+        };
+
+        assert_eq!(changes.title(), "Changes (viper/session-42)");
+        assert!(changes.watches(&wt), "watches worktree path directly");
+        assert!(changes.watches(&project), "watches root project directory enclosing worktree");
+        assert!(!changes.watches(&other), "does not watch unrelated directory");
+    }
+
+    #[test]
+    fn project_source_watches_project_and_nested_paths() {
+        let project = PathBuf::from(r"C:\work\project");
+        let nested = PathBuf::from(r"C:\work\project\src");
+        let other = PathBuf::from(r"C:\work\other");
+
+        let source = Source::Project(project.clone());
+        let changes = Changes {
+            source,
+            files: None,
+            loading: None,
+            selected: None,
+        };
+
+        assert_eq!(changes.title(), "Changes");
+        assert!(changes.watches(&project));
+        assert!(changes.watches(&nested));
+        assert!(!changes.watches(&other));
+    }
 }

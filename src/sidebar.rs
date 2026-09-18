@@ -29,13 +29,16 @@ struct Summary {
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SessionState {
     Running,
+    WaitingForApproval,
     Failed,
     Idle,
 }
 
 /// Computes the operational state of a session from its running status and entries.
 pub fn session_state(session: &Session) -> SessionState {
-    if session.is_running() {
+    if session.has_pending_approval() {
+        SessionState::WaitingForApproval
+    } else if session.is_running() {
         SessionState::Running
     } else if matches!(session.entries.last(), Some(Entry::Error(_))) {
         SessionState::Failed
@@ -412,6 +415,22 @@ impl Sidebar {
                                 ui.painter().circle_filled(center, 2.8, egui::Color32::from_rgb(34, 197, 94));
                                 ui.ctx().request_repaint();
                             }
+                            SessionState::WaitingForApproval => {
+                                let (status_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                                let center = status_rect.center();
+                                let time = ui.input(|i| i.time);
+                                let pulse = (time * 4.0).sin() as f32 * 0.5 + 0.5;
+                                let outer_r = 3.0 + pulse * 2.0;
+                                let alpha = ((1.0 - pulse) * 120.0) as u8;
+                                ui.painter().circle_filled(
+                                    center,
+                                    outer_r,
+                                    egui::Color32::from_rgba_unmultiplied(214, 158, 46, alpha),
+                                );
+                                ui.painter().circle_filled(center, 2.8, egui::Color32::from_rgb(214, 158, 46));
+                                ui.ctx().request_repaint();
+                            }
                             SessionState::Failed => {
                                 let (status_rect, _) =
                                     ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
@@ -775,6 +794,19 @@ mod tests {
 
         s.entries.push(Entry::Error("failed to run".into()));
         assert_eq!(session_state(&s), SessionState::Failed);
+    }
+
+    #[test]
+    fn session_state_reflects_waiting_for_approval_and_returns_to_idle() {
+        use crate::agent::{ApprovalDecision, ApprovalRequest};
+        let mut s = session(1, "a");
+        assert_eq!(session_state(&s), SessionState::Idle);
+
+        s.entries.push(Entry::Approval(ApprovalRequest::new("req-1", "bash", "ls", None)));
+        assert_eq!(session_state(&s), SessionState::WaitingForApproval);
+
+        assert!(s.resolve_approval("req-1", ApprovalDecision::Approved));
+        assert_eq!(session_state(&s), SessionState::Idle);
     }
 
     #[test]

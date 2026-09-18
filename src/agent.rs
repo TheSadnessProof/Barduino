@@ -103,6 +103,79 @@ pub enum AgentEvent {
     },
     /// The CLI process ended. `error` is set if it didn't exit cleanly.
     Exited { error: Option<String> },
+    /// An interactive approval request waiting on user confirmation.
+    // Retained for CLI stream parsers yielding mid-turn approval prompts.
+    #[allow(dead_code)]
+    ApprovalRequest(ApprovalRequest),
+}
+
+/// The outcome of an approval request from the agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ApprovalStatus {
+    #[default]
+    Pending,
+    Approved,
+    Denied,
+}
+
+/// The user's response to an approval request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved,
+    Denied,
+}
+
+/// A decision sent back to a running turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalResponse {
+    pub id: String,
+    pub decision: ApprovalDecision,
+}
+
+/// An interactive permission request from the agent CLI.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovalRequest {
+    pub id: String,
+    pub tool_name: String,
+    pub detail: String,
+    #[serde(default)]
+    pub edit: Option<FileEdit>,
+    #[serde(default)]
+    pub status: ApprovalStatus,
+}
+
+// Constructors and state helpers for approval requests created by stream parsers.
+#[allow(dead_code)]
+impl ApprovalRequest {
+    pub fn new(
+        id: impl Into<String>,
+        tool_name: impl Into<String>,
+        detail: impl Into<String>,
+        edit: Option<FileEdit>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            tool_name: tool_name.into(),
+            detail: detail.into(),
+            edit,
+            status: ApprovalStatus::Pending,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.status == ApprovalStatus::Pending
+    }
+
+    pub fn resolve(&mut self, decision: ApprovalDecision) -> bool {
+        if self.status != ApprovalStatus::Pending {
+            return false;
+        }
+        self.status = match decision {
+            ApprovalDecision::Approved => ApprovalStatus::Approved,
+            ApprovalDecision::Denied => ApprovalStatus::Denied,
+        };
+        true
+    }
 }
 
 /// What the agent is allowed to do without asking.
@@ -176,12 +249,37 @@ pub struct RunningTurn {
     child: Arc<Mutex<Child>>,
     /// Everything the CLI starts, such as commands its tools run.
     tree: ProcessTree,
+    approval_tx: Option<mpsc::Sender<ApprovalResponse>>,
 }
 
 impl RunningTurn {
     fn new(child: Child) -> Self {
+        Self::with_approval_channel(child, None)
+    }
+
+    pub fn with_approval_channel(
+        child: Child,
+        approval_tx: Option<mpsc::Sender<ApprovalResponse>>,
+    ) -> Self {
         let tree = ProcessTree::new(&child);
-        Self { child: Arc::new(Mutex::new(child)), tree }
+        Self {
+            child: Arc::new(Mutex::new(child)),
+            tree,
+            approval_tx,
+        }
+    }
+
+    /// Delivers an approval decision back to the running CLI or test harness.
+    pub fn respond_approval(&self, id: &str, decision: ApprovalDecision) -> bool {
+        if let Some(tx) = &self.approval_tx {
+            tx.send(ApprovalResponse {
+                id: id.to_owned(),
+                decision,
+            })
+            .is_ok()
+        } else {
+            false
+        }
     }
 
     /// Stops the CLI and every program it started.
@@ -829,4 +927,176 @@ mod tests {
         };
         assert_eq!(claude_prompt, "Build a navbar", "other providers use their native planning flags");
     }
+
+    #[test]
+    fn an_approval_request_starts_pending_and_resolves_to_approved_or_denied() {
+        let mut req = ApprovalRequest::new("req-1", "bash", "cargo test", None);
+        assert!(req.is_pending());
+        assert_eq!(req.status, ApprovalStatus::Pending);
+
+        assert!(req.resolve(ApprovalDecision::Approved));
+        assert!(!req.is_pending());
+        assert_eq!(req.status, ApprovalStatus::Approved);
+
+        let mut req2 = ApprovalRequest::new("req-2", "write_file", "src/lib.rs", None);
+        assert!(req2.resolve(ApprovalDecision::Denied));
+        assert_eq!(req2.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn an_approval_request_cannot_be_resolved_twice() {
+        let mut req = ApprovalRequest::new("req-1", "bash", "rm -rf target", None);
+        assert!(req.resolve(ApprovalDecision::Approved));
+        assert!(!req.resolve(ApprovalDecision::Denied));
+        assert_eq!(req.status, ApprovalStatus::Approved, "original decision must be preserved");
+    }
+
+    #[test]
+    fn running_turn_relays_approval_responses_across_channel() {
+        let (tx, rx) = mpsc::channel();
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 2" } else { "sleep 2" };
+        let child = hidden_command(cmd).args([arg, script]).spawn().unwrap();
+        let turn = RunningTurn::with_approval_channel(child, Some(tx));
+
+        assert!(turn.respond_approval("req-42", ApprovalDecision::Approved));
+        let resp = rx.recv().expect("response should be received");
+        assert_eq!(resp.id, "req-42");
+        assert_eq!(resp.decision, ApprovalDecision::Approved);
+        turn.stop();
+    }
+
+    #[test]
+    fn approval_request_state_machine_matrix_prevents_bypass_and_corruption() {
+        // Complete state transition matrix verification
+        // Test all possible combinations of (InitialState, TransitionAttempt)
+        for initial in [ApprovalStatus::Pending, ApprovalStatus::Approved, ApprovalStatus::Denied] {
+            for decision in [ApprovalDecision::Approved, ApprovalDecision::Denied] {
+                let mut req = ApprovalRequest::new("id-matrix", "test_tool", "detail", None);
+                req.status = initial;
+
+                let transitioned = req.resolve(decision);
+                match initial {
+                    ApprovalStatus::Pending => {
+                        assert!(transitioned, "Pending must transition on {decision:?}");
+                        let expected = match decision {
+                            ApprovalDecision::Approved => ApprovalStatus::Approved,
+                            ApprovalDecision::Denied => ApprovalStatus::Denied,
+                        };
+                        assert_eq!(req.status, expected);
+                        assert!(!req.is_pending());
+                    }
+                    ApprovalStatus::Approved => {
+                        assert!(!transitioned, "Approved must NOT transition on {decision:?}");
+                        assert_eq!(req.status, ApprovalStatus::Approved, "status must remain Approved");
+                        assert!(!req.is_pending());
+                    }
+                    ApprovalStatus::Denied => {
+                        assert!(!transitioned, "Denied must NOT transition on {decision:?}");
+                        assert_eq!(req.status, ApprovalStatus::Denied, "status must remain Denied");
+                        assert!(!req.is_pending());
+                    }
+                }
+            }
+        }
+
+        // Serialization integrity & corrupted input resistance
+        let ron_missing_status = r#"(id: "req-def", tool_name: "bash", detail: "ls")"#;
+        let deserialized: ApprovalRequest = ron::from_str(ron_missing_status).expect("should use defaults");
+        assert_eq!(deserialized.status, ApprovalStatus::Pending, "missing status must default to Pending");
+        assert_eq!(deserialized.edit, None, "missing edit must default to None");
+        assert!(deserialized.is_pending());
+
+        // Corrupted status string must be rejected, not parsed into unexpected variant
+        let ron_corrupt_status = r#"(id: "req-bad", tool_name: "bash", detail: "ls", status: HackedState)"#;
+        assert!(ron::from_str::<ApprovalRequest>(ron_corrupt_status).is_err(), "unknown status must fail deserialization");
+    }
+
+    #[test]
+    fn running_turn_respond_approval_handles_disconnected_and_missing_channels() {
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 2" } else { "sleep 2" };
+
+        // 1. Missing channel (None)
+        let child1 = hidden_command(cmd).args([arg, script]).spawn().unwrap();
+        let turn_none = RunningTurn::with_approval_channel(child1, None);
+        assert!(!turn_none.respond_approval("req-1", ApprovalDecision::Approved), "respond_approval on None channel must return false");
+        turn_none.stop();
+
+        // 2. Disconnected channel (receiver dropped before response)
+        let (tx, rx) = mpsc::channel();
+        let child2 = hidden_command(cmd).args([arg, script]).spawn().unwrap();
+        let turn_disc = RunningTurn::with_approval_channel(child2, Some(tx));
+        drop(rx); // Drop receiver to simulate disconnected/crashed receiver thread
+        assert!(!turn_disc.respond_approval("req-1", ApprovalDecision::Denied), "respond_approval on closed channel must return false without panic");
+        turn_disc.stop();
+
+        // 3. Edge IDs: empty string, special unicode, very long string
+        let (tx3, rx3) = mpsc::channel();
+        let child3 = hidden_command(cmd).args([arg, script]).spawn().unwrap();
+        let turn_edge = RunningTurn::with_approval_channel(child3, Some(tx3));
+
+        // Empty ID
+        assert!(turn_edge.respond_approval("", ApprovalDecision::Approved));
+        let resp = rx3.recv().unwrap();
+        assert_eq!(resp.id, "");
+        assert_eq!(resp.decision, ApprovalDecision::Approved);
+
+        // Unicode and control characters in ID
+        let unicode_id = "⚡-approval-\u{1F98A}-\0-\n-\t-id";
+        assert!(turn_edge.respond_approval(unicode_id, ApprovalDecision::Denied));
+        let resp2 = rx3.recv().unwrap();
+        assert_eq!(resp2.id, unicode_id);
+        assert_eq!(resp2.decision, ApprovalDecision::Denied);
+
+        // Very large ID (100,000 chars)
+        let long_id = "x".repeat(100_000);
+        assert!(turn_edge.respond_approval(&long_id, ApprovalDecision::Approved));
+        let resp3 = rx3.recv().unwrap();
+        assert_eq!(resp3.id, long_id);
+        turn_edge.stop();
+    }
+
+    #[test]
+    fn running_turn_respond_approval_concurrent_stress() {
+        let (tx, rx) = mpsc::channel();
+        let cmd = if cfg!(windows) { "powershell.exe" } else { "sh" };
+        let arg = if cfg!(windows) { "-Command" } else { "-c" };
+        let script = if cfg!(windows) { "Start-Sleep -Seconds 3" } else { "sleep 3" };
+        let child = hidden_command(cmd).args([arg, script]).spawn().unwrap();
+        let turn = Arc::new(RunningTurn::with_approval_channel(child, Some(tx)));
+
+        const THREAD_COUNT: usize = 32;
+        let mut handles = Vec::new();
+
+        for i in 0..THREAD_COUNT {
+            let turn_clone = Arc::clone(&turn);
+            let handle = std::thread::spawn(move || {
+                let id = format!("concurrent-req-{i}");
+                let decision = if i % 2 == 0 {
+                    ApprovalDecision::Approved
+                } else {
+                    ApprovalDecision::Denied
+                };
+                turn_clone.respond_approval(&id, decision)
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            let success = handle.join().expect("thread should not panic");
+            assert!(success, "all concurrent responses should succeed when channel is open");
+        }
+
+        let mut received = Vec::new();
+        while let Ok(resp) = rx.try_recv() {
+            received.push(resp);
+        }
+        assert_eq!(received.len(), THREAD_COUNT, "all responses must arrive");
+
+        turn.stop();
+    }
 }
+

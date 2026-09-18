@@ -113,11 +113,36 @@ impl Tools {
 
     /// Shows the uncommitted changes in `dir`, reusing a tab that already does.
     pub fn open_changes(&mut self, dir: &Path, ctx: &egui::Context) {
-        let existing = self.tabs.iter().position(|tab| matches!(tab, Tab::Changes(changes) if changes.watches(dir)));
+        let existing = self.tabs.iter().position(|tab| match tab {
+            Tab::Changes(changes) => matches!(&changes.source, Source::Project(p) if p == dir),
+            _ => false,
+        });
         match existing {
             Some(index) => self.active = index,
             None => {
                 self.tabs.push(Tab::Changes(Changes::new(Source::Project(dir.to_owned()), ctx)));
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// Shows branch changes in `dir` compared to `base`, reusing a tab that already watches it.
+    pub fn open_branch_changes(&mut self, dir: &Path, branch: &str, base: &str, ctx: &egui::Context) {
+        let existing = self.tabs.iter().position(|tab| match tab {
+            Tab::Changes(changes) => matches!(&changes.source, Source::Branch { dir: d, branch: b, .. } if d == dir && b == branch),
+            _ => false,
+        });
+        match existing {
+            Some(index) => self.active = index,
+            None => {
+                self.tabs.push(Tab::Changes(Changes::new(
+                    Source::Branch {
+                        dir: dir.to_owned(),
+                        branch: branch.to_owned(),
+                        base: base.to_owned(),
+                    },
+                    ctx,
+                )));
                 self.active = self.tabs.len() - 1;
             }
         }
@@ -141,6 +166,49 @@ impl Tools {
             {
                 changes.refresh(ctx);
             }
+        }
+    }
+
+    /// Mounts a web artifact preview URL in the browser: reusing an existing browser
+    /// tab if open, or creating a new browser tab. Activates the tab.
+    pub fn mount_preview(&mut self, url: &str, _reload_if_loaded: bool) {
+        let normalized = crate::browser::normalize_url(url);
+        if let Some(index) = self.tabs.iter().position(|tab| matches!(tab, Tab::Browser { .. })) {
+            if let Tab::Browser { state, .. } = &mut self.tabs[index] {
+                state.address = normalized;
+            }
+            self.active = index;
+        } else {
+            let number = self.next_browser_number;
+            self.next_browser_number += 1;
+            let mut state = self.browser_states().last().cloned().unwrap_or_default();
+            state.address = normalized;
+            self.tabs.push(Tab::Browser { number, state });
+            self.active = self.tabs.len() - 1;
+        }
+    }
+
+    /// The URL currently shown in the frontmost tab, if that tab is a browser.
+    pub fn active_browser_url(&self) -> Option<&str> {
+        match self.tabs.get(self.active) {
+            Some(Tab::Browser { state, .. }) => Some(&state.address),
+            _ => None,
+        }
+    }
+
+    /// Whether the frontmost tab is a browser with auto-refresh enabled.
+    pub fn active_browser_auto_refresh(&self) -> bool {
+        match self.tabs.get(self.active) {
+            Some(Tab::Browser { state, .. }) => state.auto_refresh,
+            _ => false,
+        }
+    }
+
+    /// Sets auto-refresh on the active browser tab.
+    #[cfg(test)]
+    pub fn set_active_browser_auto_refresh(&mut self, enabled: bool) {
+        if let Some(Tab::Browser { state, .. }) = self.tabs.get_mut(self.active) {
+            state.auto_refresh = enabled;
         }
     }
 
@@ -238,6 +306,9 @@ impl Tools {
                     Tab::Changes(changes) => {
                         let hover = match &changes.source {
                             Source::Project(dir) => format!("Uncommitted changes in {}", dir.display()),
+                            Source::Branch { dir, branch, base } => {
+                                format!("Changes in {branch} vs {base}\n{}", dir.display())
+                            }
                             Source::Files { old, new } => format!("{}\n→ {}", old.display(), new.display()),
                         };
                         (changes.title(), hover)
@@ -498,4 +569,169 @@ mod tests {
             .collect();
         assert_eq!(numbers, [1, 1]);
     }
+
+    #[test]
+    fn open_branch_changes_creates_branch_tab_and_reuses_it() {
+        let mut tools = Tools::default();
+        let ctx = egui::Context::default();
+        let wt = Path::new(r"C:\work\project\.viper\worktrees\1");
+
+        tools.open_branch_changes(wt, "viper/session-1", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Reopening reuses existing tab rather than creating duplicate
+        tools.open_branch_changes(wt, "viper/session-1", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+    }
+
+    #[test]
+    fn mounting_preview_opens_or_switches_to_browser_tab() {
+        let mut tools = Tools::default();
+        assert_eq!(tools.active_browser_url(), None);
+
+        // Mounting a preview opens a new browser tab
+        tools.mount_preview("file:///C:/test/index.html", true);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+        assert_eq!(tools.active_browser_url(), Some("file:///C:/test/index.html"));
+        assert!(tools.active_browser_auto_refresh());
+
+        // Opening a terminal makes it active
+        tools.open_terminal(Path::new("."), None);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 1);
+        assert_eq!(tools.active_browser_url(), None);
+
+        // Mounting another preview switches back to the existing browser tab and updates URL
+        tools.mount_preview("file:///C:/test/about.html", true);
+        assert_eq!(tools.tabs.len(), 2, "reuses existing browser tab without creating another");
+        assert_eq!(tools.active, 0);
+        assert_eq!(tools.active_browser_url(), Some("file:///C:/test/about.html"));
+    }
+
+    #[test]
+    fn project_changes_and_branch_changes_do_not_collide() {
+        let mut tools = Tools::default();
+        let ctx = egui::Context::default();
+        let project_dir = Path::new(r"C:\work\project");
+        let wt = Path::new(r"C:\work\project\.viper\worktrees\1");
+
+        tools.open_changes(project_dir, &ctx);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Opening branch changes opens a separate tab
+        tools.open_branch_changes(wt, "viper/session-1", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 1);
+
+        // Reopening project changes switches back to tab 0 rather than creating a third tab
+        tools.open_changes(project_dir, &ctx);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 0);
+    }
+
+    #[test]
+    fn mounting_preview_preserves_viewport_and_size_while_updating_address() {
+        let mut tools = Tools::default();
+        tools.mount_preview("file:///C:/test/first.html", true);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Customize viewport, size, and auto_refresh
+        if let Tab::Browser { state, .. } = &mut tools.tabs[0] {
+            state.viewport = crate::browser::Viewport::Fixed;
+            state.size = [800, 600];
+            state.auto_refresh = false;
+        }
+
+        // Mount new preview URL
+        tools.mount_preview("file:///C:/test/second.html", true);
+        assert_eq!(tools.tabs.len(), 1, "reuses existing browser tab");
+        assert_eq!(tools.active, 0);
+        assert_eq!(tools.active_browser_url(), Some("file:///C:/test/second.html"));
+        assert!(!tools.active_browser_auto_refresh(), "custom auto_refresh setting preserved");
+
+        if let Tab::Browser { state, .. } = &tools.tabs[0] {
+            assert_eq!(state.viewport, crate::browser::Viewport::Fixed);
+            assert_eq!(state.size, [800, 600]);
+        } else {
+            panic!("tab 0 must be a browser");
+        }
+    }
+
+    #[test]
+    fn mounting_preview_normalizes_raw_windows_path_and_reuses_tab_among_mixed_tabs() {
+        let mut tools = Tools::default();
+        let ctx = egui::Context::default();
+        tools.open_terminal(Path::new("."), None);
+        tools.open_changes(Path::new(r"C:\work\project"), &ctx);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 1);
+
+        // Mount preview with raw Windows path containing spaces and special characters
+        tools.mount_preview(r"C:\work\my app\page #1.html", true);
+        assert_eq!(tools.tabs.len(), 3);
+        assert_eq!(tools.active, 2);
+        assert_eq!(tools.active_browser_url(), Some("file:///C:/work/my%20app/page%20%231.html"));
+
+        // Switch to terminal tab
+        tools.active = 0;
+        assert_eq!(tools.active_browser_url(), None);
+        assert!(!tools.active_browser_auto_refresh());
+
+        // Mount another preview with file:// URL
+        tools.mount_preview("file:///C:/work/my%20app/about.html", true);
+        assert_eq!(tools.tabs.len(), 3, "does not duplicate browser tab among mixed tabs");
+        assert_eq!(tools.active, 2, "switches active back to the browser tab");
+        assert_eq!(tools.active_browser_url(), Some("file:///C:/work/my%20app/about.html"));
+    }
+
+    #[test]
+    fn multiple_branch_changes_and_project_changes_tabs_coexist_without_collision() {
+        let mut tools = Tools::default();
+        let ctx = egui::Context::default();
+        let project_a = Path::new(r"C:\work\project_a");
+        let project_b = Path::new(r"C:\work\project_b");
+        let wt_1 = Path::new(r"C:\work\project_a\.viper\worktrees\1");
+        let wt_2 = Path::new(r"C:\work\project_a\.viper\worktrees\2");
+
+        // Open project changes for project A
+        tools.open_changes(project_a, &ctx);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Open branch changes for worktree 1 (branch 1)
+        tools.open_branch_changes(wt_1, "viper/session-1", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 1);
+
+        // Open branch changes for worktree 2 (branch 2)
+        tools.open_branch_changes(wt_2, "viper/session-2", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 3);
+        assert_eq!(tools.active, 2);
+
+        // Open project changes for project B
+        tools.open_changes(project_b, &ctx);
+        assert_eq!(tools.tabs.len(), 4);
+        assert_eq!(tools.active, 3);
+
+        // Reopen worktree 1 branch changes: must reuse tab 1
+        tools.open_branch_changes(wt_1, "viper/session-1", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 4, "reuses existing branch tab 1");
+        assert_eq!(tools.active, 1);
+
+        // Reopen project A changes: must reuse tab 0
+        tools.open_changes(project_a, &ctx);
+        assert_eq!(tools.tabs.len(), 4, "reuses existing project tab 0");
+        assert_eq!(tools.active, 0);
+
+        // Reopen worktree 2 branch changes: must reuse tab 2
+        tools.open_branch_changes(wt_2, "viper/session-2", "main", &ctx);
+        assert_eq!(tools.tabs.len(), 4, "reuses existing branch tab 2");
+        assert_eq!(tools.active, 2);
+    }
 }
+

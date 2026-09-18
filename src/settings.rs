@@ -132,6 +132,16 @@ impl Detected {
     }
 }
 
+impl Default for Detected {
+    fn default() -> Self {
+        Self(Provider::ALL.map(|_| Installed {
+            exe: None,
+            custom: false,
+            version: Arc::new(Mutex::new(None)),
+        }))
+    }
+}
+
 /// Runs `<exe> --version` and keeps the first line, e.g. "2.1.271 (Claude Code)".
 fn read_version(exe: &Path) -> Option<String> {
     let output = hidden_command(exe).arg("--version").output().ok()?;

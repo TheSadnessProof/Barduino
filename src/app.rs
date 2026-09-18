@@ -4,13 +4,14 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentEvent, PermissionMode, Provider};
+use crate::agent::{AgentEvent, ApprovalDecision, PermissionMode, Provider};
 use crate::browser::{Browser, BrowserState};
 use crate::chat::{self, ComposerAction};
 use crate::commands::SlashAction;
 use crate::icons::{self, Icon};
 use crate::models::Catalog;
 use crate::plan::{self, PlanUsage};
+use crate::preview;
 use crate::session::Session;
 use crate::settings::{Detected, PageContext, Settings, SettingsAction, SettingsPage};
 use crate::sidebar::{Sidebar, SidebarAction};
@@ -237,6 +238,31 @@ impl ViperApp {
         app
     }
 
+    #[cfg(test)]
+    fn test_app(state: SavedState) -> Self {
+        let (events_tx, events_rx) = mpsc::channel();
+        Self {
+            detected: Detected::default(),
+            state,
+            view: View::Chat,
+            settings_page: SettingsPage::default(),
+            sidebar: Sidebar::default(),
+            tools: std::collections::BTreeMap::new(),
+            browser: Browser::default(),
+            shells: Vec::new(),
+            markdown: egui_commonmark::CommonMarkCache::default(),
+            models: Catalog::default(),
+            checked_free_plans: true,
+            plan_checks: plan::Checks::default(),
+            plan_errors: std::collections::BTreeMap::new(),
+            plan_from_disk: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            forget_panel_width: false,
+            notice: None,
+            events_tx,
+            events_rx,
+        }
+    }
+
     fn active_index(&self) -> usize {
         let id = self.state.active_session;
         self.state.sessions.iter().position(|s| s.id == id).unwrap_or(0)
@@ -247,7 +273,7 @@ impl ViperApp {
     fn tool_cwd(&self) -> PathBuf {
         let session = &self.state.sessions[self.active_index()];
         if session.has_folder() {
-            session.project_dir.clone()
+            session.working_dir().to_path_buf()
         } else {
             std::env::current_dir().unwrap_or_default()
         }
@@ -273,12 +299,42 @@ impl ViperApp {
         self.view = View::Chat;
     }
 
+    /// Sets up an isolated git worktree for a session, checking out a dedicated branch.
+    // Public session setup API for worktree isolation.
+    #[allow(dead_code)]
+    pub fn setup_session_worktree(&mut self, session_id: u64, base_ref: Option<&str>) -> Result<PathBuf, String> {
+        let session = self
+            .state
+            .sessions
+            .iter_mut()
+            .find(|s| s.id == session_id)
+            .ok_or_else(|| format!("Session {session_id} not found."))?;
+
+        if !session.has_folder() {
+            return Err("Session has no project folder configured.".to_owned());
+        }
+
+        let (path, branch) =
+            crate::worktree::create_worktree(&session.project_dir, session_id, None, base_ref)?;
+        session.worktree_dir = Some(path.clone());
+        session.worktree_branch = Some(branch);
+        session.worktree_base = Some(base_ref.unwrap_or("HEAD").to_owned());
+        Ok(path)
+    }
+
     fn delete_session(&mut self, id: u64) {
         let Some(index) = self.state.sessions.iter().position(|s| s.id == id) else { return };
         // Dropping the session stops its agent if it's still working, and dropping
         // its panel stops any shell it had open.
         let removed = self.state.sessions.remove(index);
         self.tools.remove(&id);
+
+        if let Some(ref path) = removed.worktree_dir {
+            let _ = crate::worktree::remove_worktree(&removed.project_dir, path, true);
+            if let Some(ref branch) = removed.worktree_branch {
+                let _ = crate::worktree::delete_branch(&removed.project_dir, branch, true);
+            }
+        }
 
         if self.state.sessions.is_empty() {
             self.new_session(removed.project_dir, removed.permission_mode);
@@ -387,7 +443,21 @@ impl ViperApp {
                 self.new_session(dir, permission_mode);
             }
             SidebarAction::OpenChanges(dir) => {
-                self.active_tools().open_changes(&dir, ctx);
+                let branch_info = {
+                    let session = &self.state.sessions[self.active_index()];
+                    if (session.project_dir == dir || session.worktree_dir.as_ref().is_some_and(|wt| wt.starts_with(&dir)))
+                        && let (Some(wt_dir), Some(branch)) = (&session.worktree_dir, &session.worktree_branch)
+                    {
+                        Some((wt_dir.clone(), branch.clone(), session.worktree_base.clone().unwrap_or_else(|| "HEAD".to_owned())))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((wt_dir, branch, base)) = branch_info {
+                    self.active_tools().open_branch_changes(&wt_dir, &branch, &base, ctx);
+                } else {
+                    self.active_tools().open_changes(&dir, ctx);
+                }
                 self.state.show_tools = true;
             }
         }
@@ -503,6 +573,23 @@ impl ViperApp {
                     session.chosen_model = None;
                     session.effort = None;
                 }
+            }
+            chat::ConversationAction::Approve(id) => {
+                let session = self.active_session_mut();
+                session.resolve_approval(&id, ApprovalDecision::Approved);
+                ui.ctx().request_repaint();
+            }
+            chat::ConversationAction::Deny(id) => {
+                let session = self.active_session_mut();
+                session.resolve_approval(&id, ApprovalDecision::Denied);
+                ui.ctx().request_repaint();
+            }
+            chat::ConversationAction::Preview(path) => {
+                let url = preview::path_to_file_url(&path);
+                self.active_tools().mount_preview(&url, true);
+                self.browser.reload();
+                self.state.show_tools = true;
+                ui.ctx().request_repaint();
             }
             chat::ConversationAction::None => {}
         }
@@ -657,6 +744,49 @@ impl ViperApp {
             ToolsAction::None => {}
         }
     }
+
+    /// Pulls finished turns and events from background agent threads.
+    fn poll_events(&mut self, ctx: &egui::Context) {
+        while let Ok((id, event)) = self.events_rx.try_recv() {
+            // Events for a deleted session are dropped.
+            if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
+                if let AgentEvent::Plan(plan) = &event {
+                    self.state.plan.insert(session.provider, plan.clone());
+                }
+                if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
+                    self.state.usage.record(session.provider, *usage);
+                    // Kept per session as well as in the daily totals, because its
+                    // input side is what the composer shows as the context so far.
+                    session.last_usage = Some(*usage);
+                }
+                // The agent may have edited files, so any diff of its folder is out of date.
+                if let AgentEvent::Exited { .. } = &event {
+                    for panel in self.tools.values_mut() {
+                        panel.refresh_changes(session.working_dir(), ctx);
+                        if session.worktree_dir.is_some() {
+                            panel.refresh_changes(&session.project_dir, ctx);
+                        }
+                    }
+                    // The project heading's changed count is out of date too.
+                    self.sidebar.invalidate(&session.project_dir);
+
+                    // Check if active browser tab is displaying a file:// URL inside the session folder.
+                    if let Some(panel) = self.tools.get(&id)
+                        && panel.active_browser_auto_refresh()
+                        && let Some(url) = panel.active_browser_url()
+                        && let Some(path) = preview::file_url_to_path(url)
+                    {
+                        let is_artifact = session.previewable_artifacts().contains(&path);
+                        if is_artifact || path.starts_with(session.working_dir()) || path.starts_with(&session.project_dir) {
+                            self.browser.reload();
+                            ctx.request_repaint();
+                        }
+                    }
+                }
+                session.handle_event(event);
+            }
+        }
+    }
 }
 
 impl eframe::App for ViperApp {
@@ -680,29 +810,7 @@ impl eframe::App for ViperApp {
         if let Some(found) = self.plan_from_disk.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             self.state.plan.extend(found);
         }
-        while let Ok((id, event)) = self.events_rx.try_recv() {
-            // Events for a deleted session are dropped.
-            if let Some(session) = self.state.sessions.iter_mut().find(|s| s.id == id) {
-                if let AgentEvent::Plan(plan) = &event {
-                    self.state.plan.insert(session.provider, plan.clone());
-                }
-                if let AgentEvent::Finished { usage: Some(usage), .. } = &event {
-                    self.state.usage.record(session.provider, *usage);
-                    // Kept per session as well as in the daily totals, because its
-                    // input side is what the composer shows as the context so far.
-                    session.last_usage = Some(*usage);
-                }
-                // The agent may have edited files, so any diff of its folder is out of date.
-                if let AgentEvent::Exited { .. } = &event {
-                    for panel in self.tools.values_mut() {
-                        panel.refresh_changes(&session.project_dir, ctx);
-                    }
-                    // The project heading's changed count is out of date too.
-                    self.sidebar.invalidate(&session.project_dir);
-                }
-                session.handle_event(event);
-            }
-        }
+        self.poll_events(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -866,4 +974,444 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp);
     }
+
+    #[test]
+    fn saved_state_with_interactive_approvals_and_legacy_sessions_survives_ron_round_trip() {
+        use crate::agent::{ApprovalDecision, ApprovalRequest, ApprovalStatus};
+        use crate::line_diff::FileEdit;
+        use crate::session::Entry;
+
+        let mut state = populated_state();
+        let mut session_with_approvals = Session::new(8, PathBuf::from(r"C:\work\beta"), Provider::Claude, PermissionMode::ReadOnly);
+        session_with_approvals.title = "Approval session".into();
+
+        // 1. Pending approval with diff
+        let edit = FileEdit::new("src/main.rs", "fn main() {}\n", "fn main() {\n    println!(\"hi\");\n}\n");
+        let req1 = ApprovalRequest::new("req-p1", "write_file", "src/main.rs", Some(edit));
+        session_with_approvals.entries.push(Entry::Approval(req1));
+
+        // 2. Approved approval without diff
+        let mut req2 = ApprovalRequest::new("req-a2", "bash", "cargo build", None);
+        req2.resolve(ApprovalDecision::Approved);
+        session_with_approvals.entries.push(Entry::Approval(req2));
+
+        // 3. Denied approval
+        let mut req3 = ApprovalRequest::new("req-d3", "bash", "rm -rf .", None);
+        req3.resolve(ApprovalDecision::Denied);
+        session_with_approvals.entries.push(Entry::Approval(req3));
+
+        state.sessions.push(session_with_approvals);
+        state.next_session_id = 9;
+
+        let saved = ron::to_string(&state).expect("state with approvals must serialize to RON");
+        let restored: SavedState = ron::from_str(&saved).expect("state with approvals must deserialize from RON");
+
+        assert_eq!(restored.sessions.len(), 2);
+        let app_session = &restored.sessions[1];
+        assert_eq!(app_session.id, 8);
+        assert_eq!(app_session.entries.len(), 3);
+        assert!(app_session.has_pending_approval());
+
+        let Entry::Approval(r1) = &app_session.entries[0] else { panic!("expected approval") };
+        assert_eq!(r1.id, "req-p1");
+        assert_eq!(r1.status, ApprovalStatus::Pending);
+        assert!(r1.edit.is_some());
+
+        let Entry::Approval(r2) = &app_session.entries[1] else { panic!("expected approval") };
+        assert_eq!(r2.id, "req-a2");
+        assert_eq!(r2.status, ApprovalStatus::Approved);
+
+        let Entry::Approval(r3) = &app_session.entries[2] else { panic!("expected approval") };
+        assert_eq!(r3.id, "req-d3");
+        assert_eq!(r3.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn session_with_worktree_fields_serializes_and_deserializes_in_saved_state() {
+        use std::path::Path;
+
+        let mut state = populated_state();
+        let mut session = Session::new(12, PathBuf::from(r"C:\work\gamma"), Provider::Claude, PermissionMode::Plan);
+        session.worktree_dir = Some(PathBuf::from(r"C:\work\gamma\.viper\worktrees\12"));
+        session.worktree_branch = Some("viper/session-12".into());
+        session.worktree_base = Some("main".into());
+        state.sessions.push(session);
+
+        let saved = ron::to_string(&state).expect("state with worktree fields serializes");
+        let restored: SavedState = ron::from_str(&saved).expect("state with worktree fields deserializes");
+
+        let wt_session = restored.sessions.iter().find(|s| s.id == 12).expect("session 12 found");
+        assert_eq!(wt_session.worktree_dir, Some(PathBuf::from(r"C:\work\gamma\.viper\worktrees\12")));
+        assert_eq!(wt_session.worktree_branch.as_deref(), Some("viper/session-12"));
+        assert_eq!(wt_session.worktree_base.as_deref(), Some("main"));
+        assert_eq!(wt_session.working_dir(), Path::new(r"C:\work\gamma\.viper\worktrees\12"));
+    }
+
+    #[test]
+    fn app_setup_session_worktree_and_delete_session_cleans_up_on_disk() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("viper-app-wt-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&temp_dir).expect("temp repo dir creates");
+
+        let git = crate::git_diff::git_executable().expect("git must be installed");
+        let run = |args: &[&str]| {
+            let out = crate::agent::hidden_command(&git)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "core.quotepath=false"])
+                .args(args)
+                .current_dir(&temp_dir)
+                .output()
+                .expect("git command succeeds");
+            assert!(out.status.success(), "git {:?} failed", args);
+        };
+        run(&["init", "-b", "main"]);
+        std::fs::write(temp_dir.join("root.txt"), "root repo file\n").unwrap();
+        run(&["add", "root.txt"]);
+        run(&["commit", "-m", "Initial commit"]);
+
+        let mut state = SavedState::default();
+        let session = Session::new(55, temp_dir.clone(), Provider::Claude, PermissionMode::Full);
+        state.sessions = vec![session];
+        state.active_session = 55;
+        state.next_session_id = 56;
+
+        let mut app = ViperApp::test_app(state);
+
+        // Before worktree setup: tool_cwd is root project dir
+        assert_eq!(app.tool_cwd(), temp_dir);
+
+        // Setup session worktree
+        let wt_path = app.setup_session_worktree(55, Some("main")).expect("setup worktree succeeds");
+        assert!(wt_path.exists(), "worktree path was created on disk");
+
+        // After worktree setup: tool_cwd switches to isolated worktree path
+        assert_eq!(app.tool_cwd(), wt_path);
+
+        let active_session = &app.state.sessions[0];
+        assert_eq!(active_session.worktree_dir, Some(wt_path.clone()));
+        assert_eq!(active_session.worktree_branch.as_deref(), Some("viper/session-55"));
+        assert_eq!(active_session.worktree_base.as_deref(), Some("main"));
+
+        // Delete session cleans up worktree on disk
+        app.delete_session(55);
+        assert!(!wt_path.exists(), "worktree directory was removed on session deletion");
+
+        // Verify dedicated branch was deleted from git
+        let branch_out = crate::agent::hidden_command(&git)
+            .args(["branch", "--list", "viper/session-55"])
+            .current_dir(&temp_dir)
+            .output()
+            .expect("git branch --list succeeds");
+        assert!(
+            String::from_utf8_lossy(&branch_out.stdout).trim().is_empty(),
+            "branch viper/session-55 must be deleted from git on session deletion"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn app_delete_session_cleans_up_uncommitted_and_unmerged_worktree_and_handles_already_deleted() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("viper-app-cleanup-stress-{}-{}", std::process::id(), unique));
+        std::fs::create_dir_all(&temp_dir).expect("temp repo dir creates");
+
+        let git = crate::git_diff::git_executable().expect("git must be installed");
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let out = crate::agent::hidden_command(&git)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "core.quotepath=false"])
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git command succeeds");
+            assert!(out.status.success(), "git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        run(&temp_dir, &["init", "-b", "main"]);
+        std::fs::write(temp_dir.join("root.txt"), "main branch content\n").unwrap();
+        run(&temp_dir, &["add", "root.txt"]);
+        run(&temp_dir, &["commit", "-m", "Initial commit"]);
+
+        let mut state = SavedState::default();
+        let s1 = Session::new(60, temp_dir.clone(), Provider::Claude, PermissionMode::Full);
+        let s2 = Session::new(61, temp_dir.clone(), Provider::Codex, PermissionMode::Plan);
+        state.sessions = vec![s1, s2];
+        state.active_session = 60;
+        state.next_session_id = 62;
+
+        let mut app = ViperApp::test_app(state);
+
+        // Setup worktree for s1
+        let wt1 = app.setup_session_worktree(60, Some("main")).expect("wt1 creates");
+        assert!(wt1.exists());
+
+        // Make an unmerged commit on s1's branch
+        std::fs::write(wt1.join("isolated.txt"), "feature commit\n").unwrap();
+        run(&wt1, &["add", "isolated.txt"]);
+        run(&wt1, &["commit", "-m", "Unmerged feature commit"]);
+
+        // Make uncommitted, dirty modifications in wt1
+        std::fs::write(wt1.join("isolated.txt"), "uncommitted dirty edits\n").unwrap();
+        std::fs::write(wt1.join("untracked.txt"), "untracked file\n").unwrap();
+
+        // Delete session 60: must cleanly remove worktree folder and delete unmerged branch (-D force)
+        app.delete_session(60);
+        assert!(!wt1.exists(), "worktree folder wt1 must be removed despite dirty uncommitted files");
+
+        let b60 = crate::agent::hidden_command(&git)
+            .args(["branch", "--list", "viper/session-60"])
+            .current_dir(&temp_dir)
+            .output()
+            .unwrap();
+        assert!(String::from_utf8_lossy(&b60.stdout).trim().is_empty(), "branch viper/session-60 must be deleted despite unmerged commits");
+
+        // Now test deleting a session whose worktree folder was already deleted externally
+        let wt2 = app.setup_session_worktree(61, Some("main")).expect("wt2 creates");
+        assert!(wt2.exists());
+        let _ = std::fs::remove_dir_all(&wt2); // externally removed
+        assert!(!wt2.exists());
+
+        // Deleting session 61 must not panic or crash
+        app.delete_session(61);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn app_mounts_preview_and_reloads_on_turn_exit() {
+        let s = Session::new(70, PathBuf::from(r"C:\work\demo"), Provider::Claude, PermissionMode::Full);
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 70,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        // Mount preview
+        let html_file = PathBuf::from(r"C:\work\demo\index.html");
+        let url = preview::path_to_file_url(&html_file);
+        app.active_tools().mount_preview(&url, true);
+        app.state.show_tools = true;
+
+        assert_eq!(app.active_tools().active_browser_url(), Some("file:///C:/work/demo/index.html"));
+        assert!(app.state.show_tools);
+
+        // Simulate agent turn exit
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send((70, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx;
+        app.poll_events(&ctx);
+
+        // Browser should have reload pending
+        assert!(app.browser.is_reload_pending(), "auto_refresh reloads the browser when preview file is in project");
+    }
+
+    #[test]
+    fn app_turn_exit_auto_reload_triggers_for_isolated_worktree_artifacts() {
+        let mut s = Session::new(71, PathBuf::from(r"C:\work\project"), Provider::Claude, PermissionMode::Full);
+        let wt = PathBuf::from(r"C:\work\project\.viper\worktrees\71");
+        s.worktree_dir = Some(wt.clone());
+
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 71,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        // Mount preview for file located in the worktree
+        let wt_file = wt.join("dist").join("app.html");
+        let url = preview::path_to_file_url(&wt_file);
+        app.active_tools().mount_preview(&url, true);
+
+        // Turn exit
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send((71, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx;
+        app.poll_events(&ctx);
+
+        assert!(app.browser.is_reload_pending(), "turn exit triggers reload for file in worktree");
+    }
+
+    #[test]
+    fn app_turn_exit_auto_reload_suppressed_when_auto_refresh_is_false() {
+        let s = Session::new(72, PathBuf::from(r"C:\work\demo"), Provider::Claude, PermissionMode::Full);
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 72,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        let html_file = PathBuf::from(r"C:\work\demo\index.html");
+        let url = preview::path_to_file_url(&html_file);
+        app.active_tools().mount_preview(&url, true);
+
+        // Disable auto-refresh on active browser tab
+        app.active_tools().set_active_browser_auto_refresh(false);
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send((72, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx;
+        app.poll_events(&ctx);
+
+        assert!(!app.browser.is_reload_pending(), "auto_refresh false prevents reload on turn exit");
+    }
+
+    #[test]
+    fn app_turn_exit_auto_reload_suppressed_for_external_web_and_unrelated_file_urls() {
+        let s = Session::new(73, PathBuf::from(r"C:\work\demo"), Provider::Claude, PermissionMode::Full);
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 73,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        // Mount unrelated file from a completely different directory
+        let other_file = PathBuf::from(r"D:\other_work\unrelated.html");
+        let url = preview::path_to_file_url(&other_file);
+        app.active_tools().mount_preview(&url, true);
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send((73, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx;
+        app.poll_events(&ctx);
+
+        assert!(!app.browser.is_reload_pending(), "unrelated file url does not trigger auto-reload");
+
+        // Now test external https:// URL
+        app.active_tools().mount_preview("https://example.com", true);
+        let (tx2, rx2) = mpsc::channel();
+        tx2.send((73, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx2;
+        app.poll_events(&ctx);
+
+        assert!(!app.browser.is_reload_pending(), "web https url does not trigger auto-reload");
+    }
+
+    #[test]
+    fn app_turn_exit_auto_reload_suppressed_when_active_tab_is_not_browser() {
+        let s = Session::new(74, PathBuf::from(r"C:\work\demo"), Provider::Claude, PermissionMode::Full);
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 74,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        // Mount preview first
+        let html_file = PathBuf::from(r"C:\work\demo\index.html");
+        let url = preview::path_to_file_url(&html_file);
+        app.active_tools().mount_preview(&url, true);
+        assert!(app.active_tools().active_browser_url().is_some());
+
+        // Open terminal, making terminal the active tab
+        app.active_tools().open_terminal(std::path::Path::new("."), None);
+        assert_eq!(app.active_tools().active_browser_url(), None);
+
+        let ctx = egui::Context::default();
+        let (tx, rx) = mpsc::channel();
+        tx.send((74, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx;
+        app.poll_events(&ctx);
+
+        assert!(!app.browser.is_reload_pending(), "when frontmost tab is not browser, reload is suppressed");
+    }
+
+    #[test]
+    fn app_turn_exit_auto_reload_only_triggers_on_exited_event_not_stream_or_finish() {
+        let s = Session::new(75, PathBuf::from(r"C:\work\demo"), Provider::Claude, PermissionMode::Full);
+        let state = SavedState {
+            sessions: vec![s],
+            active_session: 75,
+            ..SavedState::default()
+        };
+        let mut app = ViperApp::test_app(state);
+
+        let html_file = PathBuf::from(r"C:\work\demo\index.html");
+        let url = preview::path_to_file_url(&html_file);
+        app.active_tools().mount_preview(&url, true);
+
+        let ctx = egui::Context::default();
+
+        // 1. Stream text
+        let (tx1, rx1) = mpsc::channel();
+        tx1.send((75, AgentEvent::TextDelta("Working on layout...".into()))).unwrap();
+        app.events_rx = rx1;
+        app.poll_events(&ctx);
+        assert!(!app.browser.is_reload_pending(), "streaming text delta must not trigger reload");
+
+        // 2. Finished event
+        let (tx2, rx2) = mpsc::channel();
+        tx2.send((75, AgentEvent::Finished { session_id: None, error: None, denied_tools: Vec::new(), usage: None })).unwrap();
+        app.events_rx = rx2;
+        app.poll_events(&ctx);
+        assert!(!app.browser.is_reload_pending(), "finished event must not trigger reload");
+
+        // 3. Exited event
+        let (tx3, rx3) = mpsc::channel();
+        tx3.send((75, AgentEvent::Exited { error: None })).unwrap();
+        app.events_rx = rx3;
+        app.poll_events(&ctx);
+        assert!(app.browser.is_reload_pending(), "exited event triggers reload");
+    }
+
+    #[test]
+    fn legacy_saved_state_ron_without_auto_refresh_deserializes_and_defaults_to_true() {
+        // Pre-M3 SavedState representation without auto_refresh in app browser or session browser
+        let legacy_ron = r#"(
+            sessions: [
+                (
+                    id: 10,
+                    title: "Legacy Session",
+                    project_dir: "C:\\work\\project",
+                    provider: Claude,
+                    permission_mode: Full,
+                    entries: [],
+                    browser: (
+                        address: "http://localhost:3000",
+                        viewport: Desktop,
+                        custom_size: (1280, 800),
+                    ),
+                ),
+            ],
+            active_session: 10,
+            next_session_id: 11,
+            show_sessions: true,
+            show_tools: false,
+            browser: (
+                address: "https://example.com",
+                viewport: Mobile,
+                custom_size: (430, 932),
+            ),
+        )"#;
+
+        let restored: SavedState = ron::from_str(legacy_ron).expect("legacy SavedState without auto_refresh must deserialize");
+        assert!(restored.browser.auto_refresh, "top-level browser defaults auto_refresh to true");
+        assert_eq!(restored.browser.address, "https://example.com");
+
+        let session = &restored.sessions[0];
+        assert!(session.browser.auto_refresh, "session browser defaults auto_refresh to true");
+        assert_eq!(session.browser.address, "http://localhost:3000");
+
+        // Roundtrip with explicit auto_refresh = false
+        let mut modified = restored;
+        modified.browser.auto_refresh = false;
+        modified.sessions[0].browser.auto_refresh = false;
+
+        let serialized = ron::to_string(&modified).expect("SavedState with auto_refresh=false serializes");
+        let restored_again: SavedState = ron::from_str(&serialized).expect("SavedState with auto_refresh=false deserializes");
+        assert!(!restored_again.browser.auto_refresh, "explicit auto_refresh false roundtrips at top level");
+        assert!(!restored_again.sessions[0].browser.auto_refresh, "explicit auto_refresh false roundtrips in session");
+    }
 }
+

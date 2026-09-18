@@ -115,6 +115,25 @@ pub fn working_tree_changes(dir: &Path) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
+/// Differences between `base` and the current branch or working tree in `dir`,
+/// plus any untracked files.
+pub fn branch_changes(dir: &Path, base: &str) -> Result<Vec<FileDiff>, String> {
+    let git = git_executable().ok_or("Git isn't installed, so changes can't be shown.")?;
+    let root = run_git(&git, dir, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| format!("{} isn't inside a git repository.", dir.display()))?;
+    let root = PathBuf::from(root.trim());
+
+    let diff = run_git(&git, &root, &["diff", base, "--no-color", "--no-ext-diff", "--find-renames"])?;
+    let mut files = parse(&diff);
+
+    let untracked = run_git(&git, &root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    for path in untracked.split('\0').filter(|path| !path.is_empty()) {
+        files.push(untracked_file(&root, path));
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
 /// A project at a glance, for the heading above its sessions.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoSummary {
@@ -167,7 +186,7 @@ pub fn compare_files(old: &Path, new: &Path) -> Result<Vec<FileDiff>, String> {
     Ok(files)
 }
 
-fn git_executable() -> Option<PathBuf> {
+pub fn git_executable() -> Option<PathBuf> {
     let name = if cfg!(windows) { "git.exe" } else { "git" };
     agent::find_on_path(&[name]).or_else(|| {
         let program_files = std::env::var_os("ProgramFiles")?;
@@ -452,5 +471,86 @@ Binary files /dev/null and b/logo.png differ
 
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[test]
+    fn branch_changes_detects_committed_and_uncommitted_worktree_modifications() {
+        let Some(git) = git_executable() else { return };
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("viper-branch-diff-test-{}-{}", std::process::id(), unique));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git_in = |d: &Path, args: &[&str]| {
+            let out = hidden_command(&git)
+                .args(["-c", "user.name=Test", "-c", "user.email=test@example.com", "-c", "core.quotepath=false"])
+                .args(args)
+                .current_dir(d)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git command {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr));
+        };
+        git_in(&dir, &["init", "-b", "main"]);
+        std::fs::write(dir.join("base_file.txt"), "line 1\nline 2\n").unwrap();
+        std::fs::write(dir.join("deleted_file.txt"), "delete me\n").unwrap();
+        git_in(&dir, &["add", "."]);
+        git_in(&dir, &["commit", "-m", "initial on main"]);
+
+        // Create worktree on branch feature
+        let wt = dir.join(".viper").join("worktrees").join("1");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git_in(&dir, &["worktree", "add", "-b", "feature", wt.to_str().unwrap(), "main"]);
+
+        // 1. Committed modification on branch
+        std::fs::write(wt.join("base_file.txt"), "line 1\nline 2\nline 3\n").unwrap();
+        git_in(&wt, &["commit", "-am", "commit on feature"]);
+
+        // 2. Uncommitted modification on top of commit
+        std::fs::write(wt.join("base_file.txt"), "line 1\nline 2\nline 3 modified\n").unwrap();
+
+        // 3. Committed new file
+        std::fs::write(wt.join("committed_new.txt"), "brand new\n").unwrap();
+        git_in(&wt, &["add", "committed_new.txt"]);
+        git_in(&wt, &["commit", "-m", "add committed_new"]);
+
+        // 4. Committed deleted file
+        git_in(&wt, &["rm", "deleted_file.txt"]);
+        git_in(&wt, &["commit", "-m", "remove deleted_file"]);
+
+        // 5. Staged new file
+        std::fs::write(wt.join("staged_new.txt"), "staged\n").unwrap();
+        git_in(&wt, &["add", "staged_new.txt"]);
+
+        // 6. Untracked file
+        std::fs::write(wt.join("untracked.txt"), "untracked\n").unwrap();
+
+        // 7. Untracked file inside .viper directory (should be ignored by exclude-standard)
+        crate::worktree::ensure_viper_ignored(&dir).expect("ensure viper ignored succeeds");
+        let viper_internal = wt.join(".viper");
+        std::fs::create_dir_all(&viper_internal).unwrap();
+        std::fs::write(viper_internal.join("internal.txt"), "internal\n").unwrap();
+
+        let changes = branch_changes(&wt, "main").expect("branch_changes succeeds");
+        let items: Vec<(&str, FileStatus)> = changes.iter().map(|f| (f.path.as_str(), f.status)).collect();
+        assert!(items.contains(&("base_file.txt", FileStatus::Modified)), "committed+uncommitted edit detected: {items:?}");
+        assert!(items.contains(&("committed_new.txt", FileStatus::Added)), "committed new file detected: {items:?}");
+        assert!(items.contains(&("deleted_file.txt", FileStatus::Deleted)), "committed deleted file detected: {items:?}");
+        assert!(items.contains(&("staged_new.txt", FileStatus::Added)), "staged new file detected: {items:?}");
+        assert!(items.contains(&("untracked.txt", FileStatus::Untracked)), "untracked file detected: {items:?}");
+        assert!(!items.iter().any(|(p, _)| p.contains(".viper")), ".viper contents must be excluded: {items:?}");
+
+        // Verify invalid base branch returns an Err
+        let err = branch_changes(&wt, "nonexistent_ref_12345");
+        assert!(err.is_err(), "branch_changes with invalid ref must return Err");
+
+        // Also test calling from a subdirectory inside the worktree
+        let sub = wt.join("subdir");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_changes = branch_changes(&sub, "main").expect("branch_changes from subdir succeeds");
+        assert_eq!(sub_changes.len(), changes.len(), "subdirectory call returns same diff relative to repo root");
+
+        // Cleanup
+        git_in(&dir, &["worktree", "remove", "--force", wt.to_str().unwrap()]);
+        git_in(&dir, &["branch", "-D", "feature"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

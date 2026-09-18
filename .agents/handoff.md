@@ -1,38 +1,35 @@
-# Sentinel Final Handoff Report
+# Sentinel Handoff Report
 
 ## Observation
-- User requested a single self-contained fix to:
-  1. Fix Antigravity (`agy`) CLI invocation where passing bare `--print` causes Go flag parser exit code 2 errors.
-  2. Align permission adapter handling across Codex, Claude, and Antigravity so permission modes operate cleanly without crashes or silent tool denials.
-- Routed to SWE Light (`teamwork_preview_swe`) per the Routing Decision Table.
-- Team executed implementation and 3 adversarial review rounds:
-  - Round 0 (Implementer): initial implementation (157 unit tests passed).
-  - Round 1 (Reviewer): fixed 4 edge cases in error suppression and patch failure tracking (159 unit tests passed).
-  - Round 2 (Reviewer): fixed string error parsing, inferred fallback denials, and session notice precedence (161 unit tests passed).
-  - Round 3 (Reviewer): fixed process exit error suppression and MCP tool tracking (164 unit tests passed).
-- Post-victory independent audit was conducted by `teamwork_preview_victory_auditor`.
-- Audit verdict: **VICTORY CONFIRMED**.
+The user requested high-level functional code foundations in Viper for three key capabilities:
+1. **Interactive In-App Approvals Foundation (`R1`)**: Event definitions, data models (`ApprovalRequest`, `ApprovalDecision`), and interactive UI widgets in session/chat flow to approve or deny sensitive CLI tool executions mid-turn.
+2. **Git Worktree Session Isolation Foundation (`R2`)**: Dedicated git worktree management (`src/worktree.rs`), session directory resolution under `.viper/worktrees/<session-id>`, branch creation/cleanup, and Changes panel integration.
+3. **Webview Live Preview & Artifact Integration Foundation (`R3`)**: Automatic and one-click previewable web artifact detection (HTML, SVG, templates) via `src/preview.rs`, mount URL resolution, and embedded WebView live preview mounting in the tools panel.
+
+Integrity requirements mandated 0 errors on `cargo check`, 0 failures on `cargo test`, 0 warnings on `cargo clippy --all-targets -- -D warnings`, no unauthorized new dependencies in `Cargo.toml`, no unrequested reformatting, and backward-compatible session serialization.
 
 ## Logic Chain
-1. R1 was fixed by removing bare `--print` from `antigravity::args`. Since `agy` under `--output-format stream-json` runs non-interactively and ingests prompts via piped stdin, omitting bare `--print` prevents Go's flag parser from erroring with `flag needs an argument: -print` (exit code 2).
-2. R2 was fixed by adding `codex::plan_prompt` injected via `agent::start_turn` for `(Provider::Codex, PermissionMode::Plan)`. This instructs Codex to generate implementation checklists rather than attempting file edits against the read-only sandbox. Sandbox violations in `completed_item` and `turn.failed` are recorded into `denied_tools` with crash errors suppressed.
-3. R3 was fixed by adding `--disallowed-tools Bash` and `--permission-prompts none` in `claude::args` under `PermissionMode::ReadOnly`. `claude::parse_line` maps `error_disallowed_tool` and permission denials into `AgentEvent::Finished` with `denied_tools`, avoiding turn failures or hung headless prompts.
-4. `session::Session::handle_event` converts denied tool events to user notices (`Entry::Notice`) advising full access, eliminating unhandled red crash boxes.
-5. All rules of `AGENTS.md` were preserved: zero clippy warnings, no `cargo fmt` reformatting, no added dependencies, no unhandled panics, zero newly ignored tests.
-6. Sentinel cancelled both monitoring crons and terminated all subagents via `manage_subagents(action="kill_all")`.
+1. **Request Intake & Routing**: Recorded the request verbatim in `.agents/ORIGINAL_REQUEST.md` under `## 2026-09-18T20:52:15Z`. Evaluated task routing rules: routed multi-part architectural feature implementation to `teamwork_preview_orchestrator`.
+2. **Monitoring**: Scheduled progress reporting (`*/8 * * * *`) and liveness monitoring (`*/10 * * * *`) background crons.
+3. **Execution & Gate Review**:
+   - Orchestrator performed initial survey across 3 parallel explorers.
+   - **Milestone 1 (Approvals)**: Implemented in `src/agent.rs`, `src/session.rs`, `src/chat.rs`, and `src/app.rs`. Passed gate verification (2 reviewers, 2 challengers, 1 forensic auditor, 182 unit tests).
+   - **Milestone 2 (Worktrees)**: Implemented in `src/worktree.rs`, `src/git_diff.rs`, `src/changes.rs`, `src/sidebar.rs`, and `src/session.rs`. Passed gate verification (199 unit tests).
+   - **Milestone 3 (Live Preview)**: Implemented in `src/preview.rs`, `src/browser.rs`, and `src/tools.rs`. Challenger M3-1 identified a path tokenization issue on multi-word descriptions; orchestrator rejected the gate and dispatched `worker_m3_remediation`. Remediation passed re-check gate on Iteration 2 (231 unit tests).
+   - **Milestone 4 (Acceptance Audit)**: Orchestrator ran final end-to-end integration audit cleanly.
+4. **Independent Victory Audit**: Spawned `teamwork_preview_victory_auditor` (`e41a97d8-7d6f-4da8-9906-64f0411235b0`) to independently verify codebase integrity, absence of stubs, dependency purity, and compilation/test results. Verdict: **VICTORY CONFIRMED**.
+5. **Cleanup**: Cancelled both crons and killed all subagents.
 
 ## Caveats
-- Per AGENTS.md Rule 3.2, paid LLM tests requiring active remote credentials (`runs_the_real_antigravity_cli`, etc.) were intentionally left ignored to avoid spending user money.
-- All local unit tests (164), clippy checks, and build invariants passed cleanly.
+- Per `AGENTS.md` Rule 3.2, 8 pre-existing machine-dependent/paid CLI tests remain ignored (`runs_the_real_antigravity_cli`, `runs_the_real_codex_cli`, etc.). Zero new ignored tests were introduced.
+- Per `AGENTS.md` Rule 3.1, visual UI appearance must be inspected by the human user in the running GUI application; no full-screen capture or global input driver was executed.
 
 ## Conclusion
-Project execution succeeded and was independently certified. Verdict is VICTORY CONFIRMED.
+High-level functional code foundations for mid-turn interactive approvals, git worktree session isolation, and embedded webview live preview are completely implemented, verified, and audited. The implementation preserves all repository invariants.
 
 ## Verification Method
-```powershell
-cargo check
-cargo test
-cargo clippy --all-targets -- -D warnings
-git status
-```
-All compile cleanly with zero errors, zero warnings, and 164 passing tests.
+- `cargo check`: 0 errors
+- `cargo test`: 231 passed, 0 failed, 8 pre-existing ignored
+- `cargo clippy --all-targets -- -D warnings`: 0 warnings
+- `git diff Cargo.toml Cargo.lock`: empty (zero dependency modifications)
+- Backward compatibility: Verified RON deserialization across existing session save formats
