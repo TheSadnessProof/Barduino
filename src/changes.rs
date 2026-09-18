@@ -46,23 +46,6 @@ impl Changes {
         }
     }
 
-    /// The number of changed files, if already loaded without an error.
-    pub fn file_count(&self) -> Option<usize> {
-        match &self.files {
-            Some(Ok(files)) => Some(files.len()),
-            _ => None,
-        }
-    }
-
-    /// A readable label for the tab, including the number of changed files when known.
-    pub fn tab_title(&self) -> String {
-        let base = self.title();
-        match self.file_count() {
-            Some(count) if count > 0 => format!("{base} ({count})"),
-            _ => base,
-        }
-    }
-
     /// Reloads in the background.
     pub fn refresh(&mut self, ctx: &egui::Context) {
         let slot: Loaded = Arc::new(Mutex::new(None));
@@ -347,26 +330,5 @@ mod tests {
         assert!(changes.watches(&project));
         assert!(changes.watches(&nested));
         assert!(!changes.watches(&other));
-    }
-
-    #[test]
-    fn changes_tab_title_includes_file_count_when_loaded() {
-        let mut changes = Changes {
-            source: Source::Project(PathBuf::from(r"C:\work\project")),
-            files: None,
-            loading: None,
-            selected: None,
-        };
-        assert_eq!(changes.tab_title(), "Changes");
-
-        let file = FileDiff {
-            path: "src/main.rs".into(),
-            old_path: None,
-            status: FileStatus::Modified,
-            note: None,
-            hunks: Vec::new(),
-        };
-        changes.files = Some(Ok(vec![file.clone(), file]));
-        assert_eq!(changes.tab_title(), "Changes (2)");
     }
 }

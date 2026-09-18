@@ -138,74 +138,24 @@ pub struct Tools {
     active: usize,
     next_terminal_number: u64,
     next_browser_number: u64,
-    /// Whether the panel is split into top (active tab) and bottom (terminal) panes.
-    split: bool,
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1, next_browser_number: 1, split: false }
+        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1, next_browser_number: 1 }
     }
 }
 
 impl Tools {
+
     /// Whether this panel is the one showing the shared WebView.
     pub fn shows_browser(&self) -> bool {
         matches!(self.tabs.get(self.active), Some(Tab::Browser { .. }))
     }
 
     /// Whether the tab in front is a terminal.
-    pub fn shows_terminal(&self) -> bool {
+    fn shows_terminal(&self) -> bool {
         matches!(self.tabs.get(self.active), Some(Tab::Terminal { .. }))
-    }
-
-    /// Whether the tab in front is a changes tab.
-    pub fn shows_changes(&self) -> bool {
-        matches!(self.tabs.get(self.active), Some(Tab::Changes(_)))
-    }
-
-    /// Whether this panel is currently showing the shared WebView in full view or in the top split pane.
-    pub fn displays_browser(&self) -> bool {
-        if self.shows_browser() {
-            return true;
-        }
-        if self.split && let Some((top, _)) = self.split_pair() {
-            return matches!(self.tabs.get(top), Some(Tab::Browser { .. }));
-        }
-        false
-    }
-
-    /// Toggles the split view. If splitting and no terminal is open, opens one.
-    pub fn toggle_split(&mut self, cwd: &Path) {
-        self.split = !self.split;
-        if self.split {
-            let has_terminal = self.tabs.iter().any(|tab| matches!(tab, Tab::Terminal { .. }));
-            if !has_terminal {
-                self.open_terminal(cwd, None);
-            } else if self.tabs.len() == 1 {
-                self.open_browser();
-            }
-        }
-    }
-
-    /// The pair of tab indices to show in split view: `(top_pane_index, bottom_terminal_index)`.
-    fn split_pair(&self) -> Option<(usize, usize)> {
-        if self.tabs.len() < 2 {
-            return None;
-        }
-        let (top, bottom) = if matches!(self.tabs.get(self.active), Some(Tab::Terminal { .. })) {
-            let other_idx = self
-                .tabs
-                .iter()
-                .enumerate()
-                .position(|(i, t)| i != self.active && !matches!(t, Tab::Terminal { .. }))
-                .or_else(|| self.tabs.iter().enumerate().position(|(i, _)| i != self.active))?;
-            (other_idx, self.active)
-        } else {
-            let term_idx = self.tabs.iter().position(|t| matches!(t, Tab::Terminal { .. }))?;
-            (self.active, term_idx)
-        };
-        Some((top, bottom))
     }
 
     /// Opens a new terminal in `cwd`, optionally typing a command into it.
@@ -416,45 +366,6 @@ impl Tools {
         opened
     }
 
-    /// The collapsed 44px vertical strip. Gives direct 1-click access to Terminal,
-    /// Changes and the Browser, expanding the panel to the chosen tool.
-    pub fn collapsed_rail(&mut self, ui: &mut egui::Ui, cwd: &Path) -> bool {
-        let mut expand = false;
-        ui.add_space(6.0);
-        ui.vertical_centered(|ui| {
-            if icons::button(ui, Icon::SidebarRight, "Show terminal and browser").clicked() {
-                expand = true;
-            }
-            ui.add_space(4.0);
-
-            let term_active = self.shows_terminal();
-            let term_tip = format!("Terminal ({TERMINAL_SHORTCUT})");
-            if icons::toggle(ui, Icon::Terminal, &term_tip, term_active).clicked() {
-                self.show_terminal(cwd);
-                expand = true;
-            }
-
-            let changes_active = self.shows_changes();
-            if icons::toggle(ui, Icon::Branch, "Changes", changes_active).clicked() {
-                self.open_changes(cwd, ui.ctx());
-                expand = true;
-            }
-
-            let browser_active = self.shows_browser();
-            let browser_tip = format!("Browser ({BROWSER_SHORTCUT})");
-            if icons::toggle(ui, Icon::Desktop, &browser_tip, browser_active).clicked() {
-                self.show_browser();
-                expand = true;
-            }
-
-            ui.add_space(4.0);
-            ui.separator();
-            ui.add_space(4.0);
-            expand |= self.add_menu(ui, cwd);
-        });
-        expand
-    }
-
     /// Draws the expanded panel. `collapse` is set when the user hides it.
     pub fn ui(
         &mut self,
@@ -473,9 +384,6 @@ impl Tools {
                 if icons::button(ui, Icon::Close, "Close panel").clicked() {
                     *collapse = true;
                 }
-                if icons::toggle(ui, Icon::SplitView, "Toggle split terminal view", self.split).clicked() {
-                    self.toggle_split(cwd);
-                }
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     egui::ScrollArea::horizontal()
                         .id_salt("tools_tab_strip")
@@ -483,11 +391,10 @@ impl Tools {
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {
                                 for (index, tab) in self.tabs.iter().enumerate() {
-                                    let (icon, title, hover, is_running) = match tab {
-                                        Tab::Terminal { number, cwd, terminal, .. } => {
+                                    let (title, hover) = match tab {
+                                        Tab::Terminal { number, cwd, .. } => {
                                             let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
-                                            let running = matches!(terminal, Some(Ok(t)) if t.is_running());
-                                            (Icon::Terminal, title, cwd.display().to_string(), running)
+                                            (title, cwd.display().to_string())
                                         }
                                         Tab::Changes(changes) => {
                                             let hover = match &changes.source {
@@ -497,7 +404,7 @@ impl Tools {
                                                 }
                                                 Source::Files { old, new } => format!("{}\n→ {}", old.display(), new.display()),
                                             };
-                                            (Icon::Branch, changes.tab_title(), hover, false)
+                                            (changes.title(), hover)
                                         }
                                         Tab::Browser { number, state } => {
                                             let title = browser_tab_title(*number, &state.address);
@@ -506,7 +413,7 @@ impl Tools {
                                             } else {
                                                 state.address.clone()
                                             };
-                                            (Icon::Desktop, title, hover, false)
+                                            (title, hover)
                                         }
                                     };
 
@@ -549,17 +456,6 @@ impl Tools {
                                                     .show(ui, |ui| {
                                                         ui.horizontal(|ui| {
                                                             ui.spacing_mut().item_spacing.x = 4.0;
-                                                            let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
-                                                            icons::paint(
-                                                                ui.painter(),
-                                                                icon_rect,
-                                                                icon,
-                                                                if is_active {
-                                                                    visuals.fg_stroke.color
-                                                                } else {
-                                                                    visuals.text_color().gamma_multiply(0.7)
-                                                                },
-                                                            );
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     egui::RichText::new(&title)
@@ -573,10 +469,6 @@ impl Tools {
                                                                 .selectable(false)
                                                                 .truncate(),
                                                             );
-                                                            if is_running {
-                                                                let (dot_rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
-                                                                ui.painter().circle_filled(dot_rect.center(), 2.5, egui::Color32::from_rgb(87, 171, 90));
-                                                            }
                                                             if icons::small_button(ui, Icon::Close, "Close tab").clicked() {
                                                                 tab_closed = true;
                                                             }
@@ -612,117 +504,53 @@ impl Tools {
             }
         }
 
-        if !self.displays_browser() {
+        if !self.shows_browser() {
             browser.hide();
         }
 
         let mut action = ToolsAction::None;
-        if self.split
-            && let Some((top_idx, bottom_idx)) = self.split_pair()
-            && let Some((top_tab, bottom_tab)) = two_tabs_mut(&mut self.tabs, top_idx, bottom_idx)
-        {
-            let mut close_split = false;
-            egui::Panel::bottom(ui.id().with("split_bottom"))
-                .resizable(true)
-                .default_size(240.0)
-                .size_range(100.0..=600.0)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
-                        icons::paint(ui.painter(), icon_rect, Icon::Terminal, ui.visuals().text_color());
-                        if let Tab::Terminal { number, cwd, .. } = &*bottom_tab {
-                            let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
-                            ui.label(egui::RichText::new(title).small().strong());
-                            ui.label(egui::RichText::new(cwd.display().to_string()).small().weak())
-                                .on_hover_text(cwd.display().to_string());
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if icons::small_button(ui, Icon::Close, "Close split").clicked() {
-                                close_split = true;
-                            }
-                        });
-                    });
-                    ui.separator();
-                    if let Tab::Terminal { number, cwd, terminal, typed, focus } = bottom_tab {
-                        let take_keyboard = std::mem::take(focus);
-                        let restarted = ui
-                            .push_id(("terminal_split", *number), |ui| {
-                                terminal::show(ui, terminal, cwd, shell, typed, take_keyboard)
-                            })
-                            .inner;
-                        *focus = restarted;
-                    }
+        match self.tabs.get_mut(self.active) {
+            None => {
+                ui.add_space(40.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new("Nothing open").weak());
+                    ui.label(egui::RichText::new("Click + to open a terminal, changes or the browser.").small().weak());
+                    ui.add_space(6.0);
+                    let keys = format!("{TERMINAL_SHORTCUT} terminal  ·  {BROWSER_SHORTCUT} browser");
+                    ui.label(egui::RichText::new(keys).small().weak());
                 });
-            if close_split {
-                self.split = false;
             }
-            action = show_tab_content(top_tab, ui, frame, id, shell, browser, page);
-            return action;
-        }
-
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            action = show_tab_content(tab, ui, frame, id, shell, browser, page);
-        } else {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                ui.label(egui::RichText::new("Nothing open").weak());
-                ui.label(egui::RichText::new("Click + to open a terminal, changes or the browser.").small().weak());
-                ui.add_space(6.0);
-                let keys = format!("{TERMINAL_SHORTCUT} terminal  ·  {BROWSER_SHORTCUT} browser");
-                ui.label(egui::RichText::new(keys).small().weak());
-            });
+            Some(Tab::Terminal { number, cwd, terminal, typed, focus }) => {
+                let take_keyboard = std::mem::take(focus);
+                let restarted = ui
+                    .push_id(("terminal", *number), |ui| {
+                        terminal::show(ui, terminal, cwd, shell, typed, take_keyboard)
+                    })
+                    .inner;
+                // The restarted shell is a new terminal, so it wants the cursor as well.
+                *focus = restarted;
+            }
+            Some(Tab::Changes(changes)) => changes.ui(ui),
+            Some(Tab::Browser { number, state }) => {
+                // The first browser of a session opens on the page it was last looking
+                // at, which is what was saved for it.
+                if state.address.is_empty() && !page.address.is_empty() {
+                    *state = page.clone();
+                }
+                // The page is a native window drawn over the app, so it has to get out
+                // of the way whenever a menu or popup needs to draw on top of it.
+                let page_visible = !egui::Popup::is_any_open(ui.ctx());
+                match browser.ui((id, *number), state, ui, frame, page_visible) {
+                    BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
+                    BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
+                    BrowserAction::None => {}
+                }
+                // The session remembers the page in front of it, so that the one you
+                // were looking at is still there after a restart.
+                *page = state.clone();
+            }
         }
         action
-    }
-}
-
-fn show_tab_content(
-    tab: &mut Tab,
-    ui: &mut egui::Ui,
-    frame: &eframe::Frame,
-    id: u64,
-    shell: &Path,
-    browser: &mut Browser,
-    page: &mut BrowserState,
-) -> ToolsAction {
-    let mut action = ToolsAction::None;
-    match tab {
-        Tab::Terminal { number, cwd, terminal, typed, focus } => {
-            let take_keyboard = std::mem::take(focus);
-            let restarted = ui
-                .push_id(("terminal", *number), |ui| {
-                    terminal::show(ui, terminal, cwd, shell, typed, take_keyboard)
-                })
-                .inner;
-            *focus = restarted;
-        }
-        Tab::Changes(changes) => changes.ui(ui),
-        Tab::Browser { number, state } => {
-            if state.address.is_empty() && !page.address.is_empty() {
-                *state = page.clone();
-            }
-            let page_visible = !egui::Popup::is_any_open(ui.ctx());
-            match browser.ui((id, *number), state, ui, frame, page_visible) {
-                BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
-                BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
-                BrowserAction::None => {}
-            }
-            *page = state.clone();
-        }
-    }
-    action
-}
-
-fn two_tabs_mut(tabs: &mut [Tab], a: usize, b: usize) -> Option<(&mut Tab, &mut Tab)> {
-    if a == b || a >= tabs.len() || b >= tabs.len() {
-        return None;
-    }
-    if a < b {
-        let (first, second) = tabs.split_at_mut(b);
-        Some((&mut first[a], &mut second[0]))
-    } else {
-        let (first, second) = tabs.split_at_mut(a);
-        Some((&mut second[0], &mut first[b]))
     }
 }
 
@@ -1051,46 +879,6 @@ mod tests {
         tools.close(5);
         assert_eq!(tools.tabs.len(), 1);
         assert_eq!(tools.active, 0);
-    }
-
-    #[test]
-    fn split_pairs_active_tab_with_terminal() {
-        let mut tools = Tools::default();
-        tools.open_browser();
-        tools.open_terminal(Path::new("."), None);
-        tools.active = 0; // Browser in front
-
-        assert_eq!(tools.split_pair(), Some((0, 1)), "browser on top, terminal on bottom");
-
-        tools.active = 1; // Terminal in front
-        assert_eq!(tools.split_pair(), Some((0, 1)), "browser still on top when terminal selected");
-    }
-
-    #[test]
-    fn toggling_split_on_single_terminal_opens_browser() {
-        let mut tools = Tools::default();
-        tools.open_terminal(Path::new("."), None);
-        assert_eq!(tools.tabs.len(), 1);
-
-        tools.toggle_split(Path::new("."));
-        assert!(tools.split, "split mode is active");
-        assert_eq!(tools.tabs.len(), 2, "a browser was opened so both panes have a tool");
-        assert_eq!(tools.split_pair(), Some((1, 0)), "browser and terminal paired in split");
-    }
-
-    #[test]
-    fn displays_browser_reports_visibility_in_split_and_single_mode() {
-        let mut tools = Tools::default();
-        assert!(!tools.displays_browser());
-
-        tools.open_browser();
-        assert!(tools.displays_browser(), "active browser is displayed");
-
-        tools.open_terminal(Path::new("."), None);
-        assert!(!tools.displays_browser(), "terminal active in single mode hides browser");
-
-        tools.split = true;
-        assert!(tools.displays_browser(), "in split mode, the browser is visible in the top pane");
     }
 }
 
