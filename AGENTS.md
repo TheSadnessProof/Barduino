@@ -129,6 +129,12 @@ it afterwards.
   `#[serde(alias = "Gemini")]` because sessions were saved when Gemini CLI was
   the third option. **Do not remove that alias.** There is a test guarding it.
 
+### 3.6 Never auto-commit changes
+
+Never run `git commit` automatically. Do not commit or push changes unless the
+user explicitly asks you to do so. Leave edits in the working tree for the user
+to inspect.
+
 ---
 
 ## 4. Architecture
