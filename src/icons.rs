@@ -33,6 +33,10 @@ pub enum Icon {
     Branch,
     /// A folder outline.
     Folder,
+    /// An arrow breaking out of a box to open an external browser window.
+    External,
+    /// Two curved arrows forming a loop, for auto-refreshing live preview.
+    AutoRefresh,
 }
 
 const SIZE: f32 = 26.0;
@@ -214,6 +218,55 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 stroke,
             ));
+        }
+        Icon::External => {
+            let left = c.x - r * 0.75;
+            let right = c.x + r * 0.75;
+            let top = c.y - r * 0.75;
+            let bot = c.y + r * 0.75;
+            let mid_x = c.x + r * 0.15;
+            let mid_y = c.y - r * 0.15;
+
+            painter.line_segment([pos2(mid_x, top), pos2(left, top)], stroke);
+            painter.line_segment([pos2(left, top), pos2(left, bot)], stroke);
+            painter.line_segment([pos2(left, bot), pos2(right, bot)], stroke);
+            painter.line_segment([pos2(right, bot), pos2(right, mid_y)], stroke);
+
+            let arrow_start = pos2(c.x - r * 0.15, c.y + r * 0.15);
+            let arrow_tip = pos2(right, top);
+            painter.line_segment([arrow_start, arrow_tip], stroke);
+            let head = r * 0.45;
+            painter.line_segment([arrow_tip, pos2(right - head, top)], stroke);
+            painter.line_segment([arrow_tip, pos2(right, top + head)], stroke);
+        }
+        Icon::AutoRefresh => {
+            let arc_r = r * 0.65;
+            let mut pts_top = Vec::with_capacity(7);
+            for i in 0..=6 {
+                let a = std::f32::consts::PI * 1.1 + (i as f32 / 6.0) * std::f32::consts::PI * 0.8;
+                pts_top.push(pos2(c.x + arc_r * a.cos(), c.y + arc_r * a.sin()));
+            }
+            painter.add(egui::Shape::line(pts_top, stroke));
+            let tip_top = pos2(
+                c.x + arc_r * (std::f32::consts::PI * 1.9).cos(),
+                c.y + arc_r * (std::f32::consts::PI * 1.9).sin(),
+            );
+            let h = r * 0.35;
+            painter.line_segment([tip_top, tip_top + vec2(-h * 0.2, -h)], stroke);
+            painter.line_segment([tip_top, tip_top + vec2(-h, -h * 0.2)], stroke);
+
+            let mut pts_bot = Vec::with_capacity(7);
+            for i in 0..=6 {
+                let a = std::f32::consts::PI * 0.1 + (i as f32 / 6.0) * std::f32::consts::PI * 0.8;
+                pts_bot.push(pos2(c.x + arc_r * a.cos(), c.y + arc_r * a.sin()));
+            }
+            painter.add(egui::Shape::line(pts_bot, stroke));
+            let tip_bot = pos2(
+                c.x + arc_r * (std::f32::consts::PI * 0.9).cos(),
+                c.y + arc_r * (std::f32::consts::PI * 0.9).sin(),
+            );
+            painter.line_segment([tip_bot, tip_bot + vec2(h * 0.2, h)], stroke);
+            painter.line_segment([tip_bot, tip_bot + vec2(h, h * 0.2)], stroke);
         }
     }
 }

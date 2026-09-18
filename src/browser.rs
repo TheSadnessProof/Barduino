@@ -339,6 +339,16 @@ impl Browser {
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let go = ui.button("Go").clicked();
+                let open_ext = icons::small_button(ui, Icon::External, "Open in default browser").clicked();
+                if open_ext && !state.address.is_empty() {
+                    let norm = normalize_url(&state.address);
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(norm));
+                }
+                if !state.address.is_empty()
+                    && icons::small_button(ui, Icon::Close, "Clear address").clicked()
+                {
+                    state.address.clear();
+                }
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut state.address)
                         .desired_width(f32::INFINITY)
@@ -384,6 +394,15 @@ impl Browser {
                 state.size = size;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let refresh_tip = if state.auto_refresh {
+                    "Auto-refresh is on (reloads when files change)"
+                } else {
+                    "Auto-refresh is off (click to enable)"
+                };
+                if icons::toggle(ui, Icon::AutoRefresh, refresh_tip, state.auto_refresh).clicked() {
+                    state.auto_refresh = !state.auto_refresh;
+                }
+
                 let commenting = self.mode == Mode::Commenting;
                 let comment_tip = if commenting {
                     "Commenting: click the places you want changed (Esc to stop)"
@@ -547,7 +566,7 @@ impl Browser {
                             )
                             .on_hover_text(&comment.element.selector);
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icons::button(ui, Icon::Close, "Remove this comment").clicked() {
+                                if icons::small_button(ui, Icon::Close, "Remove this comment").clicked() {
                                     remove = Some(comment.number);
                                 }
                                 if ui
@@ -967,5 +986,27 @@ mod tests {
 
         assert_eq!(serde_json::from_str::<PageMessage>(r#"{"kind":"cancelled"}"#).unwrap(), PageMessage::Cancelled);
         assert!(serde_json::from_str::<PageMessage>(r#"{"kind":"steal-cookies"}"#).is_err());
+    }
+
+    #[test]
+    fn browser_state_address_clearing_and_auto_refresh() {
+        let mut state = BrowserState {
+            address: "http://localhost:5173".to_owned(),
+            viewport: Viewport::Desktop,
+            size: [1280, 800],
+            auto_refresh: true,
+        };
+        assert!(!state.address.is_empty());
+        assert!(state.auto_refresh);
+
+        // Clearing address empties string without losing viewport or auto-refresh settings.
+        state.address.clear();
+        assert_eq!(state.address, "");
+        assert_eq!(state.viewport, Viewport::Desktop);
+        assert!(state.auto_refresh);
+
+        // Toggling auto-refresh updates flag cleanly.
+        state.auto_refresh = !state.auto_refresh;
+        assert!(!state.auto_refresh);
     }
 }

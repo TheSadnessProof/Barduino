@@ -56,6 +56,83 @@ pub struct PanelContext<'a> {
     pub page: &'a mut BrowserState,
 }
 
+/// A short, readable label for a browser tab: the host for a website, the file
+/// name for a preview, or a generic numbered title when nothing has loaded yet.
+pub fn browser_tab_title(number: u64, address: &str) -> String {
+    let trimmed = address.trim();
+    if trimmed.is_empty() || trimmed == "about:blank" {
+        return if number == 1 { "Browser".to_owned() } else { format!("Browser {number}") };
+    }
+
+    if let Some(stripped) = trimmed.strip_prefix("file://") {
+        let path_part = stripped.split('?').next().unwrap_or(stripped).split('#').next().unwrap_or(stripped);
+        let path = Path::new(path_part);
+        if let Some(file_name) = path.file_name().and_then(|f| f.to_str()) {
+            let decoded = percent_decode(file_name);
+            if !decoded.is_empty() {
+                return shorten_title(&decoded, 20);
+            }
+        }
+    }
+
+    if Path::new(trimmed).is_file()
+        && let Some(file_name) = Path::new(trimmed).file_name().and_then(|f| f.to_str())
+    {
+        return shorten_title(file_name, 20);
+    }
+
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let host = without_scheme
+        .split('/')
+        .next()
+        .unwrap_or(without_scheme)
+        .split('?')
+        .next()
+        .unwrap_or(without_scheme);
+    if !host.is_empty() {
+        return shorten_title(host, 20);
+    }
+
+    if number == 1 { "Browser".to_owned() } else { format!("Browser {number}") }
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut bytes = Vec::new();
+    let mut chars = s.as_bytes().iter().copied().peekable();
+    while let Some(b) = chars.next() {
+        if b == b'%' {
+            let h1 = chars.next();
+            let h2 = chars.next();
+            if let (Some(c1), Some(c2)) = (h1, h2)
+                && let Ok(hex) = std::str::from_utf8(&[c1, c2])
+                && let Ok(val) = u8::from_str_radix(hex, 16)
+            {
+                bytes.push(val);
+                continue;
+            }
+            bytes.push(b'%');
+            if let Some(c1) = h1 { bytes.push(c1); }
+            if let Some(c2) = h2 { bytes.push(c2); }
+        } else {
+            bytes.push(b);
+        }
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn shorten_title(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        let mut short: String = s.chars().take(max.saturating_sub(1)).collect();
+        short.push('…');
+        short
+    }
+}
+
 pub struct Tools {
     tabs: Vec<Tab>,
     active: usize,
@@ -246,9 +323,15 @@ impl Tools {
     /// Closes tab `index`. Dropping a terminal tab stops its shell. The WebView is
     /// shared, so it is left alone here — app.rs closes it once no session wants it.
     fn close(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
         self.tabs.remove(index);
         if self.active >= index && self.active > 0 {
             self.active -= 1;
+        }
+        if self.active >= self.tabs.len() && !self.tabs.is_empty() {
+            self.active = self.tabs.len() - 1;
         }
     }
 
@@ -297,106 +380,116 @@ impl Tools {
         let mut clicked = None;
         ui.add_space(4.0);
         ui.horizontal(|ui| {
-            for (index, tab) in self.tabs.iter().enumerate() {
-                let (title, hover) = match tab {
-                    Tab::Terminal { number, cwd, .. } => {
-                        let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
-                        (title, cwd.display().to_string())
-                    }
-                    Tab::Changes(changes) => {
-                        let hover = match &changes.source {
-                            Source::Project(dir) => format!("Uncommitted changes in {}", dir.display()),
-                            Source::Branch { dir, branch, base } => {
-                                format!("Changes in {branch} vs {base}\n{}", dir.display())
-                            }
-                            Source::Files { old, new } => format!("{}\n→ {}", old.display(), new.display()),
-                        };
-                        (changes.title(), hover)
-                    }
-                                    Tab::Browser { number, state } => {
-                        let title = if *number == 1 { "Browser".to_owned() } else { format!("Browser {number}") };
-                        let hover = if state.address.is_empty() {
-                            "Built-in browser".to_owned()
-                        } else {
-                            state.address.clone()
-                        };
-                        (title, hover)
-                    }
-                };
-
-                let is_active = index == self.active;
-                let mut tab_closed = false;
-                let tab_resp = ui
-                    .scope_builder(
-                        egui::UiBuilder::new().id_salt(("tool_tab", index)).sense(egui::Sense::click()),
-                        |ui| {
-                            let response = ui.response();
-                            // `ui.response()` already reports the tab's own rect from the last
-                            // pass. Falling back to `max_rect` would cover the rest of the strip,
-                            // so hovering one tab lit up every tab before it.
-                            let hovered = response.hovered();
-                            let visuals = ui.style().interact_selectable(&response, is_active);
-                            let fill = if is_active {
-                                visuals.weak_bg_fill
-                            } else if hovered {
-                                ui.visuals().faint_bg_color
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            };
-                            // A Frame counts its stroke width as margin, so a stroke that
-                            // appeared on hover would resize this tab and shift every tab
-                            // after it. The width stays fixed; only the colour changes.
-                            let stroke = egui::Stroke::new(
-                                1.0,
-                                if is_active {
-                                    ui.visuals().selection.stroke.color
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                },
-                            );
-
-                            egui::Frame::new()
-                                .fill(fill)
-                                .stroke(stroke)
-                                .corner_radius(6.0)
-                                .inner_margin(egui::Margin::symmetric(8, 4))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.spacing_mut().item_spacing.x = 4.0;
-                                        ui.add(
-                                            egui::Label::new(
-                                                egui::RichText::new(title)
-                                                    .color(if is_active {
-                                                        visuals.fg_stroke.color
-                                                    } else {
-                                                        visuals.text_color()
-                                                    })
-                                                    .small(),
-                                            )
-                                            .selectable(false),
-                                        );
-                                        if icons::small_button(ui, Icon::Close, "Close tab").clicked() {
-                                            tab_closed = true;
-                                        }
-                                    });
-                                });
-                        },
-                    )
-                    .response;
-
-                if tab_closed || tab_resp.middle_clicked() {
-                    close = Some(index);
-                } else if tab_resp.clicked() {
-                    self.active = index;
-                    clicked = Some(index);
-                }
-                tab_resp.on_hover_text(hover);
-            }
-            self.add_menu(ui, cwd);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::SidebarRight, "Hide panel").clicked() {
+                if icons::button(ui, Icon::Close, "Close panel").clicked() {
                     *collapse = true;
                 }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("tools_tab_strip")
+                        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for (index, tab) in self.tabs.iter().enumerate() {
+                                    let (title, hover) = match tab {
+                                        Tab::Terminal { number, cwd, .. } => {
+                                            let title = if *number == 1 { "Terminal".to_owned() } else { format!("Terminal {number}") };
+                                            (title, cwd.display().to_string())
+                                        }
+                                        Tab::Changes(changes) => {
+                                            let hover = match &changes.source {
+                                                Source::Project(dir) => format!("Uncommitted changes in {}", dir.display()),
+                                                Source::Branch { dir, branch, base } => {
+                                                    format!("Changes in {branch} vs {base}\n{}", dir.display())
+                                                }
+                                                Source::Files { old, new } => format!("{}\n→ {}", old.display(), new.display()),
+                                            };
+                                            (changes.title(), hover)
+                                        }
+                                        Tab::Browser { number, state } => {
+                                            let title = browser_tab_title(*number, &state.address);
+                                            let hover = if state.address.is_empty() {
+                                                "Built-in browser".to_owned()
+                                            } else {
+                                                state.address.clone()
+                                            };
+                                            (title, hover)
+                                        }
+                                    };
+
+                                    let is_active = index == self.active;
+                                    let mut tab_closed = false;
+                                    let tab_resp = ui
+                                        .scope_builder(
+                                            egui::UiBuilder::new().id_salt(("tool_tab", index)).sense(egui::Sense::click()),
+                                            |ui| {
+                                                let response = ui.response();
+                                                // `ui.response()` already reports the tab's own rect from the last
+                                                // pass. Falling back to `max_rect` would cover the rest of the strip,
+                                                // so hovering one tab lit up every tab before it.
+                                                let hovered = response.hovered();
+                                                let visuals = ui.style().interact_selectable(&response, is_active);
+                                                let fill = if is_active {
+                                                    visuals.weak_bg_fill
+                                                } else if hovered {
+                                                    ui.visuals().faint_bg_color
+                                                } else {
+                                                    egui::Color32::TRANSPARENT
+                                                };
+                                                // A Frame counts its stroke width as margin, so a stroke that
+                                                // appeared on hover would resize this tab and shift every tab
+                                                // after it. The width stays fixed; only the colour changes.
+                                                let stroke = egui::Stroke::new(
+                                                    1.0,
+                                                    if is_active {
+                                                        ui.visuals().selection.stroke.color
+                                                    } else {
+                                                        egui::Color32::TRANSPARENT
+                                                    },
+                                                );
+
+                                                egui::Frame::new()
+                                                    .fill(fill)
+                                                    .stroke(stroke)
+                                                    .corner_radius(6.0)
+                                                    .inner_margin(egui::Margin::symmetric(8, 4))
+                                                    .show(ui, |ui| {
+                                                        ui.horizontal(|ui| {
+                                                            ui.spacing_mut().item_spacing.x = 4.0;
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(&title)
+                                                                        .color(if is_active {
+                                                                            visuals.fg_stroke.color
+                                                                        } else {
+                                                                            visuals.text_color()
+                                                                        })
+                                                                        .small(),
+                                                                )
+                                                                .selectable(false)
+                                                                .truncate(),
+                                                            );
+                                                            if icons::small_button(ui, Icon::Close, "Close tab").clicked() {
+                                                                tab_closed = true;
+                                                            }
+                                                        });
+                                                    });
+                                            },
+                                        )
+                                        .response;
+
+                                    if tab_closed || tab_resp.middle_clicked() {
+                                        close = Some(index);
+                                    } else if tab_resp.clicked() {
+                                        self.active = index;
+                                        clicked = Some(index);
+                                    }
+                                    tab_resp.on_hover_text(hover);
+                                }
+                                self.add_menu(ui, cwd);
+                            });
+                        });
+                });
             });
         });
         ui.separator();
@@ -732,6 +825,60 @@ mod tests {
         tools.open_branch_changes(wt_2, "viper/session-2", "main", &ctx);
         assert_eq!(tools.tabs.len(), 4, "reuses existing branch tab 2");
         assert_eq!(tools.active, 2);
+    }
+
+    #[test]
+    fn browser_tab_titles_reflect_host_or_file_name() {
+        assert_eq!(browser_tab_title(1, ""), "Browser");
+        assert_eq!(browser_tab_title(2, ""), "Browser 2");
+        assert_eq!(browser_tab_title(1, "about:blank"), "Browser");
+        assert_eq!(browser_tab_title(3, "about:blank"), "Browser 3");
+        assert_eq!(browser_tab_title(1, "http://localhost:3000/app"), "localhost:3000");
+        assert_eq!(browser_tab_title(1, "https://docs.rs/eframe/latest"), "docs.rs");
+        assert_eq!(browser_tab_title(1, "file:///C:/projects/site/index.html"), "index.html");
+        assert_eq!(browser_tab_title(1, "file:///C:/projects/my%20app/page%20one.svg"), "page one.svg");
+        let long_url = "https://very-long-subdomain-that-needs-truncation.example.com/test";
+        let title = browser_tab_title(1, long_url);
+        assert!(title.ends_with('…'), "long titles are truncated: {title}");
+        assert!(title.chars().count() <= 20);
+    }
+
+    #[test]
+    fn closing_the_active_tab_clamps_index_to_remaining_tabs() {
+        let mut tools = Tools::default();
+        tools.open_terminal(Path::new("."), None);
+        tools.open_browser();
+        tools.open_terminal(Path::new("."), None);
+        assert_eq!(tools.tabs.len(), 3);
+        assert_eq!(tools.active, 2);
+
+        // Closing the active tab at the end clamps back to the new end.
+        tools.close(2);
+        assert_eq!(tools.tabs.len(), 2);
+        assert_eq!(tools.active, 1);
+
+        // Closing the active tab in the middle clamps to the preceding tab.
+        tools.close(1);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Closing the only remaining tab empties the tabs.
+        tools.close(0);
+        assert!(tools.tabs.is_empty());
+        assert_eq!(tools.active, 0);
+    }
+
+    #[test]
+    fn closing_nonexistent_tab_leaves_state_intact() {
+        let mut tools = Tools::default();
+        tools.open_terminal(Path::new("."), None);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
+
+        // Index out of bounds is ignored safely without panicking.
+        tools.close(5);
+        assert_eq!(tools.tabs.len(), 1);
+        assert_eq!(tools.active, 0);
     }
 }
 
