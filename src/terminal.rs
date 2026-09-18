@@ -125,10 +125,33 @@ impl Drop for TerminalJob {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(unix)]
+struct TerminalJob(Option<u32>);
+
+#[cfg(unix)]
+impl TerminalJob {
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    fn kill(&self) {
+        if let Some(pid) = self.0 {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            let pgid = pid as i32;
+            unsafe {
+                let _ = kill(-pgid, 15); // SIGTERM
+                let _ = kill(-pgid, 9);  // SIGKILL
+            }
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 struct TerminalJob;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 impl TerminalJob {
     fn new(_pid: Option<u32>) -> Self {
         Self

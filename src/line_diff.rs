@@ -293,4 +293,43 @@ mod tests {
         assert_eq!(counts1, counts2);
         assert_eq!(edit.lines().len(), edit.lines().len());
     }
+
+    #[test]
+    fn pure_insertions_and_deletions_with_identical_context_preserve_line_numbers() {
+        // Insertion in the middle
+        let edit_ins = edit("head\ntail", "head\ninserted\ntail");
+        assert_eq!(edit_ins.counts(), (1, 0));
+        let ins_lines = edit_ins.lines();
+        let added = ins_lines.iter().find(|l| l.kind == LineKind::Added).expect("has addition");
+        assert_eq!(added.text, "inserted");
+        assert_eq!(added.new_number, Some(2));
+        assert_eq!(added.old_number, None);
+
+        // Deletion in the middle
+        let edit_del = edit("head\ndeleted\ntail", "head\ntail");
+        assert_eq!(edit_del.counts(), (0, 1));
+        let del_lines = edit_del.lines();
+        let removed = del_lines.iter().find(|l| l.kind == LineKind::Removed).expect("has removal");
+        assert_eq!(removed.text, "deleted");
+        assert_eq!(removed.old_number, Some(2));
+        assert_eq!(removed.new_number, None);
+    }
+
+    #[test]
+    fn prefix_and_suffix_trimming_handles_multibyte_unicode() {
+        let old = "ქართული ტექსტი 1\nძველი ხაზი\nქართული ტექსტი 2";
+        let new = "ქართული ტექსტი 1\nახალი ხაზი\nქართული ტექსტი 2";
+        let edit = edit(old, new);
+        assert_eq!(edit.counts(), (1, 1));
+        let changed = edit.lines().iter().find(|l| l.kind == LineKind::Added).expect("added line");
+        assert_eq!(changed.text, "ახალი ხაზი");
+    }
+
+    #[test]
+    fn diff_deserialized_from_saved_state_computes_on_demand() {
+        let json = r#"{"path":"test.rs","old":"one\ntwo","new":"one\nTWO"}"#;
+        let edit: FileEdit = serde_json::from_str(json).expect("deserializes without diff field");
+        assert_eq!(edit.counts(), (1, 1));
+        assert_eq!(edit.lines().len(), 3);
+    }
 }
