@@ -141,29 +141,13 @@ pub fn composer(
 
     // Warm, sophisticated palette tailored to the current provider and visual style.
     let accent = provider_accent(session.provider);
-    let (card_bg, border_stroke, hint_color) = if ui.visuals().dark_mode {
-        let border = if has_focus {
-            accent.gamma_multiply(0.85)
-        } else {
-            egui::Color32::from_rgba_premultiplied(255, 255, 255, 14)
-        };
-        (
-            egui::Color32::from_rgb(26, 27, 31),
-            egui::Stroke::new(if has_focus { 1.5 } else { 1.0 }, border),
-            egui::Color32::from_rgb(140, 142, 150),
-        )
+    let card_bg = ui.visuals().faint_bg_color;
+    let border_stroke = if has_focus {
+        egui::Stroke::new(1.5, accent)
     } else {
-        let border = if has_focus {
-            accent
-        } else {
-            egui::Color32::from_rgb(222, 218, 212)
-        };
-        (
-            egui::Color32::WHITE,
-            egui::Stroke::new(if has_focus { 1.5 } else { 1.0 }, border),
-            egui::Color32::from_rgb(150, 145, 138),
-        )
+        ui.visuals().widgets.noninteractive.bg_stroke
     };
+    let hint_color = ui.visuals().weak_text_color();
 
     let available_w = ui.available_width();
     let max_w = 820.0_f32.min((available_w - 32.0).max(280.0));
@@ -243,10 +227,8 @@ pub fn composer(
                         } else {
                             let (send_bg, send_fg) = if can_send {
                                 (accent, egui::Color32::WHITE)
-                            } else if ui.visuals().dark_mode {
-                                (egui::Color32::from_rgb(40, 42, 48), egui::Color32::from_rgb(110, 112, 120))
                             } else {
-                                (egui::Color32::from_rgb(230, 226, 220), egui::Color32::from_rgb(160, 155, 148))
+                                (ui.visuals().widgets.inactive.bg_fill, ui.visuals().weak_text_color())
                             };
 
                             let send_btn = egui::Button::new(
@@ -338,19 +320,9 @@ fn pill_selector(
     text: &str,
     tooltip: &str,
 ) -> egui::Response {
-    let (bg, stroke, fg) = if ui.visuals().dark_mode {
-        (
-            egui::Color32::from_rgba_premultiplied(255, 255, 255, 10),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 15)),
-            egui::Color32::from_rgb(215, 215, 222),
-        )
-    } else {
-        (
-            egui::Color32::from_rgba_premultiplied(0, 0, 0, 6),
-            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(0, 0, 0, 14)),
-            egui::Color32::from_rgb(60, 60, 68),
-        )
-    };
+    let bg = ui.visuals().widgets.inactive.bg_fill;
+    let stroke = ui.visuals().widgets.noninteractive.bg_stroke;
+    let fg = ui.visuals().text_color();
 
     let mut content = String::new();
     if let Some(ic) = icon {
@@ -544,11 +516,7 @@ fn context_chip(ui: &mut egui::Ui, session: &Session) {
     if tokens == 0 {
         return;
     }
-    let chip_bg = if ui.visuals().dark_mode {
-        egui::Color32::from_rgba_premultiplied(255, 255, 255, 8)
-    } else {
-        egui::Color32::from_rgba_premultiplied(0, 0, 0, 5)
-    };
+    let chip_bg = ui.visuals().widgets.inactive.bg_fill;
     egui::Frame::new()
         .fill(chip_bg)
         .corner_radius(6.0)
@@ -685,24 +653,18 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                             action = ConversationAction::SelectProvider(*provider);
                         }
 
-                        let fill = if selected {
-                            accent.gamma_multiply(0.18)
+                        let (fill, stroke) = if selected {
+                            (accent.gamma_multiply(0.15), egui::Stroke::new(1.5, accent))
                         } else if hovered {
-                            if ui.visuals().dark_mode { egui::Color32::from_rgb(38, 40, 46) } else { ui.visuals().faint_bg_color }
-                        } else if ui.visuals().dark_mode {
-                            egui::Color32::from_rgb(28, 29, 34)
+                            (
+                                ui.visuals().widgets.hovered.bg_fill,
+                                egui::Stroke::new(1.0, accent.gamma_multiply(0.5)),
+                            )
                         } else {
-                            egui::Color32::WHITE
-                        };
-
-                        let stroke = if selected {
-                            egui::Stroke::new(1.5, accent)
-                        } else if hovered {
-                            egui::Stroke::new(1.0, accent.gamma_multiply(0.5))
-                        } else if ui.visuals().dark_mode {
-                            egui::Stroke::new(1.0, egui::Color32::from_rgba_premultiplied(255, 255, 255, 14))
-                        } else {
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
+                            (
+                                ui.visuals().faint_bg_color,
+                                ui.visuals().widgets.noninteractive.bg_stroke,
+                            )
                         };
 
                         let painter = ui.painter_at(rect);
@@ -710,17 +672,10 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
 
                         let title_color = if selected {
                             accent
-                        } else if ui.visuals().dark_mode {
-                            egui::Color32::from_rgb(230, 230, 235)
                         } else {
-                            egui::Color32::from_rgb(30, 30, 35)
+                            ui.visuals().strong_text_color()
                         };
-
-                        let desc_color = if ui.visuals().dark_mode {
-                            egui::Color32::from_rgb(140, 140, 150)
-                        } else {
-                            egui::Color32::from_rgb(120, 120, 130)
-                        };
+                        let desc_color = ui.visuals().weak_text_color();
 
                         painter.text(
                             egui::pos2(rect.min.x + 13.0, rect.min.y + 12.0),
@@ -763,20 +718,16 @@ fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -
                             };
                             let stroke = egui::Stroke::new(1.2, RISKY.gamma_multiply(0.65));
                             (fill, stroke)
+                        } else if hovered {
+                            (
+                                ui.visuals().widgets.hovered.bg_fill,
+                                ui.visuals().widgets.hovered.bg_stroke,
+                            )
                         } else {
-                            let fill = if hovered {
-                                if ui.visuals().dark_mode { egui::Color32::from_rgb(46, 44, 41) } else { ui.visuals().faint_bg_color }
-                            } else if ui.visuals().dark_mode {
-                                egui::Color32::from_rgb(36, 35, 33)
-                            } else {
-                                egui::Color32::WHITE
-                            };
-                            let stroke = if ui.visuals().dark_mode {
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(58, 56, 52))
-                            } else {
-                                egui::Stroke::new(1.0, egui::Color32::from_rgb(222, 218, 212))
-                            };
-                            (fill, stroke)
+                            (
+                                ui.visuals().faint_bg_color,
+                                ui.visuals().widgets.noninteractive.bg_stroke,
+                            )
                         };
 
                         egui::Frame::new()
