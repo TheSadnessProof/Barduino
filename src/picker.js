@@ -1,11 +1,11 @@
-// Injected into every page the Barduino browser opens. Barduino turns picking on
-// with `window.__barduino.pick(true)` and commenting with
-// `window.__barduino.comment(true, nextNumber)`; the user then hovers to highlight
+// Injected into every page the Viper browser opens. Viper turns picking on
+// with `window.__viper.pick(true)` and commenting with
+// `window.__viper.comment(true, nextNumber)`; the user then hovers to highlight
 // an element and clicks to send its details back through `window.ipc`. Picking
 // sends one element and stops; commenting leaves a numbered pin on the page and
 // carries on, so several places can be marked in a row.
 (() => {
-  if (window.__barduino) return;
+  if (window.__viper || window.__barduino) return;
 
   let mode = null; // null, "pick" or "comment"
   let box = null;
@@ -189,10 +189,11 @@
   window.addEventListener("scroll", layoutPins, true);
   window.addEventListener("resize", layoutPins, true);
 
-  window.__barduino = {
+  window.__viper = {
     pick: (on) => (on ? start("pick") : stop()),
     comment: (on, from) => (on ? start("comment", from) : stop()),
     clearPins,
     removePin,
   };
+  window.__barduino = window.__viper;
 })();

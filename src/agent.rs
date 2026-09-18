@@ -353,10 +353,20 @@ pub fn start_turn(
         let _ = stdin.write_all(prompt.as_bytes());
     });
 
-    let stderr_reader = thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = stderr.read_to_end(&mut bytes);
-        String::from_utf8_lossy(&bytes).into_owned()
+    let stderr_buf = Arc::new(Mutex::new(Vec::new()));
+    let stderr_clone = Arc::clone(&stderr_buf);
+    thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        loop {
+            match stderr.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut data = stderr_clone.lock().unwrap_or_else(PoisonError::into_inner);
+                    data.extend_from_slice(&buf[..n]);
+                }
+                Err(_) => break,
+            }
+        }
     });
 
     let (event_tx, event_rx) = mpsc::channel();
@@ -376,7 +386,7 @@ pub fn start_turn(
 
     thread::spawn(move || {
         loop {
-            match event_rx.recv_timeout(Duration::from_millis(50)) {
+            match event_rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(event) => on_event(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     // When the agent CLI exits, don't wait forever on stdout EOF
@@ -398,7 +408,10 @@ pub fn start_turn(
             on_event(event);
         }
 
-        let stderr = stderr_reader.join().unwrap_or_default();
+        let stderr = {
+            let data = stderr_buf.lock().unwrap_or_else(PoisonError::into_inner);
+            String::from_utf8_lossy(&data).into_owned()
+        };
         let error = match status {
             Ok(status) if status.success() => None,
             Ok(status) => Some(exit_error(provider, status.code(), &stderr)),
@@ -763,5 +776,30 @@ mod tests {
         let stderr = "Error authenticating: boom\n    at initOauthClient (file:///x.js:1:2)\n  exitCode: 41\n}\n\x1b[31mManual authorization is required.\x1b[0m\n";
         assert_eq!(error_summary(stderr), "Error authenticating: boom Manual authorization is required.");
         assert_eq!(exit_error(Provider::Claude, Some(1), ""), "Claude Code exited with code 1. ");
+    }
+
+    #[test]
+    fn process_exit_cleanly_emits_exited_event() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cmd_path = if cfg!(windows) {
+            PathBuf::from("cmd.exe")
+        } else {
+            PathBuf::from("true")
+        };
+        let turn = Turn {
+            prompt: "test".into(),
+            cwd: std::env::temp_dir(),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: None,
+            effort: None,
+        };
+        let running = start_turn(Provider::Antigravity, &cmd_path, turn, move |event| {
+            let _ = tx.send(event);
+        });
+        assert!(running.is_ok(), "process should spawn");
+        let events: Vec<AgentEvent> = rx.iter().collect();
+        let exited = events.iter().any(|e| matches!(e, AgentEvent::Exited { .. }));
+        assert!(exited, "turn should exit and emit Exited event");
     }
 }

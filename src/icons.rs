@@ -33,10 +33,6 @@ pub enum Icon {
     Branch,
     /// A folder outline.
     Folder,
-    /// A wastebasket for deleting.
-    Trash,
-    /// A pencil for editing or renaming.
-    Edit,
 }
 
 const SIZE: f32 = 26.0;
@@ -218,34 +214,6 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 ],
                 stroke,
             ));
-        }
-        Icon::Trash => {
-            let top = c.y - r * 0.65;
-            let lid_bot = top + r * 0.22;
-            let bot = c.y + r * 0.72;
-            let w = r * 0.62;
-            painter.line_segment([pos2(c.x - w * 1.15, lid_bot), pos2(c.x + w * 1.15, lid_bot)], stroke);
-            painter.line_segment([pos2(c.x - w * 0.35, lid_bot), pos2(c.x - w * 0.35, top)], stroke);
-            painter.line_segment([pos2(c.x - w * 0.35, top), pos2(c.x + w * 0.35, top)], stroke);
-            painter.line_segment([pos2(c.x + w * 0.35, top), pos2(c.x + w * 0.35, lid_bot)], stroke);
-            painter.add(egui::Shape::line(
-                vec![
-                    pos2(c.x - w * 0.85, lid_bot),
-                    pos2(c.x - w * 0.68, bot),
-                    pos2(c.x + w * 0.68, bot),
-                    pos2(c.x + w * 0.85, lid_bot),
-                ],
-                stroke,
-            ));
-        }
-        Icon::Edit => {
-            let tip = pos2(c.x - r * 0.55, c.y + r * 0.55);
-            let top = pos2(c.x + r * 0.45, c.y - r * 0.45);
-            let perp = vec2(r * 0.2, -r * 0.2);
-            painter.line_segment([tip, top], stroke);
-            painter.line_segment([tip + perp, top + perp], stroke);
-            painter.line_segment([top, top + perp], stroke);
-            painter.line_segment([tip, tip + perp], stroke);
         }
     }
 }

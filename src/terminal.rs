@@ -493,7 +493,7 @@ fn pty_size((rows, cols): (u16, u16)) -> PtySize {
     PtySize { rows, cols, pixel_width: 0, pixel_height: 0 }
 }
 
-/// A shell Barduino can start a terminal with.
+/// A shell Viper can start a terminal with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Shell {
     /// What Settings calls it.

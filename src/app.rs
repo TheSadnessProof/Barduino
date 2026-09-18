@@ -52,26 +52,41 @@ fn saved_before_panel_defaults() -> bool {
     true
 }
 
-/// Atomically writes a backup of the saved state to disk, so unexpected crashes
-/// or corrupted writes never destroy the user's session history.
-fn atomic_backup_state(state: &SavedState) {
-    let Some(dir) = eframe::storage_dir("Barduino") else { return };
-    let Ok(serialized) = ron::to_string(state) else { return };
+fn write_backup_to_dir(dir: &std::path::Path, state: &SavedState) -> bool {
+    let Ok(serialized) = ron::to_string(state) else { return false };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
     let temp_path = dir.join("app.ron.tmp");
     let backup_path = dir.join("app.ron.bak");
 
     if std::fs::write(&temp_path, serialized.as_bytes()).is_ok() {
-        let _ = std::fs::rename(&temp_path, &backup_path);
+        if std::fs::rename(&temp_path, &backup_path).is_err() {
+            let _ = std::fs::remove_file(&backup_path);
+            if std::fs::rename(&temp_path, &backup_path).is_err() {
+                let _ = std::fs::remove_file(&temp_path);
+                return false;
+            }
+        }
+        return true;
     }
+    false
+}
+
+/// Atomically writes a backup of the saved state to disk, so unexpected crashes
+/// or corrupted writes never destroy the user's session history.
+fn atomic_backup_state(state: &SavedState) {
+    let Some(dir) = eframe::storage_dir("Viper").or_else(|| eframe::storage_dir("Barduino")) else { return };
+    write_backup_to_dir(&dir, state);
 }
 
 /// Copies a save that couldn't be read somewhere safe, before eframe writes over
 /// it. Returns what to tell the user, when there is anything to tell.
 fn keep_unreadable_save(raw: String) -> Option<String> {
-    let backup = eframe::storage_dir("Barduino")?.join("app.ron.corrupt");
+    let backup = eframe::storage_dir("Viper").or_else(|| eframe::storage_dir("Barduino"))?.join("app.ron.corrupt");
     std::fs::write(&backup, raw).ok()?;
     Some(format!(
-        "Your saved sessions couldn't be read, so Barduino has started empty. The old file was kept at {} — \
+        "Your saved sessions couldn't be read, so Viper has started empty. The old file was kept at {} — \
          keep hold of it if you want them back.",
         backup.display()
     ))
@@ -106,7 +121,7 @@ impl Default for SavedState {
     }
 }
 
-pub struct BarduinoApp {
+pub struct ViperApp {
     detected: Detected,
     state: SavedState,
     view: View,
@@ -140,7 +155,7 @@ pub struct BarduinoApp {
     events_rx: Receiver<(u64, AgentEvent)>,
 }
 
-impl BarduinoApp {
+impl ViperApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let stored = cc.storage.and_then(|storage| eframe::get_value::<SavedState>(storage, eframe::APP_KEY));
         // Nothing saved is an ordinary first launch. Something saved that won't read
@@ -149,13 +164,24 @@ impl BarduinoApp {
         // aside first, and the user is told where it went.
         let mut notice = None;
         let mut state = stored.unwrap_or_else(|| {
-            if let Some(storage_dir) = eframe::storage_dir("Barduino") {
-                let backup = storage_dir.join("app.ron.bak");
-                if let Ok(raw) = std::fs::read_to_string(&backup)
-                    && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
-                {
-                    notice = Some("Recovered your saved sessions from the backup copy.".into());
-                    return recovered;
+            for app_name in ["Viper", "Barduino"] {
+                if let Some(storage_dir) = eframe::storage_dir(app_name) {
+                    let backup = storage_dir.join("app.ron.bak");
+                    if let Ok(raw) = std::fs::read_to_string(&backup)
+                        && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
+                    {
+                        if let Some(unreadable) = cc.storage.and_then(|storage| storage.get_string(eframe::APP_KEY)) {
+                            let _ = keep_unreadable_save(unreadable);
+                        }
+                        notice = Some("Recovered your saved sessions from the backup copy.".into());
+                        return recovered;
+                    }
+                    let primary = storage_dir.join("app.ron");
+                    if let Ok(raw) = std::fs::read_to_string(&primary)
+                        && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
+                    {
+                        return recovered;
+                    }
                 }
             }
             notice = cc
@@ -216,7 +242,7 @@ impl BarduinoApp {
         self.state.sessions.iter().position(|s| s.id == id).unwrap_or(0)
     }
 
-    /// The folder the tools panel works in: the session's, or where Barduino was
+    /// The folder the tools panel works in: the session's, or where Viper was
     /// started from while the session still has none.
     fn tool_cwd(&self) -> PathBuf {
         let session = &self.state.sessions[self.active_index()];
@@ -633,7 +659,7 @@ impl BarduinoApp {
     }
 }
 
-impl eframe::App for BarduinoApp {
+impl eframe::App for ViperApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if std::mem::take(&mut self.forget_panel_width) {
             // egui remembers a panel's width, which would otherwise win over the new default.
@@ -817,11 +843,27 @@ mod tests {
     }
 
     #[test]
-    fn atomic_backup_roundtrips_saved_state() {
-        let state = populated_state();
-        let serialized = ron::to_string(&state).expect("state serializes to ron");
-        let restored: SavedState = ron::from_str(&serialized).expect("state deserializes from backup");
-        assert_eq!(restored.sessions.len(), 1);
+    fn atomic_backup_writes_and_replaces_cleanly_on_disk() {
+        let temp = std::env::temp_dir().join(format!("viper_test_backup_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+
+        let mut state = populated_state();
+        assert!(write_backup_to_dir(&temp, &state), "backup write should succeed");
+        let backup_file = temp.join("app.ron.bak");
+        assert!(backup_file.is_file(), "backup file must exist");
+        assert!(!temp.join("app.ron.tmp").exists(), "temp file must be cleaned up");
+
+        let content = std::fs::read_to_string(&backup_file).expect("readable backup");
+        let restored: SavedState = ron::from_str(&content).expect("deserializable backup");
         assert_eq!(restored.sessions[0].title, "Fix the login form");
+
+        // Second write atomically replaces existing backup
+        state.sessions[0].title = "Updated title".into();
+        assert!(write_backup_to_dir(&temp, &state), "subsequent backup write should succeed");
+        let updated_content = std::fs::read_to_string(&backup_file).expect("readable updated backup");
+        let updated_restored: SavedState = ron::from_str(&updated_content).expect("deserializable updated");
+        assert_eq!(updated_restored.sessions[0].title, "Updated title");
+
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

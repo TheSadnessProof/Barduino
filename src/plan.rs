@@ -1,5 +1,5 @@
 //! What each agent CLI says about its own plan limits. These are the providers'
-//! official figures, not anything Barduino works out: Claude Code sends them with
+//! official figures, not anything Viper works out: Claude Code sends them with
 //! every reply, and Codex writes them into the session file it keeps for each run.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -157,7 +157,7 @@ pub fn check_note(provider: Provider) -> &'static str {
 }
 
 /// Whether asking this provider costs anything. Only Claude Code has to be asked
-/// through a reply; Barduino checks the free ones by itself.
+/// through a reply; Viper checks the free ones by itself.
 pub fn is_free(provider: Provider) -> bool {
     provider != Provider::Claude
 }
@@ -307,7 +307,7 @@ pub fn read_in_background(ctx: &egui::Context) -> Arc<Mutex<Option<BTreeMap<Prov
 }
 
 /// Codex records its limits in the session file for each run, so its recent files hold
-/// the latest figures, including from runs outside Barduino. Each entry only carries the
+/// the latest figures, including from runs outside Viper. Each entry only carries the
 /// windows Codex felt like sending, so the newest figure for each window is gathered
 /// across entries, and a window whose reset time has passed is dropped as out of date.
 fn read_codex() -> Option<PlanUsage> {

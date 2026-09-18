@@ -95,7 +95,7 @@ impl Period {
     }
 }
 
-/// Usage per day (local time) and provider, for turns run through Barduino.
+/// Usage per day (local time) and provider, for turns run through Viper.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UsageLog {

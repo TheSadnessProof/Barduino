@@ -34,7 +34,7 @@ pub enum ComposerAction {
     None,
     Send,
     Stop,
-    /// A slash command Barduino carries out itself instead of sending, because a
+    /// A slash command Viper carries out itself instead of sending, because a
     /// headless CLI has no interactive session for it to change.
     Apply(SlashAction),
     /// Why a slash command couldn't be applied, in words for the banner.
@@ -267,7 +267,7 @@ pub fn composer(
     action
 }
 
-/// What pressing send does with what is in the box. A command Barduino owns is
+/// What pressing send does with what is in the box. A command Viper owns is
 /// carried out here and never reaches the CLI; anything else is a prompt.
 fn send_or_apply(session: &mut Session, catalog: &Catalog) -> ComposerAction {
     let models = catalog.models(session.provider);
@@ -565,7 +565,7 @@ pub fn conversation(
 
             for (index, entry) in session.entries.iter().enumerate() {
                 let entry_id = egui::Id::new(("entry_height", session.id, index));
-                let prev_height: Option<f32> = ui.ctx().data(|d| d.get_temp(entry_id));
+                let prev_height: Option<f32> = ui.ctx().data_mut(|d| d.get_persisted(entry_id));
                 let cursor_y = ui.cursor().top();
 
                 let is_offscreen = match prev_height {
@@ -576,7 +576,7 @@ pub fn conversation(
                 if let Some(height) = prev_height
                     && is_offscreen
                 {
-                    ui.add_space(height);
+                    ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::hover());
                 } else {
                     let show_agent_header = if index == 0 {
                         true
@@ -596,7 +596,7 @@ pub fn conversation(
                             );
                         })
                         .response;
-                    ui.ctx().data_mut(|d| d.insert_temp(entry_id, resp.rect.height()));
+                    ui.ctx().data_mut(|d| d.insert_persisted(entry_id, resp.rect.height()));
                 }
             }
             if !session.streaming.is_empty() {
@@ -1506,7 +1506,7 @@ fn slash_suggestions_ui(
                                             CommandSource::Project => {
                                                 egui::Color32::from_rgb(110, 70, 160).gamma_multiply(0.4)
                                             }
-                                            CommandSource::Barduino => CLAUDE_CORAL.gamma_multiply(0.35),
+                                            CommandSource::Viper => CLAUDE_CORAL.gamma_multiply(0.35),
                                         };
                                         egui::Frame::new()
                                             .fill(badge_bg)
@@ -1559,14 +1559,14 @@ fn slash_suggestions_ui(
 }
 
 /// Warns about a command the CLI can only run from its own interface. Nothing is
-/// said about the others: the "Barduino" badge already means it takes effect here,
+/// said about the others: the "Viper" badge already means it takes effect here,
 /// and everything else is a prompt, which is what the menu implies anyway.
 fn handling_badge(ui: &mut egui::Ui, cmd: &SlashCommand) {
     if commands::handling(&cmd.name, cmd.source) != Handling::Terminal {
         return;
     }
     ui.label(egui::RichText::new("opens a terminal").small().color(RISKY.gamma_multiply(0.9)))
-        .on_hover_text("Only the CLI's own interface can run this, so Barduino will start it in a terminal for you.");
+        .on_hover_text("Only the CLI's own interface can run this, so Viper will start it in a terminal for you.");
 }
 
 /// A small card for a page element attached to a message, with an × to remove

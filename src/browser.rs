@@ -783,21 +783,24 @@ mod native {
                     if on {
                         let _ = self.webview.focus();
                     }
-                    self.webview.evaluate_script(&format!("window.__barduino && window.__barduino.pick({on})"))
+                    self.webview.evaluate_script(&format!(
+                        "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).pick({on})"
+                    ))
                 }
                 Command::Comment(on, from) => {
                     if on {
                         let _ = self.webview.focus();
                     }
-                    self.webview
-                        .evaluate_script(&format!("window.__barduino && window.__barduino.comment({on}, {from})"))
+                    self.webview.evaluate_script(&format!(
+                        "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).comment({on}, {from})"
+                    ))
                 }
-                Command::RemovePin(number) => self
+                Command::RemovePin(number) => self.webview.evaluate_script(&format!(
+                    "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).removePin({number})"
+                )),
+                Command::ClearPins => self
                     .webview
-                    .evaluate_script(&format!("window.__barduino && window.__barduino.removePin({number})")),
-                Command::ClearPins => {
-                    self.webview.evaluate_script("window.__barduino && window.__barduino.clearPins()")
-                }
+                    .evaluate_script("(window.__viper || window.__barduino) && (window.__viper || window.__barduino).clearPins()"),
             };
         }
     }

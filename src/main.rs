@@ -30,19 +30,19 @@ use eframe::egui;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Barduino")
+            .with_title("Viper")
             .with_icon(logo::window_icon(64))
             .with_inner_size([1400.0, 850.0])
             .with_min_inner_size([900.0, 500.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "Barduino",
+        "Viper",
         options,
         Box::new(|cc| {
             load_system_fonts(&cc.egui_ctx);
             set_text_sizes(&cc.egui_ctx);
-            Ok(Box::new(app::BarduinoApp::new(cc)))
+            Ok(Box::new(app::ViperApp::new(cc)))
         }),
     )
 }

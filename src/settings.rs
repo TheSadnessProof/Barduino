@@ -29,9 +29,9 @@ pub struct Settings {
     pub default_provider: Provider,
     /// Providers the user switched off. Stored this way so providers added later start switched on.
     pub disabled_providers: Vec<Provider>,
-    /// Executables the user chose instead of the ones Barduino finds itself.
+    /// Executables the user chose instead of the ones Viper finds itself.
     pub custom_executables: BTreeMap<Provider, PathBuf>,
-    /// The shell new terminals run, or None to use the first one Barduino finds.
+    /// The shell new terminals run, or None to use the first one Viper finds.
     #[serde(default)]
     pub shell: Option<PathBuf>,
 }
@@ -82,7 +82,7 @@ impl Settings {
     }
 }
 
-/// What Barduino knows about one provider's CLI on this computer.
+/// What Viper knows about one provider's CLI on this computer.
 pub struct Installed {
     pub exe: Option<PathBuf>,
     /// True when `exe` is one the user chose in Settings.
@@ -279,7 +279,7 @@ impl SettingsPage {
         section_heading(ui, "Tokens spent here", |ui| {
             segmented(ui, "usage_period", &mut self.period, &Period::ALL, Period::label);
         });
-        hint(ui, "Only messages sent from Barduino. Using the CLIs elsewhere isn't counted here.");
+        hint(ui, "Only messages sent from Viper. Using the CLIs elsewhere isn't counted here.");
         ui.add_space(10.0);
 
         let totals: Vec<(Provider, Usage)> =
@@ -370,9 +370,9 @@ fn provider_usage(ui: &mut egui::Ui, provider: Provider, total: &Usage, all_toke
     ui.label(egui::RichText::new(of_all).small().weak());
 }
 
-/// What each provider says about its own plan limits. Barduino only passes these
+/// What each provider says about its own plan limits. Viper only passes these
 /// figures on: Claude Code sends them with every reply, and Codex saves them with
-/// each run, so they also cover work done outside Barduino.
+/// each run, so they also cover work done outside Viper.
 fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_>) -> Option<SettingsAction> {
     let mut action = None;
     let agents: Vec<Provider> = Provider::ALL
@@ -388,7 +388,7 @@ fn plan_section(ui: &mut egui::Ui, settings: &Settings, context: &PageContext<'_
             action = Some(SettingsAction::CheckPlan(agents.clone()));
         }
     });
-    hint(ui, "Straight from each agent, including usage that didn't come from Barduino.");
+    hint(ui, "Straight from each agent, including usage that didn't come from Viper.");
     ui.add_space(10.0);
 
     for provider in Provider::ALL {
@@ -577,7 +577,7 @@ fn provider_card(
                     action = Some(SettingsAction::ChooseExecutable(provider));
                     ui.close();
                 }
-                if installed.custom && ui.button("Use the one Barduino finds").clicked() {
+                if installed.custom && ui.button("Use the one Viper finds").clicked() {
                     action = Some(SettingsAction::UseDetectedExecutable(provider));
                     ui.close();
                 }
@@ -608,7 +608,7 @@ fn shell_card(ui: &mut egui::Ui, settings: &mut Settings, shells: &[Shell]) {
             hint(ui, "No shell was found on this computer, so terminals may not start.");
             return;
         }
-        // The first is what Barduino would pick on its own, so saying so means the
+        // The first is what Viper would pick on its own, so saying so means the
         // default doesn't need a name of its own in the list. A choice that has
         // since been uninstalled reads as this too, because that is what happens.
         let picked = settings.shell.clone().filter(|chosen| shells.iter().any(|s| s.path == *chosen));
@@ -774,7 +774,7 @@ mod tests {
             Shell { name: "Command Prompt", path: PathBuf::from(r"C:\cmd.exe") },
         ];
         let mut settings = Settings::default();
-        // Nothing chosen means Barduino picks, which is what a fresh install does.
+        // Nothing chosen means Viper picks, which is what a fresh install does.
         assert_eq!(settings.shell, None);
 
         settings.shell = Some(PathBuf::from(r"C:\cmd.exe"));

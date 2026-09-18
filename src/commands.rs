@@ -35,10 +35,10 @@ pub enum CommandSource {
     Skill,
     /// A custom command defined in `.claude/commands` or workspace config.
     Project,
-    /// Barduino's own. These change how the next turn runs, which is the CLIs' own
-    /// job in their interactive interfaces — but Barduino runs them headless, so it
+    /// Viper's own. These change how the next turn runs, which is the CLIs' own
+    /// job in their interactive interfaces — but Viper runs them headless, so it
     /// carries them out itself, the same way for every provider.
-    Barduino,
+    Viper,
 }
 
 impl CommandSource {
@@ -47,19 +47,19 @@ impl CommandSource {
             Self::Builtin => "Built-in",
             Self::Skill => "Skill",
             Self::Project => "Project",
-            Self::Barduino => "Barduino",
+            Self::Viper => "Viper",
         }
     }
 }
 
-/// Barduino's own commands, offered whichever CLI is answering. They are the same
+/// Viper's own commands, offered whichever CLI is answering. They are the same
 /// settings the row under the message box shows.
-const BARDUINO_COMMANDS: &[(&str, &str)] = &[
+const VIPER_COMMANDS: &[(&str, &str)] = &[
     ("model", "Choose the model for this session, e.g. /model opus"),
     ("effort", "Choose how hard the model works, e.g. /effort high"),
     ("permission", "Choose what the agent may do without asking, e.g. /permission full"),
     ("clear", "Start a fresh session in the same folder"),
-    ("settings", "Open Barduino's settings"),
+    ("settings", "Open Viper's settings"),
 ];
 
 /// The other spellings the CLIs use for those same commands. They work when typed,
@@ -212,14 +212,14 @@ fn scan_everything(provider: Provider, project_dir: &Path) -> Vec<SlashCommand> 
     let mut commands = Vec::new();
     let mut seen = HashSet::new();
 
-    // 0. Barduino's own, first so that where a CLI has a command of the same name
+    // 0. Viper's own, first so that where a CLI has a command of the same name
     // these are the ones offered — they are the ones that actually take effect here.
-    for &(name, desc) in BARDUINO_COMMANDS {
+    for &(name, desc) in VIPER_COMMANDS {
         if seen.insert(name.to_lowercase()) {
             commands.push(SlashCommand {
                 name: name.to_owned(),
                 description: desc.to_owned(),
-                source: CommandSource::Barduino,
+                source: CommandSource::Viper,
             });
         }
     }
@@ -435,14 +435,14 @@ pub fn filter<'a>(commands: &'a [SlashCommand], query: &str) -> Vec<&'a SlashCom
 
 /// What sending a slash command actually does.
 ///
-/// The CLIs' built-in commands belong to their own interactive session. Barduino
+/// The CLIs' built-in commands belong to their own interactive session. Viper
 /// runs them headless, where there is no such session — so a command that changes
 /// how the next turn runs has to be carried out here, and a few can't be reached
 /// at all without a real terminal. Saying which is which is the difference between
 /// a menu that works and a menu that quietly does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handling {
-    /// Barduino applies it to this session itself.
+    /// Viper applies it to this session itself.
     Here,
     /// Goes to the CLI as the prompt it is: a skill, a project command, or one of
     /// the CLI's own commands that expands into a prompt.
@@ -459,7 +459,7 @@ const NEEDS_TERMINAL: &[&str] =
 /// What happens when this command is sent, so the menu can say so before it is.
 pub fn handling(name: &str, source: CommandSource) -> Handling {
     match source {
-        CommandSource::Barduino => Handling::Here,
+        CommandSource::Viper => Handling::Here,
         // A skill or a project command is a prompt expansion whoever runs it.
         CommandSource::Skill | CommandSource::Project => Handling::Cli,
         CommandSource::Builtin if NEEDS_TERMINAL.contains(&name) => Handling::Terminal,
@@ -711,15 +711,15 @@ mod tests {
     }
 
     #[test]
-    fn every_provider_gets_barduinos_own_commands() {
-        // Codex's own list has no /effort or /permission, but Barduino sets both on
+    fn every_provider_gets_vipers_own_commands() {
+        // Codex's own list has no /effort or /permission, but Viper sets both on
         // the spawn, so they have to be offered whichever CLI is answering.
         for &provider in &Provider::ALL {
             let commands = discover(provider, Path::new("no such folder"));
             for wanted in ["model", "effort", "permission", "clear", "settings"] {
                 let found = commands.iter().find(|c| c.name == wanted);
                 let found = found.unwrap_or_else(|| panic!("{provider:?} should offer /{wanted}"));
-                assert_eq!(found.source, CommandSource::Barduino, "/{wanted} is ours, not the CLI's");
+                assert_eq!(found.source, CommandSource::Viper, "/{wanted} is ours, not the CLI's");
             }
             // The CLI's own spelling of the same thing doesn't get a second row.
             for alias in ALSO_OURS {
@@ -731,7 +731,7 @@ mod tests {
     #[test]
     fn a_command_says_where_it_will_run_before_it_is_sent() {
         // Ours, so the menu can promise it takes effect.
-        assert_eq!(handling("model", CommandSource::Barduino), Handling::Here);
+        assert_eq!(handling("model", CommandSource::Viper), Handling::Here);
         // Signing in needs the CLI's own terminal; nothing headless can do it.
         assert_eq!(handling("login", CommandSource::Builtin), Handling::Terminal);
         assert_eq!(handling("theme", CommandSource::Builtin), Handling::Terminal);

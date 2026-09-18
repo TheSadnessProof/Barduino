@@ -1,4 +1,4 @@
-//! Barduino's snake emblem: a coiled snake in burgundy (#850120) with a
+//! Viper's snake emblem: a coiled snake in burgundy (#850120) with a
 //! forked tongue and an eye cutout, drawn from `assets/snake-logo.svg`.
 //! Drawn as vector triangles on screen, and rasterised for the window icon.
 

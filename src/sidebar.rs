@@ -1,4 +1,4 @@
-//! The left-hand panel: the session list grouped by project, with a filter,
+//! The left-hand panel: the session list grouped by project, with a search filter,
 //! rename and delete, and a count on the rail of what the closed panel hides.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use eframe::egui;
 
-use crate::agent::Provider;
 use crate::git_diff::{self, RepoSummary};
 use crate::icons::{self, Icon};
 use crate::session::{Entry, Session};
@@ -26,13 +25,44 @@ struct Summary {
     asked: bool,
 }
 
-/// Which sessions to show based on the active quick-filter chip.
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FilterKind {
-    #[default]
-    All,
-    Working,
-    Errors,
+/// The operational state of a session.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SessionState {
+    Running,
+    Failed,
+    Idle,
+}
+
+/// Computes the operational state of a session from its running status and entries.
+pub fn session_state(session: &Session) -> SessionState {
+    if session.is_running() {
+        SessionState::Running
+    } else if matches!(session.entries.last(), Some(Entry::Error(_))) {
+        SessionState::Failed
+    } else {
+        SessionState::Idle
+    }
+}
+
+/// Compact subtext describing the session provider, model, or turns.
+pub fn session_detail(session: &Session) -> String {
+    let provider_name = session.provider.short_name();
+    if let Some(model) = &session.chosen_model {
+        format!("{provider_name} · {model}")
+    } else {
+        let agent_turns = session
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Agent(_)))
+            .count();
+        if agent_turns > 1 {
+            format!("{provider_name} · {agent_turns} turns")
+        } else if agent_turns == 1 {
+            format!("{provider_name} · 1 turn")
+        } else {
+            provider_name.to_string()
+        }
+    }
 }
 
 /// Sidebar state that only lasts while the app is open.
@@ -44,8 +74,6 @@ pub struct Sidebar {
     confirm_delete: Option<u64>,
     /// What the user typed in the filter box.
     filter: String,
-    /// Quick filter chip selected.
-    filter_kind: FilterKind,
     /// Projects whose sessions are folded away.
     folded: BTreeSet<PathBuf>,
     /// Each project's branch and changed-file count.
@@ -144,7 +172,7 @@ impl Sidebar {
                 action = SidebarAction::NewSession;
             }
 
-            let workspaces = group_by_workspace(sessions, "", FilterKind::All);
+            let workspaces = group_by_workspace(sessions, "");
             if !workspaces.is_empty() {
                 ui.add_space(6.0);
                 ui.separator();
@@ -249,75 +277,34 @@ impl Sidebar {
             icons::paint(ui.painter(), icon_rect, Icon::Search, ui.visuals().weak_text_color());
 
             let field = egui::TextEdit::singleline(&mut self.filter)
-                .hint_text("Filter sessions…")
+                .hint_text("Search…")
                 .desired_width(f32::INFINITY);
             ui.add(field);
-            if !self.filter.is_empty() && icons::small_button(ui, Icon::Close, "Clear the filter").clicked() {
+            if !self.filter.is_empty() && icons::small_button(ui, Icon::Close, "Clear search").clicked() {
                 self.filter.clear();
-            }
-        });
-
-        let counts = attention(sessions);
-        ui.add_space(3.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let all_label = format!("All {}", sessions.len());
-            if ui.selectable_label(self.filter_kind == FilterKind::All, all_label).clicked() {
-                self.filter_kind = FilterKind::All;
-            }
-            if counts.working > 0 {
-                let working_text = egui::RichText::new(format!("● {}", counts.working))
-                    .color(egui::Color32::from_rgb(34, 197, 94));
-                if ui
-                    .selectable_label(self.filter_kind == FilterKind::Working, working_text)
-                    .on_hover_text("Show busy sessions")
-                    .clicked()
-                {
-                    self.filter_kind = if self.filter_kind == FilterKind::Working {
-                        FilterKind::All
-                    } else {
-                        FilterKind::Working
-                    };
-                }
-            }
-            if counts.failed > 0 {
-                let failed_text =
-                    egui::RichText::new(format!("● {}", counts.failed)).color(ui.visuals().error_fg_color);
-                if ui
-                    .selectable_label(self.filter_kind == FilterKind::Errors, failed_text)
-                    .on_hover_text("Show failed sessions")
-                    .clicked()
-                {
-                    self.filter_kind = if self.filter_kind == FilterKind::Errors {
-                        FilterKind::All
-                    } else {
-                        FilterKind::Errors
-                    };
-                }
             }
         });
         ui.add_space(4.0);
 
-        let workspaces = group_by_workspace(sessions, &self.filter, self.filter_kind);
+        let workspaces = group_by_workspace(sessions, &self.filter);
         // git is asked before the rows are drawn, so the closures below don't have
         // to borrow the sidebar twice.
         let summaries: Vec<Option<RepoSummary>> = workspaces
             .iter()
             .map(|workspace| workspace.dir.clone().and_then(|dir| self.summary(&dir, ui.ctx())))
             .collect();
-        let filtering = !self.filter.is_empty() || self.filter_kind != FilterKind::All;
+        let filtering = !self.filter.is_empty();
 
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             if workspaces.is_empty() {
                 ui.add_space(20.0);
                 ui.vertical_centered(|ui| {
-                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), egui::Sense::hover());
+                    let (icon_rect, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
                     icons::paint(ui.painter(), icon_rect, Icon::Search, ui.visuals().weak_text_color());
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new("Nothing matches").weak());
-                    if filtering && ui.small_button("Clear filter").clicked() {
+                    if filtering && ui.small_button("Clear search").clicked() {
                         self.filter.clear();
-                        self.filter_kind = FilterKind::All;
                     }
                 });
             }
@@ -340,12 +327,13 @@ impl Sidebar {
                 }
                 if !folded {
                     for session in workspace.sessions {
+                        ui.add_space(2.0);
                         if let Some(row_action) = self.row(ui, session, active == Some(session.id)) {
                             action = row_action;
                         }
                     }
                 }
-                ui.add_space(8.0);
+                ui.add_space(6.0);
             }
         });
         action
@@ -372,138 +360,96 @@ impl Sidebar {
             egui::UiBuilder::new().id_salt(("session_row", session.id)).sense(egui::Sense::click()),
             |ui| {
                 let response = ui.response();
-                let visuals = ui.style().interact_selectable(&response, selected);
                 let hovered = response.hovered();
 
-                let (fill, stroke) = if selected {
+                let fill = if selected {
                     if ui.visuals().dark_mode {
-                        (
-                            egui::Color32::from_rgb(30, 33, 42),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(52, 58, 72)),
-                        )
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 20)
                     } else {
-                        (
-                            egui::Color32::from_rgb(235, 238, 246),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(190, 200, 220)),
-                        )
+                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 16)
                     }
                 } else if hovered {
                     if ui.visuals().dark_mode {
-                        (
-                            egui::Color32::from_rgb(24, 26, 32),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 50)),
-                        )
+                        egui::Color32::from_rgba_premultiplied(255, 255, 255, 10)
                     } else {
-                        (
-                            egui::Color32::from_rgb(245, 246, 250),
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(220, 224, 232)),
-                        )
+                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 8)
                     }
                 } else {
-                    (egui::Color32::TRANSPARENT, egui::Stroke::NONE)
+                    egui::Color32::TRANSPARENT
                 };
 
                 let card_frame = egui::Frame::new()
                     .fill(fill)
-                    .stroke(stroke)
+                    .stroke(egui::Stroke::NONE)
                     .corner_radius(6.0)
-                    .inner_margin(egui::Margin::symmetric(8, 6));
+                    .inner_margin(egui::Margin::symmetric(9, 5));
 
-                let frame_res = card_frame.show(ui, |ui| {
+                card_frame.show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        let (status_rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-                        let center = status_rect.center();
-                        let is_running = session.is_running();
-                        let is_failed = !is_running && matches!(session.entries.last(), Some(Entry::Error(_)));
+                    let state = session_state(session);
 
-                        if is_running {
-                            let time = ui.input(|i| i.time);
-                            let pulse = (time * 4.0).sin() as f32 * 0.5 + 0.5;
-                            let outer_r = 3.5 + pulse * 2.5;
-                            let alpha = ((1.0 - pulse) * 140.0) as u8;
-                            ui.painter().circle_filled(
-                                center,
-                                outer_r,
-                                egui::Color32::from_rgba_premultiplied(34, 197, 94, alpha),
-                            );
-                            ui.painter().circle_filled(center, 3.2, egui::Color32::from_rgb(34, 197, 94));
-                            ui.ctx().request_repaint();
-                        } else if is_failed {
-                            ui.painter().circle_filled(center, 3.2, ui.visuals().error_fg_color);
-                        } else {
-                            let idle_color = if selected {
-                                egui::Color32::from_rgb(115, 125, 140)
-                            } else {
-                                egui::Color32::from_rgb(60, 66, 78)
-                            };
-                            ui.painter().circle_filled(center, 2.2, idle_color);
+                    ui.horizontal(|ui| {
+                        // Status dot: ONLY shown for active/pulsing or failed sessions.
+                        // Idle sessions do not take up space or draw dots, maintaining Claude-like calm.
+                        match state {
+                            SessionState::Running => {
+                                let (status_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                                let center = status_rect.center();
+                                let time = ui.input(|i| i.time);
+                                let pulse = (time * 4.0).sin() as f32 * 0.5 + 0.5;
+                                let outer_r = 3.0 + pulse * 2.0;
+                                let alpha = ((1.0 - pulse) * 120.0) as u8;
+                                ui.painter().circle_filled(
+                                    center,
+                                    outer_r,
+                                    egui::Color32::from_rgba_premultiplied(34, 197, 94, alpha),
+                                );
+                                ui.painter().circle_filled(center, 2.8, egui::Color32::from_rgb(34, 197, 94));
+                                ui.ctx().request_repaint();
+                            }
+                            SessionState::Failed => {
+                                let (status_rect, _) =
+                                    ui.allocate_exact_size(egui::vec2(10.0, 14.0), egui::Sense::hover());
+                                let center = status_rect.center();
+                                ui.painter().circle_filled(center, 2.8, ui.visuals().error_fg_color);
+                            }
+                            SessionState::Idle => {}
                         }
 
                         ui.vertical(|ui| {
                             ui.set_width(ui.available_width());
+                            ui.spacing_mut().item_spacing.y = 1.5;
 
-                            let right_text = if is_running {
-                                Some(egui::RichText::new("Active").small().color(egui::Color32::from_rgb(34, 197, 94)))
-                            } else if is_failed {
-                                Some(egui::RichText::new("Failed").small().color(ui.visuals().error_fg_color))
+                            // Title row
+                            let title_color = if selected {
+                                ui.visuals().strong_text_color()
                             } else {
-                                let agent_turns = session
-                                    .entries
-                                    .iter()
-                                    .filter(|e| matches!(e, Entry::Agent(_)))
-                                    .count();
-                                if agent_turns > 0 {
-                                    let text = if agent_turns == 1 {
-                                        "1 turn".to_owned()
-                                    } else {
-                                        format!("{agent_turns} turns")
-                                    };
-                                    Some(egui::RichText::new(text).size(10.5).weak())
-                                } else {
-                                    None
-                                }
+                                ui.visuals().text_color()
                             };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&session.title)
+                                        .color(title_color)
+                                        .strong(),
+                                )
+                                .truncate(),
+                            );
 
-                            let reserved_right = if right_text.is_some() { 55.0 } else { 0.0 };
+                            // Subtext row: provider, model / turns, and action button on hover
                             ui.horizontal(|ui| {
-                                ui.set_width(ui.available_width());
-                                let label_width = (ui.available_width() - reserved_right).max(40.0);
-                                let label_color = if selected {
-                                    visuals.text_color()
-                                } else {
-                                    ui.visuals().text_color()
-                                };
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let detail = session_detail(session);
+                                let reserved_right = if hovered || selected { 22.0 } else { 0.0 };
+                                let detail_width = (ui.available_width() - reserved_right).max(20.0);
                                 ui.add_sized(
-                                    egui::vec2(label_width, 14.0),
-                                    egui::Label::new(
-                                        egui::RichText::new(&session.title).strong().color(label_color),
-                                    )
-                                    .truncate(),
+                                    egui::vec2(detail_width, 14.0),
+                                    egui::Label::new(egui::RichText::new(detail).size(11.0).weak()).truncate(),
                                 );
-                                if let Some(tag) = right_text {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.add(egui::Label::new(tag).selectable(false));
-                                    });
-                                }
-                            });
-
-                            let reserved_actions = if hovered || selected { 64.0 } else { 0.0 };
-                            ui.horizontal(|ui| {
-                                ui.set_width(ui.available_width());
-                                paint_provider_pill(ui, session.provider);
-
-                                if let Some(model) = &session.chosen_model {
-                                    let model_width = (ui.available_width() - reserved_actions).max(20.0);
-                                    ui.add_sized(
-                                        egui::vec2(model_width, 14.0),
-                                        egui::Label::new(egui::RichText::new(model).size(10.5).weak()).truncate(),
-                                    );
-                                }
 
                                 if hovered || selected {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let more = icons::small_button(ui, Icon::More, "More options");
+                                        let more = icons::small_button(ui, Icon::More, "Options");
                                         egui::Popup::menu(&more).show(|ui| {
                                             if ui.button("Rename").clicked() {
                                                 self.renaming = Some((session.id, session.title.clone()));
@@ -512,26 +458,12 @@ impl Sidebar {
                                                 self.confirm_delete = Some(session.id);
                                             }
                                         });
-                                        if icons::small_button(ui, Icon::Trash, "Delete session").clicked() {
-                                            self.confirm_delete = Some(session.id);
-                                        }
-                                        if icons::small_button(ui, Icon::Edit, "Rename session").clicked() {
-                                            self.renaming = Some((session.id, session.title.clone()));
-                                        }
                                     });
                                 }
                             });
                         });
                     });
                 });
-
-                if selected {
-                    let accent_rect = egui::Rect::from_min_max(
-                        egui::pos2(frame_res.response.rect.left() + 1.0, frame_res.response.rect.top() + 6.0),
-                        egui::pos2(frame_res.response.rect.left() + 4.0, frame_res.response.rect.bottom() - 6.0),
-                    );
-                    ui.painter().rect_filled(accent_rect, 1.5, ui.visuals().selection.bg_fill);
-                }
             },
         );
 
@@ -557,10 +489,11 @@ impl Sidebar {
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .corner_radius(6.0)
-            .inner_margin(egui::Margin::symmetric(8, 6))
+            .inner_margin(egui::Margin::symmetric(9, 6))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.add(egui::Label::new(format!("Delete “{}”?", session.title)).truncate());
+                ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let delete = egui::Button::new(egui::RichText::new("Delete").color(ui.visuals().error_fg_color));
                     if ui.add(delete).clicked() {
@@ -574,124 +507,6 @@ impl Sidebar {
             });
         action
     }
-}
-
-/// The background and text colors for a provider's identity pill.
-pub fn provider_colors(provider: Provider, dark_mode: bool) -> (egui::Color32, egui::Color32) {
-    if dark_mode {
-        match provider {
-            Provider::Claude => (
-                egui::Color32::from_rgb(55, 30, 22),
-                egui::Color32::from_rgb(249, 115, 22),
-            ),
-            Provider::Codex => (
-                egui::Color32::from_rgb(20, 42, 32),
-                egui::Color32::from_rgb(52, 211, 153),
-            ),
-            Provider::Antigravity => (
-                egui::Color32::from_rgb(34, 28, 58),
-                egui::Color32::from_rgb(167, 139, 250),
-            ),
-        }
-    } else {
-        match provider {
-            Provider::Claude => (
-                egui::Color32::from_rgb(254, 237, 232),
-                egui::Color32::from_rgb(194, 65, 12),
-            ),
-            Provider::Codex => (
-                egui::Color32::from_rgb(236, 253, 245),
-                egui::Color32::from_rgb(5, 150, 105),
-            ),
-            Provider::Antigravity => (
-                egui::Color32::from_rgb(245, 243, 255),
-                egui::Color32::from_rgb(109, 40, 217),
-            ),
-        }
-    }
-}
-
-/// A micro-badge showing the AI provider with distinctive theme branding.
-fn paint_provider_pill(ui: &mut egui::Ui, provider: Provider) {
-    let (bg, fg) = provider_colors(provider, ui.visuals().dark_mode);
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(3.5)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(
-                    egui::RichText::new(provider.short_name())
-                        .size(10.5)
-                        .color(fg)
-                        .strong(),
-                )
-                .selectable(false),
-            );
-        });
-}
-
-/// Background and text color for the git branch capsule.
-pub fn git_branch_colors(dark_mode: bool) -> (egui::Color32, egui::Color32) {
-    if dark_mode {
-        (egui::Color32::from_rgb(34, 32, 50), egui::Color32::from_rgb(175, 160, 230))
-    } else {
-        (egui::Color32::from_rgb(240, 238, 250), egui::Color32::from_rgb(100, 80, 180))
-    }
-}
-
-/// A capsule displaying the git branch name with an icon.
-fn paint_branch_pill(ui: &mut egui::Ui, branch: &str) {
-    let (bg, fg) = git_branch_colors(ui.visuals().dark_mode);
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(3.5)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 3.0;
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
-                icons::paint(ui.painter(), rect, Icon::Branch, fg);
-                ui.add(egui::Label::new(egui::RichText::new(branch).size(11.0).color(fg)).selectable(false));
-            });
-        });
-}
-
-/// Background and text color for git changed-file counts.
-pub fn git_changes_colors(changed: usize, dark_mode: bool) -> (egui::Color32, egui::Color32) {
-    if changed > 0 {
-        if dark_mode {
-            (egui::Color32::from_rgb(48, 34, 18), egui::Color32::from_rgb(245, 158, 11))
-        } else {
-            (egui::Color32::from_rgb(254, 243, 199), egui::Color32::from_rgb(180, 83, 9))
-        }
-    } else if dark_mode {
-        (egui::Color32::from_rgb(28, 32, 38), egui::Color32::from_rgb(120, 130, 145))
-    } else {
-        (egui::Color32::from_rgb(240, 242, 245), egui::Color32::from_rgb(100, 110, 125))
-    }
-}
-
-/// A capsule displaying the number of uncommitted git changes.
-fn paint_changes_pill(ui: &mut egui::Ui, count: usize) -> egui::Response {
-    let (bg, fg) = git_changes_colors(count, ui.visuals().dark_mode);
-    let text = match count {
-        0 => "clean".to_owned(),
-        1 => "+1 change".to_owned(),
-        n => format!("+{n} changes"),
-    };
-    egui::Frame::new()
-        .fill(bg)
-        .corner_radius(3.5)
-        .inner_margin(egui::Margin::symmetric(5, 1))
-        .show(ui, |ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(text).size(11.0).color(fg).strong())
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-            )
-        })
-        .inner
 }
 
 /// Computes a 1-character monogram for a project avatar on the collapsed rail.
@@ -711,17 +526,8 @@ pub struct Workspace<'a> {
     pub sessions: Vec<&'a Session>,
 }
 
-/// Whether a session is worth showing while `needle` is typed in the filter box
-/// and matching the quick-filter `kind`.
-fn matches(session: &Session, needle: &str, kind: FilterKind) -> bool {
-    let matches_kind = match kind {
-        FilterKind::All => true,
-        FilterKind::Working => session.is_running(),
-        FilterKind::Errors => !session.is_running() && matches!(session.entries.last(), Some(Entry::Error(_))),
-    };
-    if !matches_kind {
-        return false;
-    }
+/// Whether a session is worth showing while `needle` is typed in the search box.
+fn matches(session: &Session, needle: &str) -> bool {
     if needle.is_empty() {
         return true;
     }
@@ -734,14 +540,10 @@ fn matches(session: &Session, needle: &str, kind: FilterKind) -> bool {
 
 /// Groups sessions by the folder they work in, so one project's work stays together.
 /// Workspaces are ordered by their newest session, and so are the sessions inside them.
-/// Only sessions matching `filter` and `kind` are kept, and a workspace with none is dropped.
-pub fn group_by_workspace<'a>(
-    sessions: &'a [Session],
-    filter: &str,
-    kind: FilterKind,
-) -> Vec<Workspace<'a>> {
+/// Only sessions matching `filter` are kept, and a workspace with none is dropped.
+pub fn group_by_workspace<'a>(sessions: &'a [Session], filter: &str) -> Vec<Workspace<'a>> {
     let mut workspaces: Vec<Workspace<'a>> = Vec::new();
-    for session in sessions.iter().rev().filter(|session| matches(session, filter, kind)) {
+    for session in sessions.iter().rev().filter(|session| matches(session, filter)) {
         let path = session.has_folder().then(|| session.project_dir.display().to_string());
         match workspaces.iter_mut().find(|workspace| workspace.path == path) {
             Some(workspace) => workspace.sessions.push(session),
@@ -773,19 +575,19 @@ fn workspace_heading(
     folded: bool,
 ) -> Option<Heading> {
     let mut action = None;
-    ui.add_space(4.0);
+    ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 3.0;
+        ui.spacing_mut().item_spacing.x = 4.0;
         let chevron = if folded { Icon::ChevronRight } else { Icon::ChevronDown };
         let tip = if folded { "Show these sessions" } else { "Fold these sessions away" };
         if workspace.dir.is_some() && icons::small_button(ui, chevron, tip).clicked() {
             action = Some(Heading::Fold);
         }
 
-        let (folder_rect, _) = ui.allocate_exact_size(egui::vec2(13.0, 13.0), egui::Sense::hover());
+        let (folder_rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
         icons::paint(ui.painter(), folder_rect, Icon::Folder, ui.visuals().weak_text_color());
 
-        let name = egui::RichText::new(&workspace.name).strong().color(ui.visuals().text_color());
+        let name = egui::RichText::new(&workspace.name).size(12.0).strong().color(ui.visuals().text_color());
         let heading = ui.add(egui::Label::new(name).truncate().selectable(false).sense(egui::Sense::click()));
         match &workspace.path {
             Some(path) => {
@@ -808,20 +610,43 @@ fn workspace_heading(
     });
 
     if let Some(summary) = summary {
-        ui.add_space(2.0);
+        ui.add_space(1.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
-            ui.add_space(18.0);
+            ui.add_space(16.0);
 
-            paint_branch_pill(ui, &summary.branch);
+            let (branch_rect, _) = ui.allocate_exact_size(egui::vec2(10.0, 10.0), egui::Sense::hover());
+            icons::paint(ui.painter(), branch_rect, Icon::Branch, ui.visuals().weak_text_color());
 
-            let changes_response = paint_changes_pill(ui, summary.changed);
-            if summary.changed > 0 && changes_response.on_hover_text("Show the uncommitted changes").clicked() {
-                action = Some(Heading::OpenChanges(workspace.dir.clone().unwrap_or_default()));
+            ui.add(
+                egui::Label::new(egui::RichText::new(&summary.branch).size(11.0).weak())
+                    .truncate()
+                    .selectable(false),
+            );
+
+            if summary.changed > 0 {
+                let text = if summary.changed == 1 {
+                    "· 1 change".to_owned()
+                } else {
+                    format!("· {} changes", summary.changed)
+                };
+                let change_color = if ui.visuals().dark_mode {
+                    egui::Color32::from_rgb(245, 158, 11)
+                } else {
+                    egui::Color32::from_rgb(180, 83, 9)
+                };
+                let changes_label = ui.add(
+                    egui::Label::new(egui::RichText::new(text).size(11.0).color(change_color))
+                        .selectable(false)
+                        .sense(egui::Sense::click()),
+                );
+                if changes_label.on_hover_text("Show the uncommitted changes").clicked() {
+                    action = Some(Heading::OpenChanges(workspace.dir.clone().unwrap_or_default()));
+                }
             }
         });
     }
-    ui.add_space(4.0);
+    ui.add_space(2.0);
     action
 }
 
@@ -878,7 +703,7 @@ mod tests {
             session(2, "C:\\work\\beta"),
             session(3, "C:\\work\\alpha"),
         ];
-        let workspaces = group_by_workspace(&sessions, "", FilterKind::All);
+        let workspaces = group_by_workspace(&sessions, "");
         // Beta holds the newest session that isn't alpha's, but alpha's newest is newer.
         let names: Vec<&str> = workspaces.iter().map(|workspace| workspace.name.as_str()).collect();
         assert_eq!(names, ["alpha", "beta"]);
@@ -891,7 +716,7 @@ mod tests {
     #[test]
     fn sessions_without_a_folder_share_one_group() {
         let sessions = vec![session(1, ""), session(2, "C:\\work\\alpha"), session(3, "")];
-        let workspaces = group_by_workspace(&sessions, "", FilterKind::All);
+        let workspaces = group_by_workspace(&sessions, "");
         assert_eq!(workspaces.len(), 2);
         assert_eq!(workspaces[0].path, None, "the newest session has no folder yet");
         assert_eq!(workspaces[0].sessions.len(), 2);
@@ -906,17 +731,17 @@ mod tests {
         sessions[1].title = "Rename a column".into();
 
         // The title matches, whatever the case.
-        let found = group_by_workspace(&sessions, "LOGIN", FilterKind::All);
+        let found = group_by_workspace(&sessions, "LOGIN");
         assert_eq!(found.len(), 1, "only the project holding the match is left");
         assert_eq!(found[0].sessions[0].id, 1);
 
         // So does the folder, which is how you narrow to one project.
-        let by_folder = group_by_workspace(&sessions, "beta", FilterKind::All);
+        let by_folder = group_by_workspace(&sessions, "beta");
         assert_eq!(by_folder.len(), 1);
         assert_eq!(by_folder[0].sessions[0].id, 2);
 
-        assert!(group_by_workspace(&sessions, "nothing here", FilterKind::All).is_empty());
-        assert_eq!(group_by_workspace(&sessions, "", FilterKind::All).len(), 2, "an empty filter keeps everything");
+        assert!(group_by_workspace(&sessions, "nothing here").is_empty());
+        assert_eq!(group_by_workspace(&sessions, "").len(), 2, "an empty filter keeps everything");
     }
 
     #[test]
@@ -932,47 +757,34 @@ mod tests {
     }
 
     #[test]
-    fn the_filter_chips_separate_working_and_failed_sessions() {
-        let mut sessions = vec![
-            session(1, "C:\\work\\alpha"),
-            session(2, "C:\\work\\alpha"),
-        ];
-        sessions[1].entries.push(Entry::Error("boom".into()));
-
-        let errors = group_by_workspace(&sessions, "", FilterKind::Errors);
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0].sessions[0].id, 2);
-
-        let working = group_by_workspace(&sessions, "", FilterKind::Working);
-        assert!(working.is_empty(), "neither session is running");
-
-        let all = group_by_workspace(&sessions, "", FilterKind::All);
-        assert_eq!(all[0].sessions.len(), 2);
-    }
-
-    #[test]
     fn workspace_initials_extracts_first_letter() {
-        assert_eq!(workspace_initials("Barduino"), "B");
+        assert_eq!(workspace_initials("Viper"), "V");
         assert_eq!(workspace_initials("frontend-app"), "F");
         assert_eq!(workspace_initials("123-service"), "1");
         assert_eq!(workspace_initials(""), "?");
     }
 
     #[test]
-    fn provider_pill_colors_are_distinct() {
-        for provider in [Provider::Claude, Provider::Codex, Provider::Antigravity] {
-            let (dark_bg, dark_fg) = provider_colors(provider, true);
-            let (light_bg, light_fg) = provider_colors(provider, false);
-            assert_ne!(dark_bg, dark_fg);
-            assert_ne!(light_bg, light_fg);
-        }
+    fn session_state_reflects_running_and_error() {
+        let mut s = session(1, "a");
+        assert_eq!(session_state(&s), SessionState::Idle);
+
+        s.entries.push(Entry::Error("failed to run".into()));
+        assert_eq!(session_state(&s), SessionState::Failed);
     }
 
     #[test]
-    fn git_changes_colors_reflect_status() {
-        let (dark_clean_bg, dark_clean_fg) = git_changes_colors(0, true);
-        let (dark_dirty_bg, dark_dirty_fg) = git_changes_colors(3, true);
-        assert_ne!(dark_clean_bg, dark_dirty_bg);
-        assert_ne!(dark_clean_fg, dark_dirty_fg);
+    fn session_detail_formats_provider_and_turns() {
+        let mut s = session(1, "a");
+        assert_eq!(session_detail(&s), "Claude");
+
+        s.entries.push(Entry::Agent("hello".into()));
+        assert_eq!(session_detail(&s), "Claude · 1 turn");
+
+        s.entries.push(Entry::Agent("world".into()));
+        assert_eq!(session_detail(&s), "Claude · 2 turns");
+
+        s.chosen_model = Some("claude-3-7-sonnet".into());
+        assert_eq!(session_detail(&s), "Claude · claude-3-7-sonnet");
     }
 }
