@@ -57,9 +57,9 @@ pub fn args(turn: &Turn) -> Vec<String> {
         args.extend(["--conversation".into(), conversation_id.clone()]);
     }
     // Prompts can carry a whole page of HTML from attached elements, far more than
-    // a command line holds on Windows. Passing "--print" runs in print mode, and start_turn
-    // sends the prompt on stdin.
-    args.push("--print".into());
+    // a command line holds on Windows. start_turn sends the prompt on stdin, and agy
+    // runs in print mode when given --output-format stream-json. Passing bare "--print"
+    // is rejected by Go's flag parser because -print requires a prompt argument.
     args
 }
 
@@ -84,13 +84,50 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .map(|denied| string(&denied["display_name"]))
                 .filter(|name| !name.is_empty())
                 .collect();
+
+            let status = string(&result["status"]);
+            let err_msg = match result["error"]["message"].as_str() {
+                Some(message) if !message.is_empty() => message.to_owned(),
+                _ => match result["error"].as_str() {
+                    Some(message) if !message.is_empty() => message.to_owned(),
+                    _ => match result["message"].as_str() {
+                        Some(message) if !message.is_empty() => message.to_owned(),
+                        _ => string(&result["response"]),
+                    },
+                },
+            };
+            let lower_err = err_msg.to_lowercase();
+            if denied_tools.is_empty()
+                && (status == "PERMISSION_DENIED"
+                    || status.contains("DENIED")
+                    || lower_err.contains("permission")
+                    || lower_err.contains("sandbox")
+                    || lower_err.contains("forbidden"))
+            {
+                if lower_err.contains("command")
+                    || lower_err.contains("terminal")
+                    || lower_err.contains("bash")
+                    || lower_err.contains("shell")
+                {
+                    denied_tools.push("RunCommand".to_owned());
+                } else if lower_err.contains("edit")
+                    || lower_err.contains("write")
+                    || lower_err.contains("file")
+                {
+                    denied_tools.push("EditFile".to_owned());
+                } else {
+                    denied_tools.push("Action".to_owned());
+                }
+            }
             denied_tools.sort();
             denied_tools.dedup();
 
-            let status = string(&result["status"]);
-            let error = (status != "SUCCESS").then(|| match result["error"]["message"].as_str() {
-                Some(message) if !message.is_empty() => message.to_owned(),
-                _ => format!("Antigravity stopped with status {status}."),
+            let error = (status != "SUCCESS" && denied_tools.is_empty()).then(|| {
+                if !err_msg.is_empty() {
+                    err_msg
+                } else {
+                    format!("Antigravity stopped with status {status}.")
+                }
             });
             vec![AgentEvent::Finished {
                 session_id: result["conversation_id"].as_str().map(str::to_owned),
@@ -288,7 +325,6 @@ mod tests {
                 "accept-edits",
                 "--conversation",
                 "abc",
-                "--print",
             ]
         );
     }
@@ -305,7 +341,7 @@ mod tests {
             effort: None,
         };
         let cli_args = args(&turn);
-        assert!(cli_args.contains(&"--print".to_owned()));
+        assert!(!cli_args.iter().any(|arg| arg == "--print"), "bare --print is rejected by Go's flag parser");
         assert!(!cli_args.iter().any(|arg| arg.contains("xxxx")), "prompts are sent on stdin, never on argv");
     }
 
@@ -313,5 +349,44 @@ mod tests {
     fn failed_results_become_errors() {
         let line = r#"{"event":"result","result":{"conversation_id":"x","status":"ERROR","response":""}}"#;
         assert!(matches!(&parse_line(line)[..], [AgentEvent::Finished { error: Some(e), .. }] if e.contains("ERROR")));
+    }
+
+    #[test]
+    fn permission_failure_with_denied_tools_omits_error() {
+        let line = r#"{"event":"result","result":{"conversation_id":"x","status":"PERMISSION_DENIED","response":"","denied_actions":[{"action":"run_command","display_name":"RunCommand"}]}}"#;
+        let events = parse_line(line);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Finished {
+                session_id: Some("x".into()),
+                error: None,
+                denied_tools: vec!["RunCommand".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+
+        // Even with a generic failure status, having denied tools reports as a tool denial rather than a crash.
+        let failed = r#"{"event":"result","result":{"conversation_id":"x","status":"FAILED","response":"","denied_actions":[{"action":"run_command","display_name":"RunCommand"}]}}"#;
+        assert_eq!(
+            parse_line(failed),
+            vec![AgentEvent::Finished {
+                session_id: Some("x".into()),
+                error: None,
+                denied_tools: vec!["RunCommand".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+
+        // If denied_actions is empty but status is PERMISSION_DENIED or error mentions permission, infer denied tool.
+        let denied_no_actions = r#"{"event":"result","result":{"conversation_id":"x","status":"PERMISSION_DENIED","response":"","error":{"message":"Permission check failed: command execution not allowed"}}}"#;
+        assert_eq!(
+            parse_line(denied_no_actions),
+            vec![AgentEvent::Finished {
+                session_id: Some("x".into()),
+                error: None,
+                denied_tools: vec!["RunCommand".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
     }
 }

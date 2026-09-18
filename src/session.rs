@@ -290,17 +290,20 @@ impl Session {
                 }
                 self.entries.push(Entry::ToolOutput { text, is_error });
             }
-            AgentEvent::Finished { session_id, error, denied_tools, .. } => {
+            AgentEvent::Finished { session_id, error, mut denied_tools, .. } => {
                 self.keep_streamed_text();
                 // Resuming can hand back a new session ID; always continue from the latest one.
                 if session_id.is_some() {
                     self.agent_session_id = session_id;
                 }
-                if let Some(error) = error {
-                    self.error_shown = true;
-                    self.entries.push(Entry::Error(error));
+                if denied_tools.is_empty()
+                    && let Some(err) = &error
+                    && is_permission_error(err)
+                {
+                    denied_tools.push(infer_denied_tool(err).to_owned());
                 }
                 if !denied_tools.is_empty() {
+                    self.error_shown = true;
                     // Headless CLIs can't be asked for approval, so anything needing it is
                     // refused until the session is on full access.
                     let what_to_do = if self.permission_mode == PermissionMode::Full {
@@ -316,6 +319,9 @@ impl Session {
                         self.provider.short_name(),
                         denied_tools.join(", ")
                     )));
+                } else if let Some(error) = error {
+                    self.error_shown = true;
+                    self.entries.push(Entry::Error(error));
                 }
             }
             AgentEvent::Exited { error } => {
@@ -326,7 +332,23 @@ impl Session {
                 } else if let Some(error) = error
                     && !self.error_shown
                 {
-                    self.entries.push(Entry::Error(error));
+                    if is_permission_error(&error) {
+                        let tool = infer_denied_tool(&error);
+                        let what_to_do = if self.permission_mode == PermissionMode::Full {
+                            "It refused even on full access, so it may be the CLI's own setting.".to_owned()
+                        } else {
+                            format!(
+                                "Pick \"{}\" under the message box to let it do that without asking.",
+                                PermissionMode::Full.label()
+                            )
+                        };
+                        self.entries.push(Entry::Notice(format!(
+                            "{} wasn't allowed to use: {tool}. {what_to_do}",
+                            self.provider.short_name()
+                        )));
+                    } else {
+                        self.entries.push(Entry::Error(error));
+                    }
                 }
                 self.turn = None;
                 self.stop_requested = false;
@@ -341,6 +363,38 @@ impl Session {
         if !text.trim().is_empty() {
             self.entries.push(Entry::Agent(text));
         }
+    }
+}
+
+fn is_permission_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("sandbox")
+        || lower.contains("permission")
+        || lower.contains("disallowed")
+        || lower.contains("read-only")
+        || lower.contains("read only")
+        || lower.contains("read_only")
+        || lower.contains("operation not permitted")
+        || lower.contains("access is denied")
+        || lower.contains("access denied")
+        || lower.contains("forbidden")
+}
+
+fn infer_denied_tool(text: &str) -> &'static str {
+    let lower = text.to_lowercase();
+    if lower.contains("command")
+        || lower.contains("terminal")
+        || lower.contains("bash")
+        || lower.contains("shell")
+    {
+        "Shell"
+    } else if lower.contains("edit")
+        || lower.contains("write")
+        || lower.contains("file")
+    {
+        "Edit"
+    } else {
+        "Action"
     }
 }
 
@@ -448,6 +502,62 @@ mod tests {
         });
         let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice") };
         assert!(text.contains("refused even on full access"), "{text}");
+    }
+
+    #[test]
+    fn denied_tools_suppresses_process_exit_error() {
+        let mut s = session(Provider::Codex);
+        s.handle_event(AgentEvent::Finished {
+            session_id: None,
+            error: None,
+            denied_tools: vec!["Edit".into()],
+            usage: None,
+        });
+        s.handle_event(AgentEvent::Exited {
+            error: Some("Codex exited with code 1. Sandbox violation.".into()),
+        });
+        assert_eq!(s.entries.len(), 1);
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice") };
+        assert!(text.contains("wasn't allowed to use: Edit"), "{text}");
+    }
+
+    #[test]
+    fn denied_tools_take_precedence_over_finished_error() {
+        let mut s = session(Provider::Claude);
+        s.handle_event(AgentEvent::Finished {
+            session_id: None,
+            error: Some("Generic failure message".into()),
+            denied_tools: vec!["Bash".into()],
+            usage: None,
+        });
+        assert_eq!(s.entries.len(), 1);
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice, not an error") };
+        assert!(text.contains("wasn't allowed to use: Bash"), "{text}");
+    }
+
+    #[test]
+    fn process_exit_permission_error_becomes_denied_tool_notice() {
+        let mut s = session(Provider::Codex);
+        s.handle_event(AgentEvent::Exited {
+            error: Some("Codex exited with code 1. Sandbox violation: writing to file is forbidden in read-only mode.".into()),
+        });
+        assert_eq!(s.entries.len(), 1);
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice, not an error") };
+        assert!(text.contains("wasn't allowed to use: Edit"), "{text}");
+    }
+
+    #[test]
+    fn finished_permission_error_without_denied_tools_becomes_notice() {
+        let mut s = session(Provider::Claude);
+        s.handle_event(AgentEvent::Finished {
+            session_id: None,
+            error: Some("Permission denied: command execution not allowed in read-only mode".into()),
+            denied_tools: Vec::new(),
+            usage: None,
+        });
+        assert_eq!(s.entries.len(), 1);
+        let [Entry::Notice(text)] = &s.entries[..] else { panic!("expected a notice, not an error") };
+        assert!(text.contains("wasn't allowed to use: Shell"), "{text}");
     }
 
     #[test]

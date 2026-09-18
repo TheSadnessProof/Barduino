@@ -346,9 +346,12 @@ pub fn start_turn(
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let running = RunningTurn::new(child);
 
-    // Claude reads the prompt from stdin, which avoids command-line quoting and length
-    // limits. Dropping stdin afterwards tells the CLI the prompt is complete.
-    let prompt = turn.prompt;
+    // The prompt is sent on stdin to avoid command-line quoting and length limits.
+    // In Plan mode under Codex, planning guidance is prepended since Codex lacks a native plan flag.
+    let prompt = match (provider, turn.permission_mode) {
+        (Provider::Codex, PermissionMode::Plan) => codex::plan_prompt(&turn.prompt),
+        _ => turn.prompt,
+    };
     thread::spawn(move || {
         let _ = stdin.write_all(prompt.as_bytes());
     });
@@ -801,5 +804,29 @@ mod tests {
         let events: Vec<AgentEvent> = rx.iter().collect();
         let exited = events.iter().any(|e| matches!(e, AgentEvent::Exited { .. }));
         assert!(exited, "turn should exit and emit Exited event");
+    }
+
+    #[test]
+    fn codex_plan_mode_prepares_planning_prompt() {
+        let turn = Turn {
+            prompt: "Build a navbar".into(),
+            cwd: PathBuf::new(),
+            resume_session: None,
+            permission_mode: PermissionMode::Plan,
+            model: None,
+            effort: None,
+        };
+        let codex_prompt = match (Provider::Codex, turn.permission_mode) {
+            (Provider::Codex, PermissionMode::Plan) => codex::plan_prompt(&turn.prompt),
+            _ => turn.prompt.clone(),
+        };
+        assert!(codex_prompt.contains("plan mode"));
+        assert!(codex_prompt.contains("Build a navbar"));
+
+        let claude_prompt = match (Provider::Claude, turn.permission_mode) {
+            (Provider::Codex, PermissionMode::Plan) => codex::plan_prompt(&turn.prompt),
+            _ => turn.prompt.clone(),
+        };
+        assert_eq!(claude_prompt, "Build a navbar", "other providers use their native planning flags");
     }
 }

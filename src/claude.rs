@@ -41,6 +41,11 @@ pub fn args(turn: &Turn) -> Vec<String> {
         .map(String::from)
         .to_vec();
     args.extend(["--permission-mode".to_owned(), permission_mode.to_owned()]);
+    if turn.permission_mode == PermissionMode::ReadOnly {
+        args.extend(["--disallowed-tools".to_owned(), "Bash".to_owned()]);
+    }
+    // Headless mode can't answer permission prompts: anything requiring approval is denied automatically.
+    args.extend(["--permission-prompts".to_owned(), "none".to_owned()]);
     if let Some(model) = &turn.model {
         args.extend(["--model".to_owned(), model.clone()]);
     }
@@ -106,13 +111,35 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
                 .flatten()
                 .map(|denial| string(&denial["tool_name"]))
                 .collect();
+
+            let subtype = string(&msg["subtype"]);
+            let result = string(&msg["result"]);
+            let terminal_reason = string(&msg["terminal_reason"]);
+            if denied_tools.is_empty()
+                && (subtype == "error_disallowed_tool"
+                    || subtype.contains("permission")
+                    || terminal_reason.contains("permission")
+                    || terminal_reason.contains("disallowed")
+                    || result.to_lowercase().contains("permission denied")
+                    || result.to_lowercase().contains("disallowed tool"))
+            {
+                let lower = format!("{result} {subtype} {terminal_reason}").to_lowercase();
+                if lower.contains("bash") || lower.contains("command") || lower.contains("terminal") {
+                    denied_tools.push("Bash".to_owned());
+                } else if lower.contains("edit") {
+                    denied_tools.push("Edit".to_owned());
+                } else if lower.contains("write") {
+                    denied_tools.push("Write".to_owned());
+                } else {
+                    denied_tools.push("Tool".to_owned());
+                }
+            }
             denied_tools.sort();
             denied_tools.dedup();
 
-            let error = msg["is_error"].as_bool().unwrap_or(false).then(|| {
-                let result = string(&msg["result"]);
+            let error = (msg["is_error"].as_bool().unwrap_or(false) && denied_tools.is_empty()).then(|| {
                 if result.is_empty() {
-                    format!("Claude stopped with an error ({}).", string(&msg["subtype"]))
+                    format!("Claude stopped with an error ({}).", subtype)
                 } else {
                     result
                 }
@@ -252,6 +279,21 @@ mod tests {
     }
 
     #[test]
+    fn read_only_restricts_command_tools_and_bypasses_prompts() {
+        let turn = Turn {
+            prompt: "hello".into(),
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: None,
+            effort: None,
+        };
+        let args = args(&turn);
+        assert!(args.windows(2).any(|pair| pair == ["--disallowed-tools", "Bash"]), "{args:?}");
+        assert!(args.windows(2).any(|pair| pair == ["--permission-prompts", "none"]), "{args:?}");
+    }
+
+    #[test]
     fn an_edit_carries_both_sides_of_the_change() {
         let line = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"C:\\work\\a.rs","old_string":"let x = 1;","new_string":"let x = 2;"}}]},"parent_tool_use_id":null}"#;
         let [AgentEvent::ToolUse { edit: Some(edit), .. }] = &parse_line(line)[..] else {
@@ -339,6 +381,57 @@ mod tests {
             panic!("expected one Finished event");
         };
         assert_eq!(error.as_deref(), Some("Claude stopped with an error (error_max_turns)."));
+    }
+
+    #[test]
+    fn permission_failure_with_denials_omits_error() {
+        let line = r#"{"type":"result","subtype":"error_permission","is_error":true,"result":"Permission denied for Bash","session_id":"abc","permission_denials":[{"tool_name":"Bash"}]}"#;
+        let events = parse_line(line);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Finished {
+                session_id: Some("abc".into()),
+                error: None,
+                denied_tools: vec!["Bash".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+
+        // When disallowed tools trigger turn termination, report as a tool denial rather than a crash.
+        let disallowed = r#"{"type":"result","subtype":"error_disallowed_tool","is_error":true,"result":"Disallowed tool Bash called","session_id":"abc","permission_denials":[{"tool_name":"Bash"}]}"#;
+        assert_eq!(
+            parse_line(disallowed),
+            vec![AgentEvent::Finished {
+                session_id: Some("abc".into()),
+                error: None,
+                denied_tools: vec!["Bash".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+
+        // Even if permission_denials is empty, an error_disallowed_tool subtype identifies the denied tool.
+        let disallowed_empty = r#"{"type":"result","subtype":"error_disallowed_tool","is_error":true,"result":"Disallowed tool Bash called","session_id":"abc","permission_denials":[]}"#;
+        assert_eq!(
+            parse_line(disallowed_empty),
+            vec![AgentEvent::Finished {
+                session_id: Some("abc".into()),
+                error: None,
+                denied_tools: vec!["Bash".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+
+        // A result specifying terminal_reason as permission_denied identifies the denied tool.
+        let terminal_reason_denied = r#"{"type":"result","subtype":"error","terminal_reason":"permission_denied","is_error":true,"result":"Command execution restricted","session_id":"abc","permission_denials":[]}"#;
+        assert_eq!(
+            parse_line(terminal_reason_denied),
+            vec![AgentEvent::Finished {
+                session_id: Some("abc".into()),
+                error: None,
+                denied_tools: vec!["Bash".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
     }
 
     #[test]

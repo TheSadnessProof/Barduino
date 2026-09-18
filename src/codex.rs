@@ -71,6 +71,64 @@ pub fn args(turn: &Turn) -> Vec<String> {
     args
 }
 
+thread_local! {
+    static DENIED_TOOLS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_denied_tool(name: &str) {
+    DENIED_TOOLS.with(|tools| {
+        let mut tools = tools.borrow_mut();
+        if !tools.iter().any(|t| t == name) {
+            tools.push(name.to_owned());
+        }
+    });
+}
+
+fn take_denied_tools() -> Vec<String> {
+    DENIED_TOOLS.with(|tools| {
+        let mut tools = tools.borrow_mut();
+        let mut result = std::mem::take(&mut *tools);
+        result.sort();
+        result.dedup();
+        result
+    })
+}
+
+fn clear_denied_tools() {
+    DENIED_TOOLS.with(|tools| {
+        tools.borrow_mut().clear();
+    });
+}
+
+fn is_sandbox_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("sandbox")
+        || lower.contains("permission")
+        || lower.contains("disallowed")
+        || lower.contains("read-only")
+        || lower.contains("read only")
+        || lower.contains("read_only")
+        || lower.contains("operation not permitted")
+        || lower.contains("access is denied")
+        || lower.contains("access denied")
+        || lower.contains("blocked by sandbox")
+        || lower.contains("forbidden")
+}
+
+/// Guides Codex to formulate an implementation plan rather than attempting file edits,
+/// since Codex does not have a native planning mode flag.
+pub fn plan_prompt(prompt: &str) -> String {
+    const GUIDANCE: &str =
+        "You are in plan mode. Formulate an implementation plan for the requested changes rather than attempting file edits or modifications, as the workspace is in read-only mode.";
+    if prompt.starts_with(GUIDANCE) {
+        prompt.to_owned()
+    } else if prompt.trim().is_empty() {
+        GUIDANCE.to_owned()
+    } else {
+        format!("{GUIDANCE}\n\n{prompt}")
+    }
+}
+
 /// Parses one line of `codex exec --json` output.
 pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     let Ok(msg) = serde_json::from_str::<Value>(line.trim()) else {
@@ -80,7 +138,12 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
     match msg["type"].as_str().unwrap_or_default() {
         // Nothing in the stream names the model, and the UI copes with not knowing it.
         "thread.started" => {
+            clear_denied_tools();
             vec![AgentEvent::Started { session_id: string(&msg["thread_id"]), model: String::new() }]
+        }
+        "turn.started" => {
+            clear_denied_tools();
+            Vec::new()
         }
         "item.started" => match tool_name(&msg["item"]) {
             Some(name) => vec![AgentEvent::ToolUse { name, detail: item_detail(&msg["item"]), edit: None }],
@@ -90,15 +153,39 @@ pub fn parse_line(line: &str) -> Vec<AgentEvent> {
         "turn.completed" => vec![AgentEvent::Finished {
             session_id: None,
             error: None,
-            denied_tools: Vec::new(),
+            denied_tools: take_denied_tools(),
             usage: Some(turn_usage(&msg["usage"])),
         }],
         "turn.failed" => {
-            let message = string(&msg["error"]["message"]);
+            let message = match msg["error"]["message"].as_str() {
+                Some(m) if !m.is_empty() => m.to_owned(),
+                _ => match msg["error"].as_str() {
+                    Some(m) if !m.is_empty() => m.to_owned(),
+                    _ => string(&msg["message"]),
+                },
+            };
+            let is_sandbox = is_sandbox_error(&message);
+            let mut denied_tools = take_denied_tools();
+            if is_sandbox && denied_tools.is_empty() {
+                let lower = message.to_lowercase();
+                if lower.contains("file") || lower.contains("writ") || lower.contains("edit") {
+                    denied_tools.push("Edit".to_owned());
+                } else {
+                    denied_tools.push("Shell".to_owned());
+                }
+            }
+            denied_tools.sort();
+            denied_tools.dedup();
+
+            let error = if denied_tools.is_empty() {
+                Some(if message.is_empty() { "Codex stopped with an error.".to_owned() } else { message })
+            } else {
+                None
+            };
             vec![AgentEvent::Finished {
                 session_id: None,
-                error: Some(if message.is_empty() { "Codex stopped with an error.".to_owned() } else { message }),
-                denied_tools: Vec::new(),
+                error,
+                denied_tools,
                 usage: None,
             }]
         }
@@ -140,16 +227,50 @@ fn tool_name(item: &Value) -> Option<String> {
 }
 
 fn completed_item(item: &Value) -> Vec<AgentEvent> {
-    match item["type"].as_str().unwrap_or_default() {
+    let item_type = item["type"].as_str().unwrap_or_default();
+    match item_type {
         // A finished block of text, which the UI shows in place of anything streamed before it.
         "agent_message" => match string(&item["text"]) {
             text if text.trim().is_empty() => Vec::new(),
             text => vec![AgentEvent::Text(text)],
         },
         // Trouble Codex worked around, such as an unknown model name, arrives as its own item.
-        "error" => vec![AgentEvent::ToolResult { text: string(&item["message"]), is_error: true }],
+        "error" => {
+            let message = match item["message"].as_str() {
+                Some(m) if !m.is_empty() => m.to_owned(),
+                _ => match item["error"]["message"].as_str() {
+                    Some(m) if !m.is_empty() => m.to_owned(),
+                    _ => string(&item["error"]),
+                },
+            };
+            if is_sandbox_error(&message) {
+                let lower = message.to_lowercase();
+                if lower.contains("file") || lower.contains("writ") || lower.contains("edit") {
+                    record_denied_tool("Edit");
+                } else {
+                    record_denied_tool("Shell");
+                }
+            }
+            vec![AgentEvent::ToolResult { text: message, is_error: true }]
+        }
         // Reasoning has no matching event, and `codex exec` doesn't summarise it anyway.
         _ if tool_name(item).is_some() => {
+            let err_msg = string(&item["error"]["message"]);
+            let err_str = string(&item["error"]);
+            let output = string(&item["aggregated_output"]);
+            if item_type == "file_change" {
+                if is_sandbox_error(&err_msg)
+                    || is_sandbox_error(&err_str)
+                    || (item["status"] == "failed" && err_msg.is_empty() && item["error"].is_null())
+                {
+                    record_denied_tool("Edit");
+                }
+            } else if item_failed(item)
+                && (is_sandbox_error(&output) || is_sandbox_error(&err_msg) || is_sandbox_error(&err_str))
+            {
+                let name = tool_name(item).unwrap_or_else(|| "Tool".to_owned());
+                record_denied_tool(&name);
+            }
             vec![AgentEvent::ToolResult { text: item_output(item), is_error: item_failed(item) }]
         }
         _ => Vec::new(),
@@ -179,11 +300,26 @@ fn item_detail(item: &Value) -> String {
 /// such as a plan update, show as an empty (and so collapsed) tool output.
 fn item_output(item: &Value) -> String {
     match item["type"].as_str().unwrap_or_default() {
-        "command_execution" => string(&item["aggregated_output"]),
+        "command_execution" => {
+            let output = string(&item["aggregated_output"]);
+            if !output.is_empty() {
+                output
+            } else {
+                let msg = string(&item["error"]["message"]);
+                if !msg.is_empty() {
+                    msg
+                } else {
+                    string(&item["error"])
+                }
+            }
+        }
         "file_change" => changes(item).join("\n"),
         "mcp_tool_call" => match item["error"]["message"].as_str() {
             Some(message) => message.to_owned(),
-            None => mcp_text(&item["result"]["content"]),
+            None => match item["error"].as_str() {
+                Some(message) => message.to_owned(),
+                None => mcp_text(&item["result"]["content"]),
+            },
         },
         _ => String::new(),
     }
@@ -408,6 +544,136 @@ mod tests {
         assert!(parse_line(r#"{"type":"item.completed","item":{"id":"i1","type":"reasoning"}}"#).is_empty());
         assert!(parse_line("not json").is_empty());
         assert!(parse_line("").is_empty());
+    }
+
+    #[test]
+    fn plan_mode_guides_the_model_to_plan_without_edits() {
+        let guided = plan_prompt("Fix the login bug");
+        assert!(guided.starts_with("You are in plan mode. Formulate an implementation plan"));
+        assert!(guided.ends_with("Fix the login bug"));
+        assert_eq!(plan_prompt(&guided), guided, "does not duplicate guidance if already present");
+    }
+
+    #[test]
+    fn captures_failed_file_change_as_denied_edit_tool() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let item = r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","changes":[{"path":"notes.txt","kind":"update"}],"status":"failed"}}"#;
+        let events = parse_line(item);
+        assert_eq!(events, vec![AgentEvent::ToolResult { text: "update notes.txt".into(), is_error: true }]);
+        let finished = parse_line(r#"{"type":"turn.completed","usage":{}}"#);
+        assert_eq!(
+            finished,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["Edit".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+    }
+
+    #[test]
+    fn captures_sandbox_command_failure_as_denied_shell_tool() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let item = r#"{"type":"item.completed","item":{"id":"i2","type":"command_execution","command":"mkdir test","aggregated_output":"Operation not permitted (sandbox read-only)","exit_code":1,"status":"failed"}}"#;
+        let events = parse_line(item);
+        assert_eq!(events, vec![AgentEvent::ToolResult { text: "Operation not permitted (sandbox read-only)".into(), is_error: true }]);
+        let finished = parse_line(r#"{"type":"turn.completed","usage":{}}"#);
+        assert_eq!(
+            finished,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["Shell".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_failed_due_to_sandbox_reports_denied_tool_without_error() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let failed = r#"{"type":"turn.failed","error":{"message":"Sandbox execution error: writing to notes.txt is forbidden in read-only mode"}}"#;
+        let events = parse_line(failed);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["Edit".into()],
+                usage: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn patch_mismatch_does_not_record_denied_tool() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let item = r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","changes":[{"path":"notes.txt","kind":"update"}],"status":"failed","error":{"message":"Could not match replacement hunk"}}}"#;
+        let events = parse_line(item);
+        assert_eq!(events, vec![AgentEvent::ToolResult { text: "update notes.txt".into(), is_error: true }]);
+        let finished = parse_line(r#"{"type":"turn.completed","usage":{}}"#);
+        assert_eq!(
+            finished,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: Vec::new(),
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_failed_after_denied_item_omits_error_even_with_generic_message() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let item = r#"{"type":"item.completed","item":{"id":"i1","type":"file_change","changes":[{"path":"notes.txt","kind":"update"}],"status":"failed"}}"#;
+        parse_line(item);
+        let failed = r#"{"type":"turn.failed","error":{"message":"1 tool call failed"}}"#;
+        let events = parse_line(failed);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["Edit".into()],
+                usage: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn turn_failed_with_string_error_reports_denied_tool() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let failed = r#"{"type":"turn.failed","error":"Sandbox violation: cannot modify workspace in read-only mode"}"#;
+        let events = parse_line(failed);
+        assert_eq!(
+            events,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["Shell".into()],
+                usage: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn mcp_tool_permission_failure_records_denied_tool() {
+        parse_line(r#"{"type":"turn.started"}"#);
+        let item = r#"{"type":"item.completed","item":{"id":"i3","type":"mcp_tool_call","server":"git","tool":"commit","error":{"message":"Permission denied: committing is disallowed in read-only mode"}}}"#;
+        let events = parse_line(item);
+        assert_eq!(events, vec![AgentEvent::ToolResult { text: "Permission denied: committing is disallowed in read-only mode".into(), is_error: true }]);
+        let finished = parse_line(r#"{"type":"turn.completed","usage":{}}"#);
+        assert_eq!(
+            finished,
+            vec![AgentEvent::Finished {
+                session_id: None,
+                error: None,
+                denied_tools: vec!["git.commit".into()],
+                usage: Some(Usage { turns: 1, ..Default::default() }),
+            }]
+        );
     }
 
     fn run_turn(turn: Turn) -> Vec<AgentEvent> {
