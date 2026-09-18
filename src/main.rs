@@ -14,6 +14,7 @@ mod git_diff;
 mod icons;
 mod line_diff;
 mod logo;
+mod markdown;
 mod models;
 mod plan;
 mod session;

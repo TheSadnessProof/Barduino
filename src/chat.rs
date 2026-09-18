@@ -9,6 +9,7 @@ use crate::browser::PickedElement;
 use crate::commands::{self, CommandSource, Handling, SlashAction, SlashCommand};
 use crate::git_diff::LineKind;
 use crate::line_diff::FileEdit;
+use crate::markdown;
 use crate::models::{self, Catalog};
 use crate::session::{Entry, Session};
 use crate::icons::{self, Icon};
@@ -475,7 +476,7 @@ pub fn conversation(
     ui: &mut egui::Ui,
     session: &Session,
     settings: &Settings,
-    markdown: &mut egui_commonmark::CommonMarkCache,
+    _markdown: &mut egui_commonmark::CommonMarkCache,
 ) -> ConversationAction {
     if session.entries.is_empty() && session.streaming.is_empty() {
         let mut action = ConversationAction::None;
@@ -493,15 +494,38 @@ pub fn conversation(
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show(ui, |ui| {
+            let model = session.model.as_deref().or(session.chosen_model.as_deref());
             for (index, entry) in session.entries.iter().enumerate() {
-                show_entry(ui, (session.id, index), entry, markdown, &session.project_dir);
+                let show_agent_header = if index == 0 {
+                    true
+                } else {
+                    !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
+                };
+                show_entry(
+                    ui,
+                    (session.id, index),
+                    entry,
+                    session.provider,
+                    model,
+                    show_agent_header,
+                    &session.project_dir,
+                );
             }
-            // Streaming text is rendered as markdown like committed entries. The view
-            // reflows as structures complete, but that is the same behaviour users
-            // already expect from Claude.ai and ChatGPT, so it is a smaller surprise
-            // than seeing raw markdown source mid-reply.
             if !session.streaming.is_empty() {
-                egui_commonmark::CommonMarkViewer::new().show(ui, markdown, &session.streaming);
+                let show_agent_header = if session.entries.is_empty() {
+                    true
+                } else {
+                    !matches!(session.entries.last(), Some(Entry::Agent(_)))
+                };
+                markdown::show_agent_turn(
+                    ui,
+                    egui::Id::new(("streaming", session.id)),
+                    &session.streaming,
+                    session.provider,
+                    model,
+                    true,
+                    show_agent_header,
+                );
             }
             ui.add_space(8.0);
         });
@@ -693,7 +717,9 @@ fn show_entry(
     ui: &mut egui::Ui,
     id: (u64, usize),
     entry: &Entry,
-    markdown: &mut egui_commonmark::CommonMarkCache,
+    provider: Provider,
+    model: Option<&str>,
+    show_agent_header: bool,
     project_dir: &Path,
 ) {
     match entry {
@@ -705,7 +731,12 @@ fn show_entry(
                     ui.set_width(ui.available_width());
                     ui.label(egui::RichText::new("You").strong());
                     if !message.text.is_empty() {
-                        ui.label(&message.text);
+                        markdown::render_plain_or_markdown(
+                            ui,
+                            egui::Id::new(("user_msg", id.0, id.1)),
+                            &message.text,
+                            ui.visuals().dark_mode,
+                        );
                     }
                     if !message.elements.is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -717,9 +748,17 @@ fn show_entry(
                 });
             ui.add_space(4.0);
         }
-        // Agents write in markdown, so headings, lists and code blocks are shown as such.
+        // Agents write in markdown, formatted with Claude Code and Codex visuals.
         Entry::Agent(text) => {
-            egui_commonmark::CommonMarkViewer::new().show(ui, markdown, text);
+            markdown::show_agent_turn(
+                ui,
+                egui::Id::new(("agent_entry", id.0, id.1)),
+                text,
+                provider,
+                model,
+                false,
+                show_agent_header,
+            );
         }
         Entry::Tool { name, detail, edit } => {
             tool_row(ui, name, detail, project_dir);
