@@ -394,7 +394,7 @@ impl Tools {
             }
             self.add_menu(ui, cwd);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if icons::button(ui, Icon::Close, "Close panel").clicked() {
+                if icons::button(ui, Icon::SidebarRight, "Hide panel").clicked() {
                     *collapse = true;
                 }
             });
