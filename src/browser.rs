@@ -184,7 +184,10 @@ pub struct Browser {
     /// Which session's page is in the WebView. Comments and picking mode belong to
     /// that session, and the address alone can't tell them apart: two sessions in
     /// one project usually point at the same dev server.
-    showing: Option<u64>,
+    /// Which browser tab of which session the page belongs to. Marks left on it are
+    /// that tab's, so switching to another tab — even one on the same address —
+    /// starts clean rather than sending one page's comments about another.
+    showing: Option<(u64, u64)>,
     #[cfg(any(windows, target_os = "macos"))]
     native: Option<Result<native::NativeBrowser, String>>,
 }
@@ -227,7 +230,7 @@ impl Browser {
     #[cfg(not(any(windows, target_os = "macos")))]
     pub fn ui(
         &mut self,
-        _owner: u64,
+        _owner: (u64, u64),
         _state: &mut BrowserState,
         ui: &mut egui::Ui,
         _frame: &eframe::Frame,
@@ -248,7 +251,7 @@ impl Browser {
     #[cfg(any(windows, target_os = "macos"))]
     pub fn ui(
         &mut self,
-        owner: u64,
+        owner: (u64, u64),
         state: &mut BrowserState,
         ui: &mut egui::Ui,
         frame: &eframe::Frame,
@@ -259,8 +262,8 @@ impl Browser {
         let mut commands = Vec::new();
         let mut result = BrowserAction::None;
 
-        // Comments and picking belong to the session that left them, even when the
-        // next session happens to point at the same address.
+        // Comments and picking belong to the tab they were left on, even when the
+        // next one happens to point at the same address.
         if self.showing != Some(owner) {
             self.forget_marks();
             self.showing = Some(owner);

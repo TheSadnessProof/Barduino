@@ -22,8 +22,12 @@ enum Tab {
         focus: bool,
     },
     Changes(Changes),
-    /// There is at most one, because it shares the single browser window.
-    Browser,
+    /// A page. Every tab remembers its own address, but they take turns in the one
+    /// WebView the app owns, so switching to one loads the page it was showing.
+    Browser {
+        number: u64,
+        state: BrowserState,
+    },
 }
 
 /// Shown next to the menu items and in Settings; the keys are handled in app.rs.
@@ -56,11 +60,12 @@ pub struct Tools {
     tabs: Vec<Tab>,
     active: usize,
     next_terminal_number: u64,
+    next_browser_number: u64,
 }
 
 impl Default for Tools {
     fn default() -> Self {
-        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1 }
+        Self { tabs: Vec::new(), active: 0, next_terminal_number: 1, next_browser_number: 1 }
     }
 }
 
@@ -68,7 +73,7 @@ impl Tools {
 
     /// Whether this panel is the one showing the shared WebView.
     pub fn shows_browser(&self) -> bool {
-        matches!(self.tabs.get(self.active), Some(Tab::Browser))
+        matches!(self.tabs.get(self.active), Some(Tab::Browser { .. }))
     }
 
     /// Whether the tab in front is a terminal.
@@ -142,13 +147,33 @@ impl Tools {
 
     /// Shows the browser tab, opening it if needed.
     pub fn open_browser(&mut self) {
-        match self.tabs.iter().position(|tab| matches!(tab, Tab::Browser)) {
-            Some(index) => self.active = index,
-            None => {
-                self.tabs.push(Tab::Browser);
-                self.active = self.tabs.len() - 1;
-            }
+        // A new one each time, starting where the last one was looking: opening a
+        // second browser is nearly always to compare it with the first.
+        let number = self.next_browser_number;
+        self.next_browser_number += 1;
+        let state = self.browser_states().last().cloned().unwrap_or_default();
+        self.tabs.push(Tab::Browser { number, state });
+        self.active = self.tabs.len() - 1;
+    }
+
+    /// Shows a page: the browser tab already in front, or the most recent one, or a
+    /// new one. The shortcut returns you to the page you were on rather than opening
+    /// another every time it is pressed.
+    pub fn show_browser(&mut self) {
+        if self.shows_browser() {
+            return;
         }
+        match self.tabs.iter().rposition(|tab| matches!(tab, Tab::Browser { .. })) {
+            Some(index) => self.active = index,
+            None => self.open_browser(),
+        }
+    }
+
+    fn browser_states(&self) -> impl Iterator<Item = &BrowserState> {
+        self.tabs.iter().filter_map(|tab| match tab {
+            Tab::Browser { state, .. } => Some(state),
+            _ => None,
+        })
     }
 
     /// Closes tab `index`. Dropping a terminal tab stops its shell. The WebView is
@@ -163,7 +188,7 @@ impl Tools {
     /// Whether this panel has a browser tab open at all, in front or behind. The
     /// WebView is shared, so it may only be closed once this is false everywhere.
     pub fn wants_browser(&self) -> bool {
-        self.tabs.iter().any(|tab| matches!(tab, Tab::Browser))
+        self.tabs.iter().any(|tab| matches!(tab, Tab::Browser { .. }))
     }
 
     /// The "+" menu. `cwd` is where a new terminal starts. Returns true when a tab was opened.
@@ -218,7 +243,15 @@ impl Tools {
                         };
                         (changes.title(), hover)
                     }
-                    Tab::Browser => ("Browser".to_owned(), "Built-in browser".to_owned()),
+                                    Tab::Browser { number, state } => {
+                        let title = if *number == 1 { "Browser".to_owned() } else { format!("Browser {number}") };
+                        let hover = if state.address.is_empty() {
+                            "Built-in browser".to_owned()
+                        } else {
+                            state.address.clone()
+                        };
+                        (title, hover)
+                    }
                 };
 
                 let is_active = index == self.active;
@@ -335,15 +368,23 @@ impl Tools {
                 *focus = restarted;
             }
             Some(Tab::Changes(changes)) => changes.ui(ui),
-            Some(Tab::Browser) => {
+            Some(Tab::Browser { number, state }) => {
+                // The first browser of a session opens on the page it was last looking
+                // at, which is what was saved for it.
+                if state.address.is_empty() && !page.address.is_empty() {
+                    *state = page.clone();
+                }
                 // The page is a native window drawn over the app, so it has to get out
                 // of the way whenever a menu or popup needs to draw on top of it.
                 let page_visible = !egui::Popup::is_any_open(ui.ctx());
-                match browser.ui(id, page, ui, frame, page_visible) {
+                match browser.ui((id, *number), state, ui, frame, page_visible) {
                     BrowserAction::Attach(elements) => action = ToolsAction::Attach(elements),
                     BrowserAction::Send(elements) => action = ToolsAction::Send(elements),
                     BrowserAction::None => {}
                 }
+                // The session remembers the page in front of it, so that the one you
+                // were looking at is still there after a restart.
+                *page = state.clone();
             }
         }
         action
@@ -399,7 +440,42 @@ mod tests {
 
         // Nothing to focus in a browser tab, and asking anyway is harmless.
         tools.focus_terminal(1);
-        assert!(matches!(tools.tabs.get(1), Some(Tab::Browser)));
+        assert!(matches!(tools.tabs.get(1), Some(Tab::Browser { .. })));
+    }
+
+    #[test]
+    fn a_second_browser_is_a_second_tab_not_the_same_one_again() {
+        let mut tools = Tools::default();
+        tools.open_browser();
+        if let Some(Tab::Browser { state, .. }) = tools.tabs.get_mut(0) {
+            state.address = "localhost:3000".to_owned();
+        }
+
+        // Opening another gives you another, rather than putting you back on the one
+        // you already had — which is what comparing two pages needs.
+        tools.open_browser();
+        assert_eq!(tools.tabs.len(), 2, "two browsers");
+        assert_eq!(tools.active, 1, "and the new one is in front");
+
+        // It starts where the last one was looking, since a second browser is almost
+        // always opened to compare it with the first.
+        let addresses: Vec<&str> = tools.browser_states().map(|state| state.address.as_str()).collect();
+        assert_eq!(addresses, ["localhost:3000", "localhost:3000"]);
+
+        // But they are their own from then on.
+        if let Some(Tab::Browser { state, .. }) = tools.tabs.get_mut(1) {
+            state.address = "localhost:8080".to_owned();
+        }
+        let addresses: Vec<&str> = tools.browser_states().map(|state| state.address.as_str()).collect();
+        assert_eq!(addresses, ["localhost:3000", "localhost:8080"], "each tab keeps its own page");
+
+        // The shortcut returns you to a browser rather than opening yet another.
+        tools.open_terminal(Path::new("."), None);
+        tools.show_browser();
+        assert_eq!(tools.tabs.len(), 3, "no fourth tab");
+        assert!(tools.shows_browser());
+        tools.show_browser();
+        assert_eq!(tools.tabs.len(), 3, "and pressing it again stays put");
     }
 
     #[test]

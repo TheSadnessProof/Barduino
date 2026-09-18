@@ -62,6 +62,8 @@ pub struct Terminal {
     exited: Arc<AtomicBool>,
     /// Scroll wheel movement not yet turned into whole lines.
     scroll_remainder: f32,
+    /// What the user has dragged over, for the clipboard.
+    selection: Option<Selection>,
 }
 
 impl Terminal {
@@ -115,7 +117,7 @@ impl Terminal {
             ctx.request_repaint();
         });
 
-        Ok(Self { parser, writer, master: pair.master, child, size, exited, scroll_remainder: 0.0 })
+        Ok(Self { parser, writer, master: pair.master, child, size, exited, scroll_remainder: 0.0, selection: None })
     }
 
     fn parser(&self) -> MutexGuard<'_, Parser> {
@@ -157,7 +159,7 @@ impl Terminal {
         let (char_width, row_height) =
             ui.ctx().fonts_mut(|fonts| (fonts.glyph_width(&font_id, 'M'), fonts.row_height(&font_id)));
 
-        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click());
+        let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
         let rows = ((rect.height() - 2.0 * PADDING) / row_height).floor().max(2.0) as u16;
         let cols = ((rect.width() - 2.0 * PADDING) / char_width).floor().max(10.0) as u16;
         if (rows, cols) != self.size {
@@ -182,14 +184,42 @@ impl Terminal {
         }
         if response.hovered() {
             self.handle_scroll(ui, row_height);
+            // An I-beam is the only hint that the text can be taken, since a
+            // terminal has no other sign that dragging over it does anything.
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
         }
 
         let painter = ui.painter_at(rect);
         painter.rect_filled(rect, 0.0, BACKGROUND);
         let origin = rect.min + Vec2::splat(PADDING);
 
+        // Dragging selects; a plain click puts the cursor in and clears what was
+        // selected, the same as clicking in any other text.
+        if let Some(pos) = response.interact_pointer_pos() {
+            let cell = cell_at(pos - origin, char_width, row_height, self.size);
+            if response.drag_started() {
+                self.selection = Some(Selection { anchor: cell, head: cell });
+            } else if response.dragged() && let Some(selection) = &mut self.selection {
+                selection.head = cell;
+            } else if response.clicked() {
+                self.selection = None;
+            }
+        }
+
         let parser = self.parser();
         let screen = parser.screen();
+
+        // Painted under the text, so the text stays readable on top of it.
+        if let Some(selection) = self.selection.filter(|selection| !selection.is_empty()) {
+            let fill = ui.visuals().selection.bg_fill.gamma_multiply(0.5);
+            for row in 0..rows {
+                let Some((from, to)) = selection.columns_on(row, cols) else { continue };
+                let min = origin + Vec2::new(f32::from(from) * char_width, f32::from(row) * row_height);
+                let size = Vec2::new(f32::from(to - from) * char_width, row_height);
+                painter.rect_filled(egui::Rect::from_min_size(min, size), 0.0, fill);
+            }
+        }
+
         for row in 0..rows {
             let job = row_layout(screen, row, cols, &font_id);
             let galley = painter.layout_job(job);
@@ -211,11 +241,27 @@ impl Terminal {
         restart
     }
 
+    /// The text the user dragged over, ready for the clipboard. `None` when nothing
+    /// is selected, or when what is selected is only blank cells.
+    fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.filter(|selection| !selection.is_empty())?;
+        let ((top, left), (bottom, right)) = selection.ordered();
+        let parser = self.parser();
+        // Reads the rows on screen now, which is what was dragged over. The end
+        // column is exclusive, so the cell under the pointer needs the extra one.
+        let text = parser.screen().contents_between(top, left, bottom, right.saturating_add(1));
+        (!text.trim().is_empty()).then_some(text)
+    }
+
     fn handle_input(&mut self, ui: &egui::Ui) {
         let (app_cursor, bracketed_paste) = {
             let parser = self.parser();
             (parser.screen().application_cursor(), parser.screen().bracketed_paste())
         };
+        // Read before the events, so that copying doesn't reach for the parser lock
+        // while egui is holding its input.
+        let selected = self.selected_text();
+        let mut copying = None;
 
         let mut bytes = Vec::new();
         ui.input(|input| {
@@ -232,8 +278,13 @@ impl Terminal {
                             bytes.extend_from_slice(text.as_bytes());
                         }
                     }
-                    // The app turns Ctrl+C and Ctrl+X into copy/cut; in a terminal they are control keys.
-                    egui::Event::Copy => bytes.push(0x03),
+                    // Ctrl+C has to keep interrupting whatever is running — but with
+                    // something selected it means copy, as it does in every terminal.
+                    egui::Event::Copy => match &selected {
+                        Some(text) => copying = Some(text.clone()),
+                        None => bytes.push(0x03),
+                    },
+                    // The app turns Ctrl+X into cut; in a terminal it is a control key.
                     egui::Event::Cut => bytes.push(0x18),
                     egui::Event::Key { key, pressed: true, modifiers, .. } => {
                         if let Some(sequence) = key_sequence(*key, *modifiers, app_cursor) {
@@ -245,7 +296,13 @@ impl Terminal {
             }
         });
 
+        if let Some(text) = copying {
+            ui.ctx().copy_text(text);
+            self.selection = None;
+        }
         if !bytes.is_empty() {
+            // Typing moves on from whatever was selected, the same as in a text box.
+            self.selection = None;
             self.parser().screen_mut().set_scrollback(0);
             write_all(&self.writer, &bytes);
         }
@@ -256,6 +313,9 @@ impl Terminal {
         let lines = (self.scroll_remainder / row_height).trunc();
         if lines != 0.0 {
             self.scroll_remainder -= lines * row_height;
+            // A selection is a range of rows on screen, and scrolling puts different
+            // text under those rows. Keeping it would copy something else entirely.
+            self.selection = None;
             let mut parser = self.parser();
             let offset = parser.screen().scrollback() as i64 + lines as i64;
             parser.screen_mut().set_scrollback(offset.max(0) as usize);
@@ -301,6 +361,53 @@ pub fn show(
         *slot = None;
     }
     restart
+}
+
+/// Text the user has dragged over, as the two cells they dragged between.
+///
+/// Kept as anchor and head rather than start and end, because the head is wherever
+/// the pointer is now — dragging upwards or to the left is as ordinary as dragging
+/// down, and `ordered` is what sorts it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: (u16, u16),
+    head: (u16, u16),
+}
+
+impl Selection {
+    /// The two ends in reading order, both inclusive.
+    fn ordered(self) -> ((u16, u16), (u16, u16)) {
+        if self.anchor <= self.head { (self.anchor, self.head) } else { (self.head, self.anchor) }
+    }
+
+    /// Nothing was dragged over — a plain click, which clears rather than selects.
+    fn is_empty(self) -> bool {
+        self.anchor == self.head
+    }
+
+    /// The columns covered on one row, as a half-open range, or None when this row
+    /// has nothing selected on it. A selection spanning rows covers the rest of the
+    /// first row and the start of the last, which is how a terminal reads.
+    fn columns_on(self, row: u16, cols: u16) -> Option<(u16, u16)> {
+        let ((top, left), (bottom, right)) = self.ordered();
+        if row < top || row > bottom {
+            return None;
+        }
+        let from = if row == top { left } else { 0 };
+        // The cell under the pointer is part of what was dragged over, so the range
+        // runs one past it.
+        let to = if row == bottom { right.saturating_add(1).min(cols) } else { cols };
+        (from < to).then_some((from, to))
+    }
+}
+
+/// Which cell of the grid a point on screen falls in, clamped to the grid so that
+/// dragging past the edge selects to the edge rather than nowhere.
+fn cell_at(offset: Vec2, char_width: f32, row_height: f32, size: (u16, u16)) -> (u16, u16) {
+    let (rows, cols) = size;
+    let row = (offset.y / row_height.max(1.0)).floor().clamp(0.0, f32::from(rows.saturating_sub(1)));
+    let col = (offset.x / char_width.max(1.0)).floor().clamp(0.0, f32::from(cols.saturating_sub(1)));
+    (row as u16, col as u16)
 }
 
 /// Text on its way into a running terminal.
@@ -643,6 +750,48 @@ mod tests {
         let job = row_layout(parser.screen(), 0, 10, &FontId::monospace(FONT_SIZE));
         assert_eq!(job.text, "abcd      ");
         assert_eq!(job.sections.len(), 3);
+    }
+
+    #[test]
+    fn dragging_selects_the_cells_dragged_over() {
+        let size = (24, 80);
+        // Ten points per column, twenty per row, and the grid starts at the origin.
+        let at = |x: f32, y: f32| cell_at(Vec2::new(x, y), 10.0, 20.0, size);
+        assert_eq!(at(0.0, 0.0), (0, 0));
+        assert_eq!(at(25.0, 45.0), (2, 2), "a point inside a cell picks that cell");
+        // Dragging past an edge selects to the edge rather than off the grid.
+        assert_eq!(at(-50.0, -50.0), (0, 0));
+        assert_eq!(at(9999.0, 9999.0), (23, 79));
+    }
+
+    #[test]
+    fn a_selection_covers_the_rows_between_its_ends() {
+        let cols = 80;
+        let selection = Selection { anchor: (1, 10), head: (3, 5) };
+        // The first row from where it started to the end…
+        assert_eq!(selection.columns_on(1, cols), Some((10, cols)));
+        // …every row between in full…
+        assert_eq!(selection.columns_on(2, cols), Some((0, cols)));
+        // …and the last up to and including the cell the pointer is on.
+        assert_eq!(selection.columns_on(3, cols), Some((0, 6)));
+        // Nothing outside.
+        assert_eq!(selection.columns_on(0, cols), None);
+        assert_eq!(selection.columns_on(4, cols), None);
+
+        // Dragging up and to the left selects exactly the same cells.
+        let backwards = Selection { anchor: (3, 5), head: (1, 10) };
+        for row in 0..5 {
+            assert_eq!(backwards.columns_on(row, cols), selection.columns_on(row, cols), "row {row}");
+        }
+
+        // One cell is one cell, not nothing.
+        let single = Selection { anchor: (2, 4), head: (2, 4) };
+        assert!(single.is_empty(), "a click that didn't move selects nothing to copy");
+        assert_eq!(single.columns_on(2, cols), Some((4, 5)));
+
+        // A selection that ends on the last column doesn't run off the row.
+        let to_the_edge = Selection { anchor: (0, 70), head: (0, 79) };
+        assert_eq!(to_the_edge.columns_on(0, cols), Some((70, 80)));
     }
 
     #[test]

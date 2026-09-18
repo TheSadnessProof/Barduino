@@ -285,7 +285,7 @@ impl BarduinoApp {
             self.active_tools().show_terminal(&cwd);
         }
         if browser {
-            self.active_tools().open_browser();
+            self.active_tools().show_browser();
         }
         self.state.show_tools = true;
     }
