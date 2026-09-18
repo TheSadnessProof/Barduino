@@ -34,6 +34,19 @@ pub struct Settings {
     /// The shell new terminals run, or None to use the first one Barduino finds.
     #[serde(default)]
     pub shell: Option<PathBuf>,
+    /// True to run the agent in a terminal in the middle column, showing the CLI's
+    /// own interface, instead of Barduino's chat.
+    #[serde(default)]
+    pub chat_in_terminal: bool,
+    /// True in settings saved before the terminal chat was the default, so that
+    /// someone who already had Barduino is moved over once rather than having to
+    /// find the box. Consumed by the first launch that reads it.
+    #[serde(default = "saved_before_terminal_chat")]
+    pub apply_terminal_chat: bool,
+}
+
+fn saved_before_terminal_chat() -> bool {
+    true
 }
 
 impl Default for Settings {
@@ -43,6 +56,9 @@ impl Default for Settings {
             disabled_providers: Vec::new(),
             custom_executables: BTreeMap::new(),
             shell: None,
+            chat_in_terminal: true,
+            // A new install gets it from the line above; there is nothing to move over.
+            apply_terminal_chat: false,
         }
     }
 }
@@ -252,6 +268,9 @@ impl SettingsPage {
             hint(ui, "Which shell the terminals in the right panel run.");
             ui.add_space(8.0);
             shell_card(ui, settings, context.shells);
+
+            ui.add_space(14.0);
+            chat_in_terminal_card(ui, settings);
 
             ui.add_space(18.0);
             section_heading(ui, "Shortcuts", |_ui| {});
@@ -624,6 +643,27 @@ fn shell_card(ui: &mut egui::Ui, settings: &mut Settings, shells: &[Shell]) {
         }
         ui.add_space(2.0);
         hint(ui, "Terminals already open keep the shell they started with.");
+    });
+}
+
+/// Whether the middle column is Barduino's own chat or the CLI's own interface.
+fn chat_in_terminal_card(ui: &mut egui::Ui, settings: &mut Settings) {
+    card(ui, None, |ui| {
+        ui.checkbox(&mut settings.chat_in_terminal, "Run the agent in a terminal");
+        ui.add_space(4.0);
+        hint(
+            ui,
+            "Choose an agent and a folder, press Start, and the middle column becomes a terminal \
+             running that agent exactly as you would run it yourself — its own slash commands, its \
+             own approval prompts, its own model picker.",
+        );
+        ui.add_space(4.0);
+        hint(
+            ui,
+            "Turn it off for Barduino's own chat, which reads the agent's output instead and is \
+             where the diffs, plan limits and token counts come from. Either way, elements picked \
+             in the browser go to whichever is showing, and nothing is thrown away by switching.",
+        );
     });
 }
 
