@@ -4,7 +4,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -221,10 +221,32 @@ impl ProcessTree {
     fn new(child: &Child) -> Self {
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::{CloseHandle, HANDLE};
-        use windows::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
 
         let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }.ok();
         let job = job.filter(|job| {
+            // Configure the job so that if Barduino terminates or crashes,
+            // the Windows kernel automatically terminates all child processes in the job.
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    *job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .is_ok();
+            if !configured {
+                let _ = unsafe { CloseHandle(*job) };
+                return false;
+            }
+
             let assigned = unsafe { AssignProcessToJobObject(*job, HANDLE(child.as_raw_handle())) }.is_ok();
             if !assigned {
                 let _ = unsafe { CloseHandle(*job) };
@@ -250,11 +272,33 @@ impl Drop for ProcessTree {
     }
 }
 
-/// Elsewhere only the CLI itself is stopped for now.
-#[cfg(not(windows))]
+/// On Unix, child processes join a process group so stopping the turn terminates
+/// the CLI and any subprocesses (test runners, build tools) it spawned.
+#[cfg(unix)]
+struct ProcessTree(u32);
+
+#[cfg(unix)]
+impl ProcessTree {
+    fn new(child: &Child) -> Self {
+        Self(child.id())
+    }
+
+    fn kill(&self) {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        let pgid = self.0 as i32;
+        unsafe {
+            let _ = kill(-pgid, 15); // SIGTERM
+            let _ = kill(-pgid, 9);  // SIGKILL
+        }
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 struct ProcessTree;
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, unix)))]
 impl ProcessTree {
     fn new(_child: &Child) -> Self {
         Self
@@ -286,6 +330,11 @@ pub fn start_turn(
             antigravity::parse_line
         }
     };
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
     cmd.current_dir(&turn.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -310,16 +359,45 @@ pub fn start_turn(
         String::from_utf8_lossy(&bytes).into_owned()
     });
 
-    let waiter = Arc::clone(&running.child);
+    let (event_tx, event_rx) = mpsc::channel();
     thread::spawn(move || {
         for line in BufReader::new(stdout).split(b'\n') {
             let Ok(line) = line else { break };
             for event in parse_line(&String::from_utf8_lossy(&line)) {
-                on_event(event);
+                if event_tx.send(event).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+
+    let waiter = Arc::clone(&running.child);
+    let process_waiter = thread::spawn(move || wait_process(&waiter));
+
+    thread::spawn(move || {
+        loop {
+            match event_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => on_event(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // When the agent CLI exits, don't wait forever on stdout EOF
+                    // if an inherited pipe handle is kept open by a grandchild process.
+                    if process_waiter.is_finished() {
+                        break;
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
 
-        let status = wait(&waiter);
+        let status = process_waiter.join().unwrap_or_else(|_| {
+            Err(std::io::Error::other("Process waiter panicked"))
+        });
+
+        // Drain any lingering events buffered right before the process exited.
+        while let Ok(event) = event_rx.try_recv() {
+            on_event(event);
+        }
+
         let stderr = stderr_reader.join().unwrap_or_default();
         let error = match status {
             Ok(status) if status.success() => None,
@@ -344,14 +422,35 @@ pub fn hidden_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     cmd
 }
 
-fn wait(child: &Mutex<Child>) -> std::io::Result<ExitStatus> {
-    loop {
-        // Lock only briefly so a Stop click is never stuck behind this loop.
-        let status = child.lock().unwrap_or_else(PoisonError::into_inner).try_wait()?;
-        if let Some(status) = status {
-            return Ok(status);
+/// Waits synchronously for the child process to exit.
+fn wait_process(child: &Mutex<Child>) -> std::io::Result<ExitStatus> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::HANDLE;
+        unsafe extern "system" {
+            fn WaitForSingleObject(hHandle: HANDLE, dwMilliseconds: u32) -> u32;
         }
-        thread::sleep(Duration::from_millis(50));
+        let raw_handle = {
+            let guard = child.lock().unwrap_or_else(PoisonError::into_inner);
+            HANDLE(guard.as_raw_handle())
+        };
+        unsafe {
+            WaitForSingleObject(raw_handle, 0xFFFF_FFFF);
+        }
+        child.lock().unwrap_or_else(PoisonError::into_inner).try_wait()?.ok_or_else(|| {
+            std::io::Error::other("Process wait finished but status unavailable")
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        loop {
+            let status = child.lock().unwrap_or_else(PoisonError::into_inner).try_wait()?;
+            if let Some(status) = status {
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 }
 

@@ -2,6 +2,8 @@
 //! The agents hand over the text before and after rather than a diff, and the
 //! files may not be on disk yet, so the comparison happens here.
 
+use std::sync::OnceLock;
+
 use serde::{Deserialize, Serialize};
 
 use crate::git_diff::{DiffLine, LineKind};
@@ -10,27 +12,54 @@ use crate::git_diff::{DiffLine, LineKind};
 const CONTEXT: usize = 2;
 
 /// A file an agent's tool is about to change.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileEdit {
     pub path: String,
     /// The text being replaced, empty when the file is being written from scratch.
     pub old: String,
     pub new: String,
+    /// Memoized diff lines and line addition/removal counts, so redrawing the UI
+    /// does not recompute quadratic diff matrices every frame.
+    #[serde(skip)]
+    diff: OnceLock<(Vec<DiffLine>, (usize, usize))>,
+}
+
+impl PartialEq for FileEdit {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.old == other.old && self.new == other.new
+    }
 }
 
 impl FileEdit {
+    pub fn new(path: impl Into<String>, old: impl Into<String>, new: impl Into<String>) -> Self {
+        let edit = Self {
+            path: path.into(),
+            old: old.into(),
+            new: new.into(),
+            diff: OnceLock::new(),
+        };
+        edit.compute();
+        edit
+    }
+
+    fn compute(&self) -> &(Vec<DiffLine>, (usize, usize)) {
+        self.diff.get_or_init(|| {
+            let all = compare(&split(&self.old), &split(&self.new));
+            let added = all.iter().filter(|line| line.kind == LineKind::Added).count();
+            let removed = all.iter().filter(|line| line.kind == LineKind::Removed).count();
+            let lines = trim_to_context(all);
+            (lines, (added, removed))
+        })
+    }
+
     /// The change as diff lines, with a few lines of context around each edit.
-    pub fn lines(&self) -> Vec<DiffLine> {
-        let all = compare(&split(&self.old), &split(&self.new));
-        trim_to_context(all)
+    pub fn lines(&self) -> &[DiffLine] {
+        &self.compute().0
     }
 
     /// How many lines the edit adds and removes.
     pub fn counts(&self) -> (usize, usize) {
-        let lines = compare(&split(&self.old), &split(&self.new));
-        let added = lines.iter().filter(|line| line.kind == LineKind::Added).count();
-        let removed = lines.iter().filter(|line| line.kind == LineKind::Removed).count();
-        (added, removed)
+        self.compute().1
     }
 }
 
@@ -44,29 +73,75 @@ fn split(text: &str) -> Vec<&str> {
 
 /// Lines up the two versions on their longest common subsequence, which is what
 /// makes untouched lines show as context instead of a removal and an addition.
+///
+/// Trims identical prefix and suffix lines before building the dynamic programming table,
+/// reducing the matrix from the whole file to only the edited region.
 fn compare(old: &[&str], new: &[&str]) -> Vec<DiffLine> {
-    let table = common_lengths(old, new);
-    let mut lines = Vec::new();
+    let mut prefix_len = 0;
+    while prefix_len < old.len() && prefix_len < new.len() && old[prefix_len] == new[prefix_len] {
+        prefix_len += 1;
+    }
+
+    if prefix_len == old.len() && prefix_len == new.len() {
+        return (0..old.len())
+            .map(|i| line(LineKind::Context, Some(i), Some(i), old[i]))
+            .collect();
+    }
+
+    let mut suffix_len = 0;
+    while suffix_len < old.len() - prefix_len
+        && suffix_len < new.len() - prefix_len
+        && old[old.len() - 1 - suffix_len] == new[new.len() - 1 - suffix_len]
+    {
+        suffix_len += 1;
+    }
+
+    let mut lines = Vec::with_capacity(old.len() + new.len());
+
+    // 1. Context before the edit
+    for (i, text) in old.iter().take(prefix_len).enumerate() {
+        lines.push(line(LineKind::Context, Some(i), Some(i), text));
+    }
+
+    // 2. The edited region via dynamic programming LCS
+    let old_mid = &old[prefix_len..old.len() - suffix_len];
+    let new_mid = &new[prefix_len..new.len() - suffix_len];
+    let table = common_lengths(old_mid, new_mid);
     let (mut o, mut n) = (0, 0);
-    while o < old.len() && n < new.len() {
-        if old[o] == new[n] {
-            lines.push(line(LineKind::Context, Some(o), Some(n), old[o]));
+    while o < old_mid.len() && n < new_mid.len() {
+        if old_mid[o] == new_mid[n] {
+            lines.push(line(
+                LineKind::Context,
+                Some(prefix_len + o),
+                Some(prefix_len + n),
+                old_mid[o],
+            ));
             o += 1;
             n += 1;
         } else if table[o + 1][n] >= table[o][n + 1] {
-            lines.push(line(LineKind::Removed, Some(o), None, old[o]));
+            lines.push(line(LineKind::Removed, Some(prefix_len + o), None, old_mid[o]));
             o += 1;
         } else {
-            lines.push(line(LineKind::Added, None, Some(n), new[n]));
+            lines.push(line(LineKind::Added, None, Some(prefix_len + n), new_mid[n]));
             n += 1;
         }
     }
-    for (index, text) in old[o..].iter().enumerate() {
-        lines.push(line(LineKind::Removed, Some(o + index), None, text));
+    for (index, text) in old_mid[o..].iter().enumerate() {
+        lines.push(line(LineKind::Removed, Some(prefix_len + o + index), None, text));
     }
-    for (index, text) in new[n..].iter().enumerate() {
-        lines.push(line(LineKind::Added, None, Some(n + index), text));
+    for (index, text) in new_mid[n..].iter().enumerate() {
+        lines.push(line(LineKind::Added, None, Some(prefix_len + n + index), text));
     }
+
+    // 3. Context after the edit
+    let old_suffix_start = old.len() - suffix_len;
+    let new_suffix_start = new.len() - suffix_len;
+    for (i, text) in old[old_suffix_start..].iter().enumerate() {
+        let old_idx = old_suffix_start + i;
+        let new_idx = new_suffix_start + i;
+        lines.push(line(LineKind::Context, Some(old_idx), Some(new_idx), text));
+    }
+
     lines
 }
 
@@ -135,11 +210,11 @@ mod tests {
     use super::*;
 
     fn edit(old: &str, new: &str) -> FileEdit {
-        FileEdit { path: "src/main.rs".into(), old: old.into(), new: new.into() }
+        FileEdit::new("src/main.rs", old, new)
     }
 
     fn shown(edit: &FileEdit) -> Vec<(LineKind, String)> {
-        edit.lines().into_iter().map(|line| (line.kind, line.text)).collect()
+        edit.lines().iter().map(|line| (line.kind, line.text.clone())).collect()
     }
 
     #[test]
@@ -169,7 +244,8 @@ mod tests {
 
     #[test]
     fn line_numbers_follow_each_side() {
-        let lines = edit("a\nb\nc", "a\nB\nc").lines();
+        let edit = edit("a\nb\nc", "a\nB\nc");
+        let lines = edit.lines();
         let removed = lines.iter().find(|line| line.kind == LineKind::Removed).expect("one removal");
         let added = lines.iter().find(|line| line.kind == LineKind::Added).expect("one addition");
         assert_eq!((removed.old_number, removed.new_number), (Some(2), None));
@@ -196,5 +272,25 @@ mod tests {
     #[test]
     fn windows_line_endings_are_not_a_change() {
         assert!(edit("a\r\nb", "a\nb").lines().is_empty());
+    }
+
+    #[test]
+    fn large_files_with_small_changes_trim_prefix_and_suffix_instantly() {
+        let old: String = (1..=3000).map(|n| format!("line {n}\n")).collect();
+        let new = old.replace("line 1500", "line fifteen hundred");
+        let edit = edit(&old, &new);
+        assert_eq!(edit.counts(), (1, 1));
+        let lines = edit.lines();
+        let changed = lines.iter().find(|l| l.kind == LineKind::Added).expect("has addition");
+        assert_eq!(changed.text, "line fifteen hundred");
+    }
+
+    #[test]
+    fn diff_memoization_caches_lines_and_counts() {
+        let edit = edit("old\n", "new\n");
+        let counts1 = edit.counts();
+        let counts2 = edit.counts();
+        assert_eq!(counts1, counts2);
+        assert_eq!(edit.lines().len(), edit.lines().len());
     }
 }

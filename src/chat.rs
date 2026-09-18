@@ -558,21 +558,46 @@ pub fn conversation(
         .stick_to_bottom(true)
         .show(ui, |ui| {
             let model = session.model.as_deref().or(session.chosen_model.as_deref());
+            let clip = ui.clip_rect();
+            const CULL_MARGIN: f32 = 400.0;
+            let visible_min_y = clip.min.y - CULL_MARGIN;
+            let visible_max_y = clip.max.y + CULL_MARGIN;
+
             for (index, entry) in session.entries.iter().enumerate() {
-                let show_agent_header = if index == 0 {
-                    true
-                } else {
-                    !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
+                let entry_id = egui::Id::new(("entry_height", session.id, index));
+                let prev_height: Option<f32> = ui.ctx().data(|d| d.get_temp(entry_id));
+                let cursor_y = ui.cursor().top();
+
+                let is_offscreen = match prev_height {
+                    Some(height) => (cursor_y + height < visible_min_y) || (cursor_y > visible_max_y),
+                    None => false,
                 };
-                show_entry(
-                    ui,
-                    (session.id, index),
-                    entry,
-                    session.provider,
-                    model,
-                    show_agent_header,
-                    &session.project_dir,
-                );
+
+                if let Some(height) = prev_height
+                    && is_offscreen
+                {
+                    ui.add_space(height);
+                } else {
+                    let show_agent_header = if index == 0 {
+                        true
+                    } else {
+                        !matches!(session.entries.get(index - 1), Some(Entry::Agent(_)))
+                    };
+                    let resp = ui
+                        .scope(|ui| {
+                            show_entry(
+                                ui,
+                                (session.id, index),
+                                entry,
+                                session.provider,
+                                model,
+                                show_agent_header,
+                                &session.project_dir,
+                            );
+                        })
+                        .response;
+                    ui.ctx().data_mut(|d| d.insert_temp(entry_id, resp.rect.height()));
+                }
             }
             if !session.streaming.is_empty() {
                 let show_agent_header = if session.entries.is_empty() {
@@ -941,7 +966,7 @@ fn edit_view(ui: &mut egui::Ui, id: (u64, usize), edit: &FileEdit) {
                     .inner_margin(egui::Margin::symmetric(8, 6))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        for line in &lines {
+                        for line in lines {
                             diff_line(ui, line.kind, &line.text);
                         }
                     });

@@ -52,10 +52,23 @@ fn saved_before_panel_defaults() -> bool {
     true
 }
 
+/// Atomically writes a backup of the saved state to disk, so unexpected crashes
+/// or corrupted writes never destroy the user's session history.
+fn atomic_backup_state(state: &SavedState) {
+    let Some(dir) = eframe::storage_dir("Barduino") else { return };
+    let Ok(serialized) = ron::to_string(state) else { return };
+    let temp_path = dir.join("app.ron.tmp");
+    let backup_path = dir.join("app.ron.bak");
+
+    if std::fs::write(&temp_path, serialized.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&temp_path, &backup_path);
+    }
+}
+
 /// Copies a save that couldn't be read somewhere safe, before eframe writes over
 /// it. Returns what to tell the user, when there is anything to tell.
 fn keep_unreadable_save(raw: String) -> Option<String> {
-    let backup = eframe::storage_dir("Barduino")?.join("app.ron.bak");
+    let backup = eframe::storage_dir("Barduino")?.join("app.ron.corrupt");
     std::fs::write(&backup, raw).ok()?;
     Some(format!(
         "Your saved sessions couldn't be read, so Barduino has started empty. The old file was kept at {} — \
@@ -136,6 +149,15 @@ impl BarduinoApp {
         // aside first, and the user is told where it went.
         let mut notice = None;
         let mut state = stored.unwrap_or_else(|| {
+            if let Some(storage_dir) = eframe::storage_dir("Barduino") {
+                let backup = storage_dir.join("app.ron.bak");
+                if let Ok(raw) = std::fs::read_to_string(&backup)
+                    && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
+                {
+                    notice = Some("Recovered your saved sessions from the backup copy.".into());
+                    return recovered;
+                }
+            }
             notice = cc
                 .storage
                 .and_then(|storage| storage.get_string(eframe::APP_KEY))
@@ -670,6 +692,7 @@ impl eframe::App for BarduinoApp {
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, &self.state);
+        atomic_backup_state(&self.state);
     }
 }
 
@@ -791,5 +814,14 @@ mod tests {
         let state: SavedState = ron::from_str(saved).expect("a save from the terminal chat must still load");
         assert_eq!(state.sessions[0].title, "kept");
         assert_eq!(state.sessions[0].entries.len(), 1, "the conversation is still there to read");
+    }
+
+    #[test]
+    fn atomic_backup_roundtrips_saved_state() {
+        let state = populated_state();
+        let serialized = ron::to_string(&state).expect("state serializes to ron");
+        let restored: SavedState = ron::from_str(&serialized).expect("state deserializes from backup");
+        assert_eq!(restored.sessions.len(), 1);
+        assert_eq!(restored.sessions[0].title, "Fix the login form");
     }
 }

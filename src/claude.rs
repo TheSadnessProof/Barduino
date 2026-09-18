@@ -162,13 +162,13 @@ fn detail_for(tool: &str, input: &Value) -> String {
 fn file_edit(tool: &str, input: &Value) -> Option<FileEdit> {
     let path = input["file_path"].as_str()?.to_owned();
     match tool {
-        "Edit" => Some(FileEdit {
+        "Edit" => Some(FileEdit::new(
             path,
-            old: string(&input["old_string"]),
-            new: string(&input["new_string"]),
-        }),
+            string(&input["old_string"]),
+            string(&input["new_string"]),
+        )),
         // A write replaces the file, so everything in it counts as added.
-        "Write" => Some(FileEdit { path, old: String::new(), new: string(&input["content"]) }),
+        "Write" => Some(FileEdit::new(path, String::new(), string(&input["content"]))),
         // Several edits to one file, shown as the run of changes they make.
         "MultiEdit" => {
             let edits = input["edits"].as_array()?;
@@ -180,7 +180,7 @@ fn file_edit(tool: &str, input: &Value) -> Option<FileEdit> {
                 new.push_str(&string(&edit["new_string"]));
                 new.push('\n');
             }
-            Some(FileEdit { path, old, new })
+            Some(FileEdit::new(path, old, new))
         }
         _ => None,
     }

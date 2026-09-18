@@ -22,7 +22,7 @@ pub fn find_executable() -> Option<PathBuf> {
         .filter(|exe| exe.is_file())
 }
 
-/// Arguments for one print-mode turn.
+/// Arguments for one print-mode turn. The prompt itself is sent on stdin.
 pub fn args(turn: &Turn) -> Vec<String> {
     // agy doesn't treat the current folder as its workspace, so it has to be added explicitly.
     let mut args: Vec<String> = vec![
@@ -56,9 +56,10 @@ pub fn args(turn: &Turn) -> Vec<String> {
     if let Some(conversation_id) = &turn.resume_session {
         args.extend(["--conversation".into(), conversation_id.clone()]);
     }
-    // Attached with "=" so a prompt starting with "-" isn't read as a flag. agy.exe is a
-    // real executable, so the argument reaches it without cmd.exe reinterpreting it.
-    args.push(format!("--print={}", turn.prompt));
+    // Prompts can carry a whole page of HTML from attached elements, far more than
+    // a command line holds on Windows. Passing "--print" runs in print mode, and start_turn
+    // sends the prompt on stdin.
+    args.push("--print".into());
     args
 }
 
@@ -287,9 +288,25 @@ mod tests {
                 "accept-edits",
                 "--conversation",
                 "abc",
-                "--print=-v what does this do?",
+                "--print",
             ]
         );
+    }
+
+    #[test]
+    fn prompts_do_not_appear_on_the_command_line() {
+        let large_prompt = "x".repeat(100_000);
+        let turn = Turn {
+            prompt: large_prompt,
+            cwd: PathBuf::from("C:\\work\\demo"),
+            resume_session: None,
+            permission_mode: PermissionMode::ReadOnly,
+            model: None,
+            effort: None,
+        };
+        let cli_args = args(&turn);
+        assert!(cli_args.contains(&"--print".to_owned()));
+        assert!(!cli_args.iter().any(|arg| arg.contains("xxxx")), "prompts are sent on stdin, never on argv");
     }
 
     #[test]

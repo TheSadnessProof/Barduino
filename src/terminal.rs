@@ -53,11 +53,95 @@ impl vt100::Callbacks for Replies {
     }
 }
 
+/// On Windows, shells and any programs they spawn (dev servers, compilers) run inside
+/// a job object with kill-on-close, ensuring closing a terminal tab kills all background programs.
+#[cfg(windows)]
+struct TerminalJob(Option<windows::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl TerminalJob {
+    fn new(pid: Option<u32>) -> Self {
+        use windows::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+
+        unsafe extern "system" {
+            fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> HANDLE;
+        }
+
+        let Some(pid) = pid else { return Self(None) };
+        let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }.ok();
+        let job = job.filter(|job| {
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = unsafe {
+                SetInformationJobObject(
+                    *job,
+                    JobObjectExtendedLimitInformation,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            }
+            .is_ok();
+            if !configured {
+                let _ = unsafe { CloseHandle(*job) };
+                return false;
+            }
+
+            // PROCESS_SET_QUOTA (0x0100) | PROCESS_TERMINATE (0x0001)
+            let process_handle = unsafe { OpenProcess(0x0100 | 0x0001, 0, pid) };
+            if process_handle.is_invalid() {
+                let _ = unsafe { CloseHandle(*job) };
+                return false;
+            }
+
+            let assigned = unsafe { AssignProcessToJobObject(*job, process_handle) }.is_ok();
+            let _ = unsafe { CloseHandle(process_handle) };
+            if !assigned {
+                let _ = unsafe { CloseHandle(*job) };
+            }
+            assigned
+        });
+        Self(job)
+    }
+
+    fn kill(&self) {
+        if let Some(job) = self.0 {
+            let _ = unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) };
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for TerminalJob {
+    fn drop(&mut self) {
+        if let Some(job) = self.0.take() {
+            let _ = unsafe { windows::Win32::System::JobObjects::TerminateJobObject(job, 1) };
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(job) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct TerminalJob;
+
+#[cfg(not(windows))]
+impl TerminalJob {
+    fn new(_pid: Option<u32>) -> Self {
+        Self
+    }
+    fn kill(&self) {}
+}
+
 pub struct Terminal {
     parser: Arc<Mutex<Parser>>,
     writer: Writer,
     master: Box<dyn MasterPty + Send>,
     child: Box<dyn Child + Send + Sync>,
+    job: TerminalJob,
     size: (u16, u16),
     exited: Arc<AtomicBool>,
     /// Scroll wheel movement not yet turned into whole lines.
@@ -81,6 +165,8 @@ impl Terminal {
             .spawn_command(cmd)
             .map_err(|err| format!("Couldn't start the shell: {err}"))?;
         drop(pair.slave);
+
+        let job = TerminalJob::new(child.process_id());
 
         let mut reader = pair.master.try_clone_reader().map_err(|err| err.to_string())?;
         let writer: Writer = Arc::new(Mutex::new(pair.master.take_writer().map_err(|err| err.to_string())?));
@@ -117,7 +203,7 @@ impl Terminal {
             ctx.request_repaint();
         });
 
-        Ok(Self { parser, writer, master: pair.master, child, size, exited, scroll_remainder: 0.0, selection: None })
+        Ok(Self { parser, writer, master: pair.master, child, job, size, exited, scroll_remainder: 0.0, selection: None })
     }
 
     fn parser(&self) -> MutexGuard<'_, Parser> {
@@ -310,6 +396,7 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        self.job.kill();
         let _ = self.child.kill();
     }
 }
