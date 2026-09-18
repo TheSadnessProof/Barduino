@@ -496,10 +496,12 @@ pub fn conversation(
             for (index, entry) in session.entries.iter().enumerate() {
                 show_entry(ui, (session.id, index), entry, markdown, &session.project_dir);
             }
-            // Text still arriving is left plain: half-written markdown would jump about
-            // as the rest of it comes in.
+            // Streaming text is rendered as markdown like committed entries. The view
+            // reflows as structures complete, but that is the same behaviour users
+            // already expect from Claude.ai and ChatGPT, so it is a smaller surprise
+            // than seeing raw markdown source mid-reply.
             if !session.streaming.is_empty() {
-                ui.label(&session.streaming);
+                egui_commonmark::CommonMarkViewer::new().show(ui, markdown, &session.streaming);
             }
             ui.add_space(8.0);
         });
