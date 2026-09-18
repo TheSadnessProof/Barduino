@@ -72,11 +72,18 @@ pub fn composer(
         }
     };
 
+    // The list follows the keyboard and never the mouse. Scrolling to the highlight
+    // moves a different row under the pointer, which highlights that one, which
+    // scrolls again — so the menu chased the cursor around as soon as it was moved.
+    let mut scroll_to_selected = false;
+
     if in_slash {
         if slash_query != session.slash_query {
             session.slash_query = slash_query.clone();
             session.slash_dismissed = false;
             session.slash_selected = 0;
+            // A narrower query starts at the top rather than wherever the last one left off.
+            scroll_to_selected = true;
         }
     } else {
         session.slash_query.clear();
@@ -100,9 +107,11 @@ pub fn composer(
     if show_slash && has_focus {
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)) {
             session.slash_selected = (session.slash_selected + 1).min(slash_matches.len().saturating_sub(1));
+            scroll_to_selected = true;
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)) {
             session.slash_selected = session.slash_selected.saturating_sub(1);
+            scroll_to_selected = true;
         }
         if ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             session.slash_dismissed = true;
@@ -182,7 +191,7 @@ pub fn composer(
                     ui.add_space(4.0);
                 }
                 if show_slash {
-                    slash_suggestions_ui(ui, session, &slash_matches, &slash_query);
+                    slash_suggestions_ui(ui, session, &slash_matches, &slash_query, scroll_to_selected);
                     ui.add_space(6.0);
                 }
                 let hint = format!("Message {}…   ·   / for commands", session.provider.short_name());
@@ -1262,7 +1271,12 @@ fn slash_suggestions_ui(
     session: &mut Session,
     matches: &[&SlashCommand],
     query: &str,
+    scroll_to_selected: bool,
 ) {
+    // Only a pointer that actually moved this frame may take the highlight. Resting
+    // the mouse over the list would otherwise drag it back every frame, and the
+    // arrow keys would appear to do nothing at all.
+    let pointer_moved = ui.input(|i| i.pointer.delta() != egui::Vec2::ZERO);
     let (card_bg, border_stroke) = if ui.visuals().dark_mode {
         (egui::Color32::from_rgb(40, 38, 35), egui::Stroke::new(1.0, egui::Color32::from_rgb(60, 58, 53)))
     } else {
@@ -1387,13 +1401,16 @@ fn slash_suggestions_ui(
                             },
                         );
 
-                        if is_selected {
-                            row.response.scroll_to_me(Some(egui::Align::Center));
+                        if is_selected && scroll_to_selected {
+                            // None scrolls as little as it takes to bring the row
+                            // into view, so the list only moves at the edges rather
+                            // than re-centring on every keypress.
+                            row.response.scroll_to_me(None);
                         }
 
                         if row.response.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                            if !is_selected {
+                            if !is_selected && pointer_moved {
                                 session.slash_selected = index;
                             }
                         }
