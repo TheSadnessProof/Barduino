@@ -27,6 +27,16 @@ pub enum Icon {
     ChevronRight,
     /// Points at an open group of sessions.
     ChevronDown,
+    /// A search magnifying glass.
+    Search,
+    /// A git branch icon with a stem and node.
+    Branch,
+    /// A folder outline.
+    Folder,
+    /// A wastebasket for deleting.
+    Trash,
+    /// A pencil for editing or renaming.
+    Edit,
 }
 
 const SIZE: f32 = 26.0;
@@ -159,6 +169,83 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 painter.line_segment([from, c + dir * r], Stroke::new(2.0, color));
             }
             painter.circle_stroke(c, r * 0.68, Stroke::new(1.2, color));
+        }
+        Icon::Search => {
+            let circle_center = c - vec2(r * 0.18, r * 0.18);
+            let circle_radius = r * 0.46;
+            painter.circle_stroke(circle_center, circle_radius, stroke);
+            let handle_start = circle_center + vec2(circle_radius * 0.707, circle_radius * 0.707);
+            let handle_end = c + vec2(r * 0.72, r * 0.72);
+            painter.line_segment([handle_start, handle_end], Stroke::new(1.8, color));
+        }
+        Icon::Branch => {
+            let trunk_x = c.x - r * 0.32;
+            let top_y = c.y - r * 0.52;
+            let bot_y = c.y + r * 0.52;
+            let right_x = c.x + r * 0.34;
+            let node_r = 1.8;
+
+            painter.line_segment([pos2(trunk_x, top_y + node_r), pos2(trunk_x, bot_y - node_r)], stroke);
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(trunk_x, c.y + r * 0.08),
+                    pos2(right_x, c.y - r * 0.12),
+                    pos2(right_x, top_y + node_r),
+                ],
+                stroke,
+            ));
+            painter.circle_filled(pos2(trunk_x, bot_y), node_r, color);
+            painter.circle_filled(pos2(trunk_x, top_y), node_r, color);
+            painter.circle_filled(pos2(right_x, top_y), node_r, color);
+        }
+        Icon::Folder => {
+            let left = c.x - r * 0.8;
+            let right = c.x + r * 0.8;
+            let top = c.y - r * 0.55;
+            let bot = c.y + r * 0.6;
+            let tab_right = left + r * 0.65;
+            let tab_bot = top + r * 0.28;
+
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(left, bot),
+                    pos2(left, top),
+                    pos2(tab_right - r * 0.15, top),
+                    pos2(tab_right, tab_bot),
+                    pos2(right, tab_bot),
+                    pos2(right, bot),
+                    pos2(left, bot),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Trash => {
+            let top = c.y - r * 0.65;
+            let lid_bot = top + r * 0.22;
+            let bot = c.y + r * 0.72;
+            let w = r * 0.62;
+            painter.line_segment([pos2(c.x - w * 1.15, lid_bot), pos2(c.x + w * 1.15, lid_bot)], stroke);
+            painter.line_segment([pos2(c.x - w * 0.35, lid_bot), pos2(c.x - w * 0.35, top)], stroke);
+            painter.line_segment([pos2(c.x - w * 0.35, top), pos2(c.x + w * 0.35, top)], stroke);
+            painter.line_segment([pos2(c.x + w * 0.35, top), pos2(c.x + w * 0.35, lid_bot)], stroke);
+            painter.add(egui::Shape::line(
+                vec![
+                    pos2(c.x - w * 0.85, lid_bot),
+                    pos2(c.x - w * 0.68, bot),
+                    pos2(c.x + w * 0.68, bot),
+                    pos2(c.x + w * 0.85, lid_bot),
+                ],
+                stroke,
+            ));
+        }
+        Icon::Edit => {
+            let tip = pos2(c.x - r * 0.55, c.y + r * 0.55);
+            let top = pos2(c.x + r * 0.45, c.y - r * 0.45);
+            let perp = vec2(r * 0.2, -r * 0.2);
+            painter.line_segment([tip, top], stroke);
+            painter.line_segment([tip + perp, top + perp], stroke);
+            painter.line_segment([top, top + perp], stroke);
+            painter.line_segment([tip, tip + perp], stroke);
         }
     }
 }
