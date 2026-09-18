@@ -5,7 +5,6 @@ use eframe::egui;
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentEvent, PermissionMode, Provider};
-use crate::agent_terminal::{AgentTerminals, TerminalAction};
 use crate::browser::{Browser, BrowserState};
 use crate::chat::{self, ComposerAction};
 use crate::commands::SlashAction;
@@ -106,9 +105,6 @@ pub struct BarduinoApp {
     tools: std::collections::BTreeMap<u64, Tools>,
     /// The system WebView, which all the panels take turns showing.
     browser: Browser,
-    /// Each session's agent running in its own terminal, when the middle column is
-    /// the CLI's own interface rather than Barduino's chat.
-    agent_terminals: AgentTerminals,
     /// The shells this computer offers, found once and after a rescan.
     shells: Vec<terminal::Shell>,
     /// Set until the width egui remembers for the right panel has been forgotten.
@@ -151,11 +147,6 @@ impl BarduinoApp {
             state.browser.address = old_address;
         }
         let apply_panel_defaults = std::mem::take(&mut state.apply_panel_defaults);
-        // Settings saved before the agent ran in a terminal are moved over once, so
-        // this reaches people who already had Barduino without them going to look.
-        if std::mem::take(&mut state.settings.apply_terminal_chat) {
-            state.settings.chat_in_terminal = true;
-        }
         // The right tools panel starts closed on every launch, new width and all.
         state.show_tools = false;
         // Live terminals and browser pages are keyed by session ID, so a repeated ID
@@ -176,7 +167,6 @@ impl BarduinoApp {
             sidebar: Sidebar::default(),
             tools: std::collections::BTreeMap::new(),
             browser: Browser::default(),
-            agent_terminals: AgentTerminals::default(),
             shells: terminal::available_shells(),
             markdown: egui_commonmark::CommonMarkCache::default(),
             models: Catalog::default(),
@@ -241,8 +231,6 @@ impl BarduinoApp {
         // its panel stops any shell it had open.
         let removed = self.state.sessions.remove(index);
         self.tools.remove(&id);
-        // And its agent terminal, which is holding a CLI open.
-        self.agent_terminals.close(id);
 
         if self.state.sessions.is_empty() {
             self.new_session(removed.project_dir, removed.permission_mode);
@@ -314,9 +302,6 @@ impl BarduinoApp {
             // chosen, that is Barduino's own — and its Changes tab watches it. Left
             // alone they would quietly be about the wrong project, so they go.
             self.tools.remove(&id);
-            // The agent terminal was started in the old folder too, and an agent
-            // reads the folder it was launched in.
-            self.agent_terminals.close(id);
         } else {
             // A conversation belongs to its folder, so a different folder gets a new session.
             let permission_mode = session.permission_mode;
@@ -331,13 +316,6 @@ impl BarduinoApp {
                 self.view = View::Chat;
                 self.state.active_session = id;
                 self.active_session_mut().focus_composer = true;
-                // The terminal chat has no composer to focus, so it takes the
-                // keyboard itself — otherwise switching session leaves you typing
-                // into nothing. Only asked for when it is the middle column, since
-                // asking would otherwise create the terminal it is asking about.
-                if self.state.settings.chat_in_terminal {
-                    self.agent_terminals.get(id).take_keyboard();
-                }
             }
             SidebarAction::NewSession => {
                 // A new session starts without a folder, so its first step is choosing one.
@@ -435,10 +413,6 @@ impl BarduinoApp {
     }
 
     fn chat_area(&mut self, ui: &mut egui::Ui) {
-        if self.state.settings.chat_in_terminal {
-            self.terminal_chat_area(ui);
-            return;
-        }
         let index = self.active_index();
         let provider = self.state.sessions[index].provider;
         let installed = self.detected.get(provider).is_some();
@@ -475,11 +449,14 @@ impl BarduinoApp {
         match conv_action {
             chat::ConversationAction::ChangeFolder => self.change_folder(),
             chat::ConversationAction::SelectProvider(p) => {
-                self.select_provider(p);
+                let session = self.active_session_mut();
+                if session.can_change_provider() && session.provider != p {
+                    session.provider = p;
+                    session.chosen_model = None;
+                    session.effort = None;
+                }
             }
-            // Only the terminal chat has a Start button; this one starts an agent
-            // when the first message is sent.
-            chat::ConversationAction::Start | chat::ConversationAction::None => {}
+            chat::ConversationAction::None => {}
         }
 
         match composer_action {
@@ -492,55 +469,6 @@ impl BarduinoApp {
         }
         if open_settings {
             self.view = View::Settings;
-        }
-    }
-
-    /// The middle column when the agent runs in its own terminal: no composer and no
-    /// transcript, because the CLI draws both of those itself.
-    fn terminal_chat_area(&mut self, ui: &mut egui::Ui) {
-        let index = self.active_index();
-        let session = &self.state.sessions[index];
-        let (id, provider) = (session.id, session.provider);
-        let shell = self.state.settings.shell(&self.shells);
-        let installed = self.detected.get(provider).is_some();
-        let settings = &self.state.settings;
-        let terminals = &mut self.agent_terminals;
-        let mut open_settings = false;
-
-        let action = egui::CentralPanel::default()
-            .show(ui, |ui| {
-                if !installed {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.colored_label(
-                            ui.visuals().error_fg_color,
-                            format!("{} isn't installed. {}.", provider.label(), provider.install_hint()),
-                        );
-                        open_settings = ui.link("Open Settings").clicked();
-                    });
-                }
-                terminals.get(id).ui(ui, session, settings, &shell)
-            })
-            .inner;
-
-        match action {
-            TerminalAction::ChangeFolder => self.change_folder(),
-            TerminalAction::SelectProvider(provider) => self.select_provider(provider),
-            TerminalAction::None => {}
-        }
-        if open_settings {
-            self.view = View::Settings;
-        }
-    }
-
-    /// Points a session at a different agent. Only before it has said anything: the
-    /// conversation so far belongs to the CLI that held it, and the model and effort
-    /// are that CLI's own words, so they go back to its defaults.
-    fn select_provider(&mut self, provider: Provider) {
-        let session = self.active_session_mut();
-        if session.can_change_provider() && session.provider != provider {
-            session.provider = provider;
-            session.chosen_model = None;
-            session.effort = None;
         }
     }
 
@@ -663,33 +591,20 @@ impl BarduinoApp {
         }
 
         match action {
-            // Whatever the middle column is, what was picked in the browser goes into
-            // it. In the chat that is a chip above the message box; in a terminal it
-            // is a paste into the CLI's own prompt.
             ToolsAction::Attach(elements) => {
-                self.view = View::Chat;
-                if self.state.settings.chat_in_terminal {
-                    let id = self.state.active_session;
-                    self.agent_terminals.get(id).attach(&elements, false);
-                    return;
-                }
                 let session = self.active_session_mut();
                 for element in elements {
                     session.attach(element);
                 }
                 session.focus_composer = true;
+                self.view = View::Chat;
             }
             ToolsAction::Send(elements) => {
-                self.view = View::Chat;
-                if self.state.settings.chat_in_terminal {
-                    let id = self.state.active_session;
-                    self.agent_terminals.get(id).attach(&elements, true);
-                    return;
-                }
                 let session = self.active_session_mut();
                 for element in elements {
                     session.attach(element);
                 }
+                self.view = View::Chat;
                 self.send(ui.ctx());
             }
             ToolsAction::None => {}
@@ -865,5 +780,17 @@ mod tests {
         let again: SavedState = ron::from_str(&saved).expect("saved state should load");
         assert!(!again.apply_panel_defaults, "the defaults are only applied once");
         assert!(!again.show_tools, "the right panel starts closed");
+    }
+
+    #[test]
+    fn a_state_saved_while_the_agent_ran_in_a_terminal_still_loads() {
+        // The two settings that chose between the chat and a terminal are gone, and
+        // the file on disk still has them. They have to be skipped rather than take
+        // every session down with them.
+        let saved = r#"(sessions: [(id: 4, title: "kept", entries: [Agent("hi")])],
+                        settings: (chat_in_terminal: true, apply_terminal_chat: false))"#;
+        let state: SavedState = ron::from_str(saved).expect("a save from the terminal chat must still load");
+        assert_eq!(state.sessions[0].title, "kept");
+        assert_eq!(state.sessions[0].entries.len(), 1, "the conversation is still there to read");
     }
 }

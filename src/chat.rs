@@ -46,9 +46,6 @@ pub enum ConversationAction {
     None,
     ChangeFolder,
     SelectProvider(Provider),
-    /// Start the agent. Only the terminal chat asks for this: Barduino's own chat
-    /// starts an agent when the first message is sent, so it has nothing to press.
-    Start,
 }
 
 /// Claude signature terracotta/coral accent for primary actions and focus states.
@@ -486,7 +483,7 @@ pub fn conversation(
             .id_salt(("empty_scroll", session.id))
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                action = empty_session_ui(ui, session, settings, false);
+                action = empty_session_ui(ui, session, settings);
             });
         return action;
     }
@@ -512,12 +509,7 @@ pub fn conversation(
 
 /// The welcome setup screen displayed in the center of an empty session.
 /// Houses agent selection and project workspace setup before the conversation begins.
-pub fn empty_session_ui(
-    ui: &mut egui::Ui,
-    session: &Session,
-    settings: &Settings,
-    show_start: bool,
-) -> ConversationAction {
+fn empty_session_ui(ui: &mut egui::Ui, session: &Session, settings: &Settings) -> ConversationAction {
     let mut action = ConversationAction::None;
 
     ui.vertical_centered(|ui| {
@@ -688,62 +680,11 @@ pub fn empty_session_ui(
                 if folder_resp.response.clicked() {
                     action = ConversationAction::ChangeFolder;
                 }
-
-                if show_start {
-                    ui.add_space(22.0);
-                    if start_button(ui, session) {
-                        action = ConversationAction::Start;
-                    }
-                    // A session held in Barduino's own chat before the agent moved
-                    // into a terminal still has its messages. They aren't lost, but
-                    // they aren't here either, so say where they went.
-                    if !session.entries.is_empty() {
-                        ui.add_space(10.0);
-                        let count = session.entries.len();
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "This session has {count} earlier messages in Barduino's own chat. \
-                                 Turn off “Run the agent in a terminal” in Settings to read them."
-                            ))
-                            .small()
-                            .weak(),
-                        );
-                    }
-                }
             },
         );
     });
 
     action
-}
-
-/// The button that runs the agent, for the terminal chat — which has no message box
-/// to send the first message from, so starting has to be something you press.
-/// Returns true when it is clicked.
-fn start_button(ui: &mut egui::Ui, session: &Session) -> bool {
-    let ready = session.has_folder();
-    let (fill, text_colour) = if ready {
-        (CLAUDE_CORAL, egui::Color32::WHITE)
-    } else if ui.visuals().dark_mode {
-        (egui::Color32::from_rgb(48, 46, 43), egui::Color32::from_rgb(110, 105, 98))
-    } else {
-        (egui::Color32::from_rgb(230, 226, 220), egui::Color32::from_rgb(160, 155, 148))
-    };
-    let label = format!("Start {}", session.provider.short_name());
-    let button = egui::Button::new(egui::RichText::new(label).strong().color(text_colour))
-        .fill(fill)
-        .corner_radius(10.0)
-        .min_size(egui::vec2(180.0, 38.0));
-
-    let tooltip = if ready {
-        format!("Opens a terminal in {} and runs {} in it", session.folder_name(), session.provider.command())
-    } else {
-        "Choose a project folder first — an agent always runs inside one".to_owned()
-    };
-    let clicked = ui.add_enabled(ready, button).on_hover_text(tooltip).clicked();
-    ui.add_space(8.0);
-    ui.label(egui::RichText::new("The agent's own interface opens here, as if you had run it yourself.").small().weak());
-    clicked
 }
 
 fn show_entry(

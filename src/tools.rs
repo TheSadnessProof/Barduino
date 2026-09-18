@@ -7,7 +7,7 @@ use eframe::egui;
 use crate::browser::{Browser, BrowserAction, BrowserState, PickedElement};
 use crate::changes::{Changes, Source};
 use crate::icons::{self, Icon};
-use crate::terminal::{self, Input, Terminal};
+use crate::terminal::{self, Terminal};
 
 enum Tab {
     Terminal {
@@ -15,8 +15,8 @@ enum Tab {
         cwd: PathBuf,
         /// Started the first time the tab is drawn.
         terminal: Option<Result<Terminal, String>>,
-        /// Put into the shell once it has started.
-        typed: Vec<Input>,
+        /// Typed into the shell once it has started.
+        typed: Option<String>,
         /// Set while this terminal should take the keyboard the next time it is
         /// drawn, so a terminal you just opened can be typed into right away.
         focus: bool,
@@ -85,7 +85,6 @@ impl Tools {
     pub fn open_terminal(&mut self, cwd: &Path, typed: Option<String>) {
         let number = self.next_terminal_number;
         self.next_terminal_number += 1;
-        let typed = typed.map(Input::Run).into_iter().collect();
         self.tabs.push(Tab::Terminal { number, cwd: cwd.to_owned(), terminal: None, typed, focus: true });
         self.active = self.tabs.len() - 1;
     }

@@ -2,7 +2,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
-mod agent_terminal;
 mod antigravity;
 mod app;
 mod browser;

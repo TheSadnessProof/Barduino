@@ -124,21 +124,6 @@ impl Terminal {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Puts text into the terminal as if it came from the keyboard.
-    pub fn send(&mut self, input: Input) {
-        let bracketed = {
-            let mut parser = self.parser();
-            // Whatever arrives should be on screen, not above a scrolled-back view.
-            parser.screen_mut().set_scrollback(0);
-            parser.screen().bracketed_paste()
-        };
-        let bytes = match input {
-            Input::Run(text) => text.into_bytes(),
-            Input::Paste(text) => paste_bytes(&text, bracketed),
-        };
-        write_all(&self.writer, &bytes);
-    }
-
     fn has_exited(&mut self) -> bool {
         // On Windows the output pipe can stay open after the shell exits, so also ask the process.
         self.exited.load(Ordering::Relaxed) || matches!(self.child.try_wait(), Ok(Some(_)))
@@ -339,16 +324,17 @@ pub fn show(
     slot: &mut Option<Result<Terminal, String>>,
     cwd: &Path,
     shell: &Path,
-    typed: &mut Vec<Input>,
+    typed: &mut Option<String>,
     take_keyboard: bool,
 ) -> bool {
     let terminal = slot.get_or_insert_with(|| Terminal::start(cwd, shell, ui.ctx().clone()));
     let restart = match terminal {
         Ok(terminal) => {
-            // Drained here rather than by the caller, so a shell that failed to start
+            // Taken here rather than by the caller, so a shell that failed to start
             // doesn't swallow the command it was opened to run.
-            for input in typed.drain(..) {
-                terminal.send(input);
+            if let Some(text) = typed.take() {
+                terminal.parser().screen_mut().set_scrollback(0);
+                write_all(&terminal.writer, text.as_bytes());
             }
             terminal.ui(ui, take_keyboard)
         }
@@ -408,31 +394,6 @@ fn cell_at(offset: Vec2, char_width: f32, row_height: f32, size: (u16, u16)) -> 
     let row = (offset.y / row_height.max(1.0)).floor().clamp(0.0, f32::from(rows.saturating_sub(1)));
     let col = (offset.x / char_width.max(1.0)).floor().clamp(0.0, f32::from(cols.saturating_sub(1)));
     (row as u16, col as u16)
-}
-
-/// Text on its way into a running terminal.
-pub enum Input {
-    /// Typed as if by the user, control characters and all. The caller supplies the
-    /// trailing `\r` when it wants the line run.
-    Run(String),
-    /// Put in as a paste rather than as keystrokes, so that a program which asked
-    /// for bracketed paste — as the agent CLIs do — receives it as one block.
-    Paste(String),
-}
-
-/// A paste, as the bytes to write. An agent prompt runs to many lines and holds a
-/// fenced block of HTML, so how the newlines are sent decides whether the CLI gets
-/// one message or a dozen half-written ones.
-fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
-    // A terminal ends a line with \r; \n on its own moves down without returning.
-    let text = text.replace("\r\n", "\r").replace('\n', "\r");
-    if bracketed {
-        return format!("\x1b[200~{text}\x1b[201~").into_bytes();
-    }
-    // Without bracketed paste every \r submits whatever has been typed so far, so a
-    // prompt would arrive a line at a time. Spaces keep it as one message, which
-    // reads worse than the original but is at least the message the user meant.
-    text.replace('\r', " ").into_bytes()
 }
 
 fn write_all(writer: &Writer, bytes: &[u8]) {
@@ -792,27 +753,5 @@ mod tests {
         // A selection that ends on the last column doesn't run off the row.
         let to_the_edge = Selection { anchor: (0, 70), head: (0, 79) };
         assert_eq!(to_the_edge.columns_on(0, cols), Some((70, 80)));
-    }
-
-    #[test]
-    fn a_pasted_prompt_arrives_as_one_message() {
-        // What the browser sends: a comment, then a fenced block of the element's HTML.
-        let prompt = "Comment on https://example.com: make this bigger\n```html\n<h1>Hi</h1>\n```";
-
-        // A CLI that asked for bracketed paste is told where the paste starts and
-        // ends, so it takes the whole thing as one prompt to be edited before sending.
-        let wrapped = String::from_utf8(paste_bytes(prompt, true)).expect("text in, text out");
-        assert!(wrapped.starts_with("\x1b[200~") && wrapped.ends_with("\x1b[201~"), "{wrapped:?}");
-        assert!(wrapped.contains("<h1>Hi</h1>"), "the HTML survives intact");
-        assert_eq!(wrapped.matches('\r').count(), 3, "and its line breaks are still line breaks");
-
-        // Without it, every line break would be an Enter — the agent would get
-        // "Comment on…" as a whole prompt and the rest as three more. Spaces instead.
-        let flattened = String::from_utf8(paste_bytes(prompt, false)).expect("text in, text out");
-        assert!(!flattened.contains('\r') && !flattened.contains('\n'), "nothing that submits: {flattened:?}");
-        assert!(flattened.contains("make this bigger") && flattened.contains("<h1>Hi</h1>"));
-
-        // Windows line endings are one break, not two.
-        assert_eq!(paste_bytes("a\r\nb", true), b"\x1b[200~a\rb\x1b[201~");
     }
 }
