@@ -135,6 +135,7 @@ fn set_text_sizes(ctx: &egui::Context) {
             (TextStyle::Monospace, FontId::new(13.5, FontFamily::Monospace)),
         ]
         .into();
+        style.interaction.tooltip_delay = 0.15;
     });
 }
 

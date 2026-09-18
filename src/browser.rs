@@ -143,8 +143,8 @@ pub struct Comment {
     pub number: u32,
     #[serde(flatten)]
     pub element: PickedElement,
-    /// What the user typed about it, which starts empty.
-    #[serde(skip)]
+    /// What the user typed about it, which can be sent from the in-page popover.
+    #[serde(default)]
     pub note: String,
 }
 
@@ -155,6 +155,8 @@ enum PageMessage {
     Picked(PickedElement),
     Commented(Comment),
     Cancelled,
+    #[serde(rename = "comment_removed")]
+    CommentRemoved { number: u32 },
 }
 
 /// What clicking on the page does at the moment.
@@ -311,11 +313,22 @@ impl Browser {
                         self.mode = Mode::Off;
                         result = BrowserAction::Attach(vec![element]);
                     }
-                    native::Message::Page(PageMessage::Commented(comment))
-                        if self.mode == Mode::Commenting =>
-                    {
-                        self.focus_note = Some(comment.number);
-                        self.comments.push(comment);
+                    native::Message::Page(PageMessage::Commented(mut comment)) => {
+                        if comment.note.is_empty() && let Some(n) = &comment.element.note {
+                            comment.note = n.clone();
+                        }
+                        if !comment.note.is_empty() && comment.element.note.is_none() {
+                            comment.element.note = Some(comment.note.clone());
+                        }
+                        if let Some(pos) = self.comments.iter().position(|c| c.number == comment.number) {
+                            self.comments[pos] = comment;
+                        } else {
+                            self.focus_note = Some(comment.number);
+                            self.comments.push(comment);
+                        }
+                    }
+                    native::Message::Page(PageMessage::CommentRemoved { number }) => {
+                        self.comments.retain(|c| c.number != number);
                     }
                     native::Message::Page(PageMessage::Cancelled) => self.mode = Mode::Off,
                     native::Message::Page(_) => {}
@@ -328,17 +341,17 @@ impl Browser {
 
         let mut address_focused = false;
         ui.horizontal(|ui| {
-            if ui.button("<").on_hover_text("Back").clicked() {
+            if ui.button("<").on_hover_text("Back in history").clicked() {
                 commands.push(Command::Back);
             }
-            if ui.button(">").on_hover_text("Forward").clicked() {
+            if ui.button(">").on_hover_text("Forward in history").clicked() {
                 commands.push(Command::Forward);
             }
-            if ui.button("⟳").on_hover_text("Reload").clicked() {
+            if ui.button("⟳").on_hover_text("Reload page").clicked() {
                 commands.push(Command::Reload);
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let go = ui.button("Go").clicked();
+                let go = ui.button("Go").on_hover_text("Load address").clicked();
                 let open_ext = icons::small_button(ui, Icon::External, "Open in default browser").clicked();
                 if open_ext && !state.address.is_empty() {
                     let norm = normalize_url(&state.address);
@@ -367,16 +380,14 @@ impl Browser {
             // Desktop means "fill the panel"; the other two are shortcuts for the
             // pixel boxes beside them, which are what actually decide the size.
             let fitting = state.viewport == Viewport::Desktop;
-            if icons::toggle(ui, Icon::Desktop, "Fit the panel", fitting).clicked() {
+            if icons::toggle(ui, Icon::Desktop, "Desktop: Fit page to panel width", fitting).clicked() {
                 state.viewport = Viewport::Desktop;
             }
             for (icon, name, preset) in
-                [(Icon::Tablet, "Tablet", TABLET_SIZE), (Icon::Mobile, "Mobile", MOBILE_SIZE)]
+                [(Icon::Tablet, "Tablet viewport (768 × 1024 px)", TABLET_SIZE), (Icon::Mobile, "Mobile viewport (375 × 812 px)", MOBILE_SIZE)]
             {
-                let [width, height] = preset;
-                let tip = format!("{name} — {width} × {height}");
                 let chosen = !fitting && state.size == preset;
-                if icons::toggle(ui, icon, &tip, chosen).clicked() {
+                if icons::toggle(ui, icon, name, chosen).clicked() {
                     state.viewport = Viewport::Fixed;
                     state.size = preset;
                 }
@@ -386,18 +397,22 @@ impl Browser {
             // of that, and typing in one switches to that size instead.
             let mut size = if fitting { self.page_size } else { state.size };
             let [width, height] = &mut size;
-            let mut retyped = ui.add(egui::DragValue::new(width).range(200..=3840).suffix(" px")).changed();
+            let mut retyped = ui.add(egui::DragValue::new(width).range(200..=3840).suffix(" px"))
+                .on_hover_text("Viewport width in pixels (drag or click to edit)")
+                .changed();
             ui.label("×");
-            retyped |= ui.add(egui::DragValue::new(height).range(200..=2400).suffix(" px")).changed();
+            retyped |= ui.add(egui::DragValue::new(height).range(200..=2400).suffix(" px"))
+                .on_hover_text("Viewport height in pixels (drag or click to edit)")
+                .changed();
             if retyped {
                 state.viewport = Viewport::Fixed;
                 state.size = size;
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let refresh_tip = if state.auto_refresh {
-                    "Auto-refresh is on (reloads when files change)"
+                    "Auto-refresh is on: automatically reloads when project files change"
                 } else {
-                    "Auto-refresh is off (click to enable)"
+                    "Auto-refresh is off: click to enable automatic reloading on file changes"
                 };
                 if icons::toggle(ui, Icon::AutoRefresh, refresh_tip, state.auto_refresh).clicked() {
                     state.auto_refresh = !state.auto_refresh;
@@ -405,9 +420,9 @@ impl Browser {
 
                 let commenting = self.mode == Mode::Commenting;
                 let comment_tip = if commenting {
-                    "Commenting: click the places you want changed (Esc to stop)"
+                    "Commenting active: click an element on the page to leave a note (Esc to stop)"
                 } else {
-                    "Leave comments on the page, then send them to the agent"
+                    "Comment: pin feedback notes directly onto page elements for the agent"
                 };
                 if icons::toggle(ui, Icon::Comment, comment_tip, commenting).clicked() {
                     self.mode = if commenting { Mode::Off } else { Mode::Commenting };
@@ -419,9 +434,9 @@ impl Browser {
 
                 let picking = self.mode == Mode::Picking;
                 let pick_tip = if picking {
-                    "Picking: click an element on the page (Esc to cancel)"
+                    "Element picker active: click an element on the page to attach to chat (Esc to cancel)"
                 } else {
-                    "Select an element on the page"
+                    "Inspect element: click any element on the page to attach its details to chat"
                 };
                 if icons::toggle(ui, Icon::Pick, pick_tip, picking).clicked() {
                     self.mode = if picking { Mode::Off } else { Mode::Picking };
@@ -433,7 +448,7 @@ impl Browser {
                         ui.label(egui::RichText::new("Click an element").small().weak());
                     }
                     Mode::Commenting => {
-                        ui.label(egui::RichText::new("Click a place to comment on").small().weak());
+                        ui.label(egui::RichText::new("Click an element to comment").small().weak());
                     }
                     Mode::Off => {}
                 }
@@ -497,27 +512,57 @@ impl Browser {
         result
     }
 
-    /// The comments left so far: a note each, and buttons to send or drop them.
+    /// The comments left so far: compact chips with direct send or drop actions.
     #[cfg(any(windows, target_os = "macos"))]
     fn comment_list(&mut self, ui: &mut egui::Ui, commands: &mut Vec<native::Command>) -> Option<BrowserAction> {
         let mut action = None;
         let mut remove = None;
-        let mut send_single = None;
+        let count = self.comments.len();
+
         egui::Frame::new()
             .fill(ui.visuals().faint_bg_color)
             .stroke(ui.visuals().widgets.noninteractive.bg_stroke)
-            .corner_radius(8.0)
-            .inner_margin(egui::Margin::same(8))
+            .corner_radius(6.0)
+            .inner_margin(egui::Margin::symmetric(8, 4))
             .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                let count = self.comments.len();
                 ui.horizontal(|ui| {
-                    let heading = if count == 1 { "1 comment".to_owned() } else { format!("{count} comments") };
+                    let heading = if count == 1 { "1 comment:".to_owned() } else { format!("{count} comments:") };
                     ui.label(egui::RichText::new(heading).strong().small());
+
+                    egui::ScrollArea::horizontal()
+                        .id_salt("comments_strip")
+                        .max_width((ui.available_width() - 230.0).max(60.0))
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                for comment in &self.comments {
+                                    let summary = if !comment.note.trim().is_empty() {
+                                        shorten(comment.note.trim(), 22)
+                                    } else {
+                                        comment.element.short_label()
+                                    };
+                                    let tooltip = if !comment.note.trim().is_empty() {
+                                        format!("#{} {}: “{}”\nSelector: {}", comment.number, comment.element.short_label(), comment.note.trim(), comment.element.selector)
+                                    } else {
+                                        format!("#{} {}\nSelector: {}", comment.number, comment.element.short_label(), comment.element.selector)
+                                    };
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        pin_number(ui, comment.number);
+                                        let resp = ui.label(egui::RichText::new(summary).small().weak());
+                                        resp.on_hover_text(tooltip);
+                                        if icons::small_button(ui, Icon::Close, "Remove this comment").clicked() {
+                                            remove = Some(comment.number);
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                            });
+                        });
+
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let send_direct = ui
                             .button(egui::RichText::new("Send directly").small().strong())
-                            .on_hover_text("Sends all comments directly to the session");
+                            .on_hover_text("Send all pinned comments directly to the agent now");
                         if send_direct.clicked() {
                             let elements = self.comments.drain(..).map(Comment::into_element).collect();
                             commands.push(native::Command::ClearPins);
@@ -525,10 +570,10 @@ impl Browser {
                             commands.push(native::Command::Comment(false, 1));
                             action = Some(BrowserAction::Send(elements));
                         }
-                        let add_label = if count == 1 { "Add comment" } else { "Add comments" };
+                        let add_label = if count == 1 { "Add to message" } else { "Add comments to message" };
                         let add_btn = ui
                             .button(egui::RichText::new(add_label).small())
-                            .on_hover_text("Accumulates comments in the message box to send together later");
+                            .on_hover_text("Attach all pinned comments to your chat message composer");
                         if add_btn.clicked() {
                             let elements = self.comments.drain(..).map(Comment::into_element).collect();
                             commands.push(native::Command::ClearPins);
@@ -536,66 +581,21 @@ impl Browser {
                             commands.push(native::Command::Comment(false, 1));
                             action = Some(BrowserAction::Attach(elements));
                         }
-                        if ui.button(egui::RichText::new("Clear").small()).clicked() {
+                        if ui.button(egui::RichText::new("Clear").small()).on_hover_text("Clear all pinned comments").clicked() {
                             self.comments.clear();
                             commands.push(native::Command::ClearPins);
                         }
                     });
                 });
-                ui.add_space(2.0);
-
-                egui::ScrollArea::vertical().max_height(150.0).id_salt("comments").show(ui, |ui| {
-                    for comment in &mut self.comments {
-                        ui.horizontal(|ui| {
-                            pin_number(ui, comment.number);
-                            let note = ui.add(
-                                egui::TextEdit::singleline(&mut comment.note)
-                                    .desired_width((ui.available_width() - 170.0).max(60.0))
-                                    .hint_text("What should change here?"),
-                            );
-                            // The note for a fresh pin takes the keyboard, so the user can just type.
-                            if self.focus_note == Some(comment.number) {
-                                note.request_focus();
-                                self.focus_note = None;
-                            }
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(comment.element.short_label()).monospace().small().weak(),
-                                )
-                                .truncate(),
-                            )
-                            .on_hover_text(&comment.element.selector);
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if icons::small_button(ui, Icon::Close, "Remove this comment").clicked() {
-                                    remove = Some(comment.number);
-                                }
-                                if ui
-                                    .small_button("Send")
-                                    .on_hover_text("Send this comment directly to the session")
-                                    .clicked()
-                                {
-                                    send_single = Some(comment.number);
-                                }
-                            });
-                        });
-                    }
-                });
             });
 
-        if let Some(number) = send_single
-            && let Some(pos) = self.comments.iter().position(|c| c.number == number)
-        {
-            let comment = self.comments.remove(pos);
+        if let Some(number) = remove {
+            self.comments.retain(|comment| comment.number != number);
             commands.push(native::Command::RemovePin(number));
             if self.comments.is_empty() {
                 self.mode = Mode::Off;
                 commands.push(native::Command::Comment(false, 1));
             }
-            action = Some(BrowserAction::Send(vec![comment.into_element()]));
-        }
-        if let Some(number) = remove {
-            self.comments.retain(|comment| comment.number != number);
-            commands.push(native::Command::RemovePin(number));
         }
         action
     }
@@ -985,6 +985,16 @@ mod tests {
         assert_eq!(blank.note(), None);
 
         assert_eq!(serde_json::from_str::<PageMessage>(r#"{"kind":"cancelled"}"#).unwrap(), PageMessage::Cancelled);
+        let in_page_comment = r#"{"kind":"commented","number":4,"url":"http://localhost:3000/","selector":"button#submit","tag":"button#submit","text":"Send","html":"<button id=\"submit\">Send</button>","width":100,"height":32,"note":"Change button to green"}"#;
+        let Ok(PageMessage::Commented(in_page)) = serde_json::from_str::<PageMessage>(in_page_comment) else {
+            panic!("should parse in-page comment with note");
+        };
+        assert_eq!(in_page.note, "Change button to green");
+        assert_eq!(in_page.into_element().note(), Some("Change button to green"));
+
+        let removed = r#"{"kind":"comment_removed","number":4}"#;
+        assert_eq!(serde_json::from_str::<PageMessage>(removed).unwrap(), PageMessage::CommentRemoved { number: 4 });
+
         assert!(serde_json::from_str::<PageMessage>(r#"{"kind":"steal-cookies"}"#).is_err());
     }
 
