@@ -1,5 +1,7 @@
 //! The middle column: the conversation and the message box.
 
+#![allow(dead_code)] // Preserved for conversation tests and transition.
+
 use std::path::Path;
 
 use eframe::egui;

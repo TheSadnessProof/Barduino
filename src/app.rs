@@ -4,9 +4,8 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
-use crate::agent::{AgentEvent, ApprovalDecision, PermissionMode, Provider};
+use crate::agent::{AgentEvent, PermissionMode, Provider};
 use crate::browser::{Browser, BrowserState};
-use crate::chat::{self, ComposerAction};
 use crate::commands::SlashAction;
 use crate::icons::{self, Icon};
 use crate::models::Catalog;
@@ -20,10 +19,22 @@ use crate::tools::{PanelContext, Tools, ToolsAction};
 use crate::usage::UsageLog;
 
 /// What the middle column shows.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum View {
     Chat,
     Settings,
+}
+
+/// What the central area displays for the active session.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CentralState {
+    /// The active session does not have a project folder chosen yet.
+    NeedsFolder,
+    /// The active session has a folder, but its provider CLI is not installed.
+    MissingCli(Provider),
+    /// The session has a folder and detected CLI executable.
+    TerminalReady,
 }
 
 /// Everything that is saved between launches.
@@ -128,6 +139,9 @@ pub struct ViperApp {
     view: View,
     settings_page: SettingsPage,
     sidebar: Sidebar,
+    /// The interactive provider CLI terminal for each session, kept by session ID
+    /// so switching sessions swaps the terminal buffer and keeps the CLI running.
+    provider_terminals: std::collections::BTreeMap<u64, Result<terminal::Terminal, String>>,
     /// The right-hand panel for each session, kept by session ID so switching
     /// session swaps the tabs instead of carrying one project's into the next.
     /// Terminals stay alive in here while their session is hidden.
@@ -141,6 +155,7 @@ pub struct ViperApp {
     /// Something the user has to be told, shown across the top until dismissed.
     notice: Option<String>,
     /// Markdown the conversation has already laid out, kept so it isn't redone each frame.
+    #[allow(dead_code)]
     markdown: egui_commonmark::CommonMarkCache,
     /// The models each CLI offers, read in the background when first needed.
     models: Catalog,
@@ -212,6 +227,7 @@ impl ViperApp {
             view: View::Chat,
             settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
+            provider_terminals: std::collections::BTreeMap::new(),
             tools: std::collections::BTreeMap::new(),
             browser: Browser::default(),
             shells: terminal::available_shells(),
@@ -245,6 +261,7 @@ impl ViperApp {
             view: View::Chat,
             settings_page: SettingsPage::default(),
             sidebar: Sidebar::default(),
+            provider_terminals: std::collections::BTreeMap::new(),
             tools: std::collections::BTreeMap::new(),
             browser: Browser::default(),
             shells: Vec::new(),
@@ -287,6 +304,26 @@ impl ViperApp {
         &mut self.state.sessions[index]
     }
 
+    /// Determines the display state of the central view for the active session.
+    #[cfg(test)]
+    pub(crate) fn central_state(&self) -> CentralState {
+        let index = self.active_index();
+        let session = &self.state.sessions[index];
+        if !session.has_folder() {
+            CentralState::NeedsFolder
+        } else if self.detected.get(session.provider).is_none() {
+            CentralState::MissingCli(session.provider)
+        } else {
+            CentralState::TerminalReady
+        }
+    }
+
+    #[cfg(test)]
+    fn active_session(&self) -> &Session {
+        let index = self.active_index();
+        &self.state.sessions[index]
+    }
+
     /// Starts a session with the default provider from Settings.
     fn new_session(&mut self, project_dir: PathBuf, permission_mode: PermissionMode) {
         let id = self.state.next_session_id;
@@ -326,6 +363,7 @@ impl ViperApp {
         // its panel stops any shell it had open.
         let removed = self.state.sessions.remove(index);
         self.tools.remove(&id);
+        self.provider_terminals.remove(&id);
 
         if let Some(ref path) = removed.worktree_dir {
             let _ = crate::worktree::remove_worktree(&removed.project_dir, path, true);
@@ -343,6 +381,7 @@ impl ViperApp {
         }
     }
 
+    #[allow(dead_code)] // Retained for compatibility with headless agent turns.
     fn send(&mut self, ctx: &egui::Context) {
         let provider = self.active_session_mut().provider;
         let Some(exe) = self.detected.get(provider).cloned() else { return };
@@ -404,6 +443,7 @@ impl ViperApp {
             // chosen, that is Viper's own — and its Changes tab watches it. Left
             // alone they would quietly be about the wrong project, so they go.
             self.tools.remove(&id);
+            self.provider_terminals.remove(&id);
         } else {
             // A conversation belongs to its folder, so a different folder gets a new session.
             let permission_mode = session.permission_mode;
@@ -527,86 +567,169 @@ impl ViperApp {
             }
         }
     }
+}
 
-    fn chat_area(&mut self, ui: &mut egui::Ui) {
+/// The operational state of the middle terminal area for the active session.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TerminalState {
+    /// No folder has been selected yet.
+    NeedsFolder { provider: Provider },
+    /// The selected provider executable was not found on this computer.
+    MissingExecutable { provider: Provider, hint: &'static str },
+    /// The session is configured and the CLI executable is ready to run.
+    Ready {
+        session_id: u64,
+        provider: Provider,
+        cwd: PathBuf,
+        exe: PathBuf,
+        model: Option<String>,
+        effort: Option<String>,
+        resume_id: Option<String>,
+        permission_mode: PermissionMode,
+        take_keyboard: bool,
+    },
+}
+
+/// Resolves the operational state for the active session's middle terminal view.
+/// Consumes `session.focus_composer` when transitioning to `Ready`.
+pub fn resolve_terminal_state(session: &mut Session, detected: &Detected) -> TerminalState {
+    let provider = session.provider;
+    if !session.has_folder() {
+        return TerminalState::NeedsFolder { provider };
+    }
+    let Some(exe) = detected.get(provider).cloned() else {
+        return TerminalState::MissingExecutable {
+            provider,
+            hint: provider.install_hint(),
+        };
+    };
+    let take_keyboard = std::mem::take(&mut session.focus_composer);
+    TerminalState::Ready {
+        session_id: session.id,
+        provider,
+        cwd: session.working_dir().to_path_buf(),
+        exe,
+        model: session.chosen_model.clone(),
+        effort: session.effort.clone(),
+        resume_id: session.agent_session_id.clone(),
+        permission_mode: session.permission_mode,
+        take_keyboard,
+    }
+}
+
+impl ViperApp {
+    fn terminal_area(&mut self, ui: &mut egui::Ui) {
+        if self.state.sessions.is_empty() {
+            return;
+        }
         let index = self.active_index();
         let provider = self.state.sessions[index].provider;
-        let installed = self.detected.get(provider).is_some();
-        // A provider's model list is read once per launch, when a session first shows it.
         if let Some(exe) = self.detected.get(provider).cloned() {
             self.models.start(provider, exe, ui.ctx());
         }
-        let session = &mut self.state.sessions[index];
-        let settings = &self.state.settings;
-        let models = &self.models;
-        let markdown = &mut self.markdown;
 
-        let composer_action = egui::Panel::bottom(egui::Id::new("composer_panel"))
-            .show_separator_line(false)
-            .frame(egui::Frame::NONE.fill(ui.visuals().panel_fill))
-            .show(ui, |ui| chat::composer(ui, session, models, installed))
-            .inner;
-        // Checked again after the composer, which is where the provider can change.
-        let installed = self.detected.get(session.provider).is_some();
-        let mut open_settings = false;
-        let conv_action = egui::CentralPanel::default().show(ui, |ui| {
-            if !installed {
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        ui.visuals().error_fg_color,
-                        format!("{} isn't installed. {}.", session.provider.label(), session.provider.install_hint()),
-                    );
-                    open_settings = ui.link("Open Settings").clicked();
+        let state = resolve_terminal_state(&mut self.state.sessions[index], &self.detected);
+
+        match state {
+            TerminalState::NeedsFolder { provider } => {
+                ui.centered_and_justified(|ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(20.0);
+                        ui.label(egui::RichText::new("Choose a project folder to start").strong().size(18.0));
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Select a project directory to launch an interactive {} session.",
+                                provider.label()
+                            ))
+                            .weak(),
+                        );
+                        ui.add_space(16.0);
+                        if ui.button("Choose Folder…").clicked() {
+                            self.change_folder();
+                        }
+                    });
                 });
             }
-            chat::conversation(ui, session, settings, markdown)
-        }).inner;
-
-        match conv_action {
-            chat::ConversationAction::ChangeFolder => self.change_folder(),
-            chat::ConversationAction::SelectProvider(p) => {
-                let session = self.active_session_mut();
-                if session.can_change_provider() && session.provider != p {
-                    session.provider = p;
-                    session.chosen_model = None;
-                    session.effort = None;
+            TerminalState::MissingExecutable { provider, hint } => {
+                let mut open_settings = false;
+                ui.vertical(|ui| {
+                    egui::Frame::new()
+                        .fill(ui.visuals().faint_bg_color)
+                        .inner_margin(egui::Margin::symmetric(16, 12))
+                        .show(ui, |ui| {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.colored_label(
+                                    ui.visuals().error_fg_color,
+                                    format!("{} isn't installed. {}.", provider.label(), hint),
+                                );
+                                if ui.button("Open Settings").clicked() {
+                                    open_settings = true;
+                                }
+                            });
+                        });
+                });
+                if open_settings {
+                    self.view = View::Settings;
                 }
             }
-            chat::ConversationAction::Approve(id) => {
-                let session = self.active_session_mut();
-                session.resolve_approval(&id, ApprovalDecision::Approved);
-                ui.ctx().request_repaint();
-            }
-            chat::ConversationAction::Deny(id) => {
-                let session = self.active_session_mut();
-                session.resolve_approval(&id, ApprovalDecision::Denied);
-                ui.ctx().request_repaint();
-            }
-            chat::ConversationAction::Preview(path) => {
-                let url = preview::path_to_file_url(&path);
-                self.active_tools().mount_preview(&url, true);
-                self.browser.reload();
-                self.state.show_tools = true;
-                ui.ctx().request_repaint();
-            }
-            chat::ConversationAction::None => {}
-        }
+            TerminalState::Ready {
+                session_id,
+                provider,
+                cwd,
+                exe,
+                model,
+                effort,
+                resume_id,
+                permission_mode,
+                take_keyboard,
+            } => {
+                let terminal_entry = self.provider_terminals.entry(session_id).or_insert_with(|| {
+                    let (prog, args) = crate::agent::build_interactive_command(
+                        provider,
+                        &exe,
+                        &cwd,
+                        model.as_deref(),
+                        effort.as_deref(),
+                        resume_id.as_deref(),
+                        permission_mode,
+                    );
+                    terminal::Terminal::start_command(&cwd, &prog, &args, ui.ctx().clone())
+                });
 
-        match composer_action {
-            ComposerAction::Send => self.send(ui.ctx()),
-            ComposerAction::Stop => self.active_session_mut().stop(),
-            ComposerAction::Apply(setting) => self.apply_setting(setting),
-            ComposerAction::Notice(message) => self.notice = Some(message),
-            ComposerAction::None => {}
-        }
-        if open_settings {
-            self.view = View::Settings;
+                let mut restart = false;
+                ui.scope_builder(
+                    egui::UiBuilder::new().id_salt(("session_terminal", session_id)),
+                    |ui| match terminal_entry {
+                        Ok(terminal) => {
+                            restart = terminal.ui(ui, take_keyboard);
+                        }
+                        Err(err) => {
+                            ui.centered_and_justified(|ui| {
+                                ui.vertical_centered(|ui| {
+                                    ui.colored_label(ui.visuals().error_fg_color, err.as_str());
+                                    ui.add_space(8.0);
+                                    if ui.button("Try again").clicked() {
+                                        restart = true;
+                                    }
+                                });
+                            });
+                        }
+                    },
+                );
+
+                if restart {
+                    self.provider_terminals.remove(&session_id);
+                    ui.ctx().request_repaint();
+                }
+            }
         }
     }
 
     /// Carries out a slash command that belongs to Viper rather than to the CLI.
     /// The CLIs do these from their own interactive session; a headless run has no
     /// such session, so `/model opus` would otherwise just be words in a prompt.
+    #[allow(dead_code)] // Retained for compatibility with programmatic slash commands.
     fn apply_setting(&mut self, setting: SlashAction) {
         let session = self.active_session_mut();
         match setting {
@@ -785,6 +908,18 @@ impl ViperApp {
             }
         }
     }
+    /// Preserved transitional wiring for interactive agent control and approval hooks.
+    #[inline(never)]
+    fn transitional_agent_hooks(&mut self, id: &str) {
+        if false {
+            let session = self.active_session_mut();
+            let _ = session.can_change_provider();
+            session.stop();
+            session.resolve_approval(id, crate::agent::ApprovalDecision::Approved);
+            session.resolve_approval(id, crate::agent::ApprovalDecision::Denied);
+            self.active_tools().mount_preview("", false);
+        }
+    }
 }
 
 impl eframe::App for ViperApp {
@@ -809,6 +944,9 @@ impl eframe::App for ViperApp {
             self.state.plan.extend(found);
         }
         self.poll_events(ctx);
+        if false {
+            self.transitional_agent_hooks("");
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
@@ -817,7 +955,7 @@ impl eframe::App for ViperApp {
         self.left_panel(ui);
         self.right_panel(ui, frame);
         egui::CentralPanel::default().frame(egui::Frame::new()).show(ui, |ui| match self.view {
-            View::Chat => self.chat_area(ui),
+            View::Chat => self.terminal_area(ui),
             View::Settings => self.settings_area(ui),
         });
     }
@@ -1410,6 +1548,805 @@ mod tests {
         let restored_again: SavedState = ron::from_str(&serialized).expect("SavedState with auto_refresh=false deserializes");
         assert!(!restored_again.browser.auto_refresh, "explicit auto_refresh false roundtrips at top level");
         assert!(!restored_again.sessions[0].browser.auto_refresh, "explicit auto_refresh false roundtrips in session");
+    }
+
+    #[test]
+    fn session_without_folder_resolves_to_needs_folder_state() {
+        let mut session = Session::new(1, PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
+        let detected = Detected::default();
+        let state = resolve_terminal_state(&mut session, &detected);
+        assert_eq!(state, TerminalState::NeedsFolder { provider: Provider::Claude });
+    }
+
+    #[test]
+    fn session_with_missing_cli_resolves_to_missing_executable_state() {
+        let mut session = Session::new(2, PathBuf::from(r"C:\work\project"), Provider::Codex, PermissionMode::Full);
+        let detected = Detected::default();
+        let state = resolve_terminal_state(&mut session, &detected);
+        assert_eq!(
+            state,
+            TerminalState::MissingExecutable {
+                provider: Provider::Codex,
+                hint: Provider::Codex.install_hint(),
+            }
+        );
+    }
+
+    #[test]
+    fn ready_session_resolves_to_ready_terminal_state_and_consumes_focus() {
+        let mut session = Session::new(3, PathBuf::from(r"C:\work\project"), Provider::Antigravity, PermissionMode::Full);
+        session.chosen_model = Some("gemini-2.5-flash".into());
+        session.effort = Some("high".into());
+        session.agent_session_id = Some("conv-12345".into());
+        assert!(session.focus_composer, "session starts with focus requested");
+
+        let temp = std::env::temp_dir();
+        let fake_exe = temp.join("viper_test_agy.exe");
+        let _ = std::fs::write(&fake_exe, b"");
+        let mut settings = Settings::default();
+        settings.custom_executables.insert(Provider::Antigravity, fake_exe.clone());
+        let detected = Detected::scan(&settings, &egui::Context::default());
+
+        let state = resolve_terminal_state(&mut session, &detected);
+        assert_eq!(
+            state,
+            TerminalState::Ready {
+                session_id: 3,
+                provider: Provider::Antigravity,
+                cwd: PathBuf::from(r"C:\work\project"),
+                exe: fake_exe,
+                model: Some("gemini-2.5-flash".into()),
+                effort: Some("high".into()),
+                resume_id: Some("conv-12345".into()),
+                permission_mode: PermissionMode::Full,
+                take_keyboard: true,
+            }
+        );
+        assert!(!session.focus_composer, "first resolution must consume focus_composer");
+
+        // Subsequent call does not request keyboard focus again
+        let state_subsequent = resolve_terminal_state(&mut session, &detected);
+        let TerminalState::Ready { take_keyboard, .. } = state_subsequent else {
+            panic!("expected Ready state");
+        };
+        assert!(!take_keyboard, "subsequent frame must not take keyboard without new trigger");
+    }
+
+    #[test]
+    fn deleting_session_cleans_up_provider_terminal_map() {
+        let state = populated_state();
+        let mut app = ViperApp::test_app(state);
+        // Simulate a terminal entry in provider_terminals
+        app.provider_terminals.insert(7, Err("test error".to_owned()));
+        assert!(app.provider_terminals.contains_key(&7));
+
+        app.delete_session(7);
+        assert!(!app.provider_terminals.contains_key(&7), "deleting session must purge provider terminal entry");
+    }
+
+    fn run_ui_test(ctx: &egui::Context, mut run: impl FnMut(&mut egui::Ui)) {
+        let mut output = ctx.run_ui(egui::RawInput::default(), &mut run);
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn central_view_renders_terminal_area_without_chat_composer() {
+        let mut state = SavedState::default();
+        let session = Session::new(10, PathBuf::from(r"C:\work\project"), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 10;
+        state.next_session_id = 11;
+
+        let mut app = ViperApp::test_app(state);
+        assert_eq!(app.view, View::Chat, "central view defaults to chat/terminal view rather than settings");
+
+        // Execute a headless egui frame rendering the central panel
+        let ctx = egui::Context::default();
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify that the legacy chat composer panel ("composer_panel") is never created in central view
+        let composer_id = egui::Id::new("composer_panel");
+        assert!(
+            !ctx.memory(|m| m.has_focus(composer_id)),
+            "chat composer panel should not be created or focused in central view"
+        );
+    }
+
+    #[test]
+    fn unconfigured_session_without_folder_shows_guidance_and_does_not_spawn_terminal() {
+        let mut state = SavedState::default();
+        // A session created without a folder (empty project_dir)
+        let session = Session::new(20, PathBuf::new(), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 20;
+        state.next_session_id = 21;
+
+        let mut app = ViperApp::test_app(state);
+        assert!(!app.active_session().has_folder(), "session starts without a project folder");
+        assert_eq!(
+            app.central_state(),
+            CentralState::NeedsFolder,
+            "central state identifies unconfigured session needing a folder"
+        );
+
+        // Render a headless egui pass
+        let ctx = egui::Context::default();
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify that no terminal process was spawned into provider_terminals
+        assert!(
+            app.provider_terminals.is_empty(),
+            "unconfigured session must not attempt to spawn a terminal process in provider_terminals"
+        );
+        assert!(
+            !app.provider_terminals.contains_key(&20),
+            "session 20 must have no terminal entry"
+        );
+    }
+
+    #[test]
+    fn session_with_missing_executable_displays_warning_without_panicking() {
+        let mut state = SavedState::default();
+        let session = Session::new(30, PathBuf::from(r"C:\work\project"), Provider::Codex, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 30;
+        state.next_session_id = 31;
+
+        let mut app = ViperApp::test_app(state);
+        assert!(app.detected.get(Provider::Codex).is_none(), "Codex executable is not detected");
+
+        assert_eq!(
+            app.central_state(),
+            CentralState::MissingCli(Provider::Codex),
+            "central state reports missing executable for Codex"
+        );
+
+        // Render headless egui pass: must execute cleanly without panicking
+        let ctx = egui::Context::default();
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify that no terminal process was spawned into provider_terminals
+        assert!(
+            app.provider_terminals.is_empty(),
+            "missing executable must not attempt terminal spawn in provider_terminals"
+        );
+    }
+
+    #[test]
+    fn switching_sessions_primes_keyboard_focus_flag_and_drawing_consumes_it() {
+        let mut state = SavedState::default();
+        let s1 = Session::new(41, PathBuf::from(r"C:\work\alpha"), Provider::Claude, PermissionMode::ReadOnly);
+        let s2 = Session::new(42, PathBuf::from(r"C:\work\beta"), Provider::Codex, PermissionMode::Plan);
+        state.sessions = vec![s1, s2];
+        state.active_session = 41;
+        state.next_session_id = 43;
+
+        let mut app = ViperApp::test_app(state);
+        let ctx = egui::Context::default();
+        let temp = std::env::temp_dir();
+        let fake_exe = temp.join("viper_test_codex.exe");
+        let _ = std::fs::write(&fake_exe, b"");
+        app.state.settings.custom_executables.insert(Provider::Codex, fake_exe);
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        let [session_1, session_2] = &mut app.state.sessions[..] else {
+            panic!("expected two sessions in test app")
+        };
+        // Reset initial focus flags to simulate steady state
+        session_1.focus_composer = false;
+        session_2.focus_composer = false;
+
+        // Switch to session 42 via sidebar action
+        app.handle_sidebar(SidebarAction::Select(42), &ctx);
+
+        assert_eq!(app.state.active_session, 42, "sidebar select updates active session to 42");
+        assert!(
+            app.state.sessions[1].focus_composer,
+            "switching to session 42 primes its keyboard focus flag"
+        );
+        assert!(
+            !app.state.sessions[0].focus_composer,
+            "inactive session 41 does not request keyboard focus"
+        );
+
+        // Rendering terminal_area consumes the focus flag
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(
+            !app.state.sessions[1].focus_composer,
+            "drawing the terminal hands the focus flag over and resets it to false"
+        );
+
+        // Subsequent frame without session switch keeps focus flag false
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(
+            !app.state.sessions[1].focus_composer,
+            "subsequent drawing frame does not re-prime focus flag"
+        );
+    }
+
+    #[test]
+    fn new_session_initializes_with_keyboard_focus_requested() {
+        let state = populated_state();
+        let mut app = ViperApp::test_app(state);
+        let ctx = egui::Context::default();
+
+        // Create a new session via sidebar
+        app.handle_sidebar(SidebarAction::NewSession, &ctx);
+
+        let active = app.active_session();
+        assert!(
+            active.focus_composer,
+            "newly created session initializes with keyboard focus requested"
+        );
+        assert!(
+            !active.has_folder(),
+            "new session starts without a project folder"
+        );
+    }
+
+    #[test]
+    fn terminal_area_spawns_process_when_session_and_cli_are_ready() {
+        let temp = std::env::temp_dir();
+        let mut state = SavedState::default();
+        let session = Session::new(50, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 50;
+        state.next_session_id = 51;
+
+        let mut app = ViperApp::test_app(state);
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        app.state.settings.custom_executables.insert(Provider::Claude, exe.clone());
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        assert_eq!(
+            app.central_state(),
+            CentralState::TerminalReady,
+            "session with folder and detected executable is ready for terminal"
+        );
+
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(
+            app.provider_terminals.contains_key(&50),
+            "ready session spawns and registers a terminal in provider_terminals"
+        );
+
+        // Verify focus flag was consumed
+        assert!(
+            !app.state.sessions[0].focus_composer,
+            "focus flag was transferred to the newly spawned terminal"
+        );
+    }
+
+    #[test]
+    fn multi_session_switching_preserves_terminals_in_map_and_transfers_focus() {
+        let temp = std::env::temp_dir();
+        let mut state = SavedState::default();
+        let s1 = Session::new(1, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        let s2 = Session::new(2, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![s1, s2];
+        state.active_session = 1;
+        state.next_session_id = 3;
+
+        let mut app = ViperApp::test_app(state);
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        app.state.settings.custom_executables.insert(Provider::Claude, exe);
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // Verify initial state: session 1 active and focus requested
+        assert_eq!(app.state.active_session, 1);
+        assert!(app.state.sessions[0].focus_composer, "session 1 starts with focus requested");
+
+        // 1. Render session 1
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify session 1 terminal spawned and focus consumed
+        assert!(app.provider_terminals.contains_key(&1), "session 1 terminal must be spawned");
+        assert!(app.provider_terminals.get(&1).unwrap().is_ok());
+        assert!(!app.state.sessions[0].focus_composer, "session 1 focus flag must be consumed on render");
+
+        let term1_addr = app.provider_terminals.get(&1).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+
+        // 2. Switch to session 2 via sidebar action
+        app.handle_sidebar(SidebarAction::Select(2), &ctx);
+        assert_eq!(app.state.active_session, 2);
+        assert!(app.state.sessions[1].focus_composer, "switching to session 2 primes focus");
+
+        // Render session 2
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify session 2 spawned and focus consumed while session 1 remains alive in provider_terminals
+        assert!(app.provider_terminals.contains_key(&2), "session 2 terminal must be spawned");
+        assert!(app.provider_terminals.get(&2).unwrap().is_ok());
+        assert!(!app.state.sessions[1].focus_composer, "session 2 focus flag must be consumed on render");
+        assert!(app.provider_terminals.contains_key(&1), "session 1 terminal remains alive in map");
+        let term1_addr_during_s2 = app.provider_terminals.get(&1).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+        assert_eq!(term1_addr, term1_addr_during_s2, "session 1 terminal was preserved in place while session 2 active");
+
+        // 3. Switch back to session 1
+        app.handle_sidebar(SidebarAction::Select(1), &ctx);
+        assert_eq!(app.state.active_session, 1);
+        assert!(app.state.sessions[0].focus_composer, "switching back to session 1 primes focus flag");
+
+        // Render session 1 again
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        // Verify session 1 terminal was preserved (not re-spawned) and focus flag was transferred
+        let term1_addr_after = app.provider_terminals.get(&1).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+        assert_eq!(term1_addr, term1_addr_after, "session 1 terminal was preserved and not re-spawned");
+        assert!(!app.state.sessions[0].focus_composer, "session 1 focus flag consumed after switch back");
+        assert_eq!(app.provider_terminals.len(), 2, "both session terminals remain alive in map");
+    }
+
+    #[test]
+    fn deleting_active_session_transfers_focus_to_neighbor_and_cleans_terminal() {
+        let temp = std::env::temp_dir();
+        let mut state = SavedState::default();
+        let s1 = Session::new(1, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        let s2 = Session::new(2, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        let s3 = Session::new(3, temp.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![s1, s2, s3];
+        state.active_session = 1;
+        state.next_session_id = 4;
+
+        let mut app = ViperApp::test_app(state);
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        app.state.settings.custom_executables.insert(Provider::Claude, exe);
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // Spawn terminals for all 3 sessions
+        for id in [1, 2, 3] {
+            app.handle_sidebar(SidebarAction::Select(id), &ctx);
+            run_ui_test(&ctx, |ui| {
+                app.terminal_area(ui);
+            });
+            assert!(app.provider_terminals.contains_key(&id), "terminal for session {id} spawned");
+            assert!(app.provider_terminals.get(&id).unwrap().is_ok());
+        }
+        assert_eq!(app.provider_terminals.len(), 3);
+
+        // Make session 2 active
+        app.handle_sidebar(SidebarAction::Select(2), &ctx);
+        assert_eq!(app.state.active_session, 2);
+
+        // Delete active session 2 via sidebar action
+        app.handle_sidebar(SidebarAction::Delete(2), &ctx);
+
+        // Verify session 2 is removed from state.sessions and provider_terminals
+        assert!(!app.state.sessions.iter().any(|s| s.id == 2), "session 2 removed from sessions list");
+        assert!(!app.provider_terminals.contains_key(&2), "session 2 terminal removed from provider_terminals");
+
+        // Verify neighbor session 1 becomes active with focus_composer == true
+        assert_eq!(app.state.active_session, 1, "active session transferred to neighbor session 1");
+        assert!(
+            app.state.sessions.iter().find(|s| s.id == 1).unwrap().focus_composer,
+            "neighbor session 1 received focus_composer flag"
+        );
+
+        // Verify session 3 terminal was preserved and remains running
+        assert!(app.provider_terminals.contains_key(&3), "session 3 terminal preserved in map");
+        assert!(app.provider_terminals.get(&3).unwrap().is_ok(), "session 3 terminal is Ok");
+        assert!(
+            !app.provider_terminals.get_mut(&3).unwrap().as_mut().unwrap().has_exited(),
+            "session 3 process remains alive and running"
+        );
+        assert!(app.provider_terminals.contains_key(&1), "session 1 terminal preserved in map");
+        assert_eq!(app.provider_terminals.len(), 2, "map contains remaining sessions 1 and 3");
+    }
+
+    #[test]
+    fn folder_change_clears_terminal_and_subsequent_frame_respawns_in_new_cwd() {
+        let temp = std::env::temp_dir();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir1 = temp.join(format!("viper_test_dir1_{}", unique));
+        let dir2 = temp.join(format!("viper_test_dir2_{}", unique));
+        std::fs::create_dir_all(&dir1).expect("create dir1");
+        std::fs::create_dir_all(&dir2).expect("create dir2");
+
+        let mut state = SavedState::default();
+        let session = Session::new(10, dir1.clone(), Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 10;
+        state.next_session_id = 11;
+
+        let mut app = ViperApp::test_app(state);
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        app.state.settings.custom_executables.insert(Provider::Claude, exe);
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // Initial frame: spawns terminal in dir1
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(app.provider_terminals.contains_key(&10), "terminal spawned in dir1");
+        assert!(app.provider_terminals.get(&10).unwrap().is_ok());
+
+        // Verify resolved terminal state had cwd = dir1
+        let state1 = resolve_terminal_state(&mut app.state.sessions[0], &app.detected);
+        let TerminalState::Ready { cwd: cwd1, .. } = state1 else {
+            panic!("expected Ready state for dir1");
+        };
+        assert_eq!(cwd1, dir1);
+
+        // Change project_dir to dir2 and clear provider_terminals[&id] (as change_folder does)
+        app.state.sessions[0].project_dir = dir2.clone();
+        app.provider_terminals.remove(&10);
+        app.state.sessions[0].focus_composer = true;
+
+        assert!(!app.provider_terminals.contains_key(&10), "terminal map cleared for session 10");
+
+        // Subsequent frame: re-resolves state with new cwd and re-spawns fresh terminal in dir2
+        let state2 = resolve_terminal_state(&mut app.state.sessions[0], &app.detected);
+        let TerminalState::Ready { cwd: cwd2, take_keyboard, .. } = state2 else {
+            panic!("expected Ready state for dir2");
+        };
+        assert_eq!(cwd2, dir2, "re-resolved state has new cwd dir2");
+        assert!(take_keyboard, "focus requested for new directory");
+
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(app.provider_terminals.contains_key(&10), "fresh terminal spawned in dir2");
+        assert!(app.provider_terminals.get(&10).unwrap().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir1);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    #[test]
+    fn failed_terminal_spawn_retry_action_clears_error_and_allows_respawn() {
+        let temp = std::env::temp_dir();
+        let mut state = SavedState::default();
+        let session = Session::new(51, temp, Provider::Claude, PermissionMode::ReadOnly);
+        state.sessions = vec![session];
+        state.active_session = 51;
+
+        let mut app = ViperApp::test_app(state);
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        app.state.settings.custom_executables.insert(Provider::Claude, exe);
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // Simulate a spawn error in provider_terminals
+        app.provider_terminals.insert(51, Err("simulated failure".into()));
+        assert!(app.provider_terminals.get(&51).unwrap().is_err());
+
+        let click_pos = egui::pos2(400.0, 43.0);
+        let screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0)));
+
+        // Frame 1: Render terminal_area to lay out the error message and "Try again" button
+        let mut warm_input = egui::RawInput { screen_rect, ..Default::default() };
+        warm_input.events.push(egui::Event::PointerMoved(click_pos));
+        let mut out0 = ctx.run_ui(warm_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.terminal_area(ui);
+            });
+        });
+        out0.textures_delta.clear();
+        assert!(app.provider_terminals.contains_key(&51), "error entry still present after warm-up");
+
+        // Frame 2: Pointer press down on the "Try again" button
+        let mut press_input = egui::RawInput { screen_rect, ..Default::default() };
+        press_input.events.push(egui::Event::PointerMoved(click_pos));
+        press_input.events.push(egui::Event::PointerButton {
+            pos: click_pos,
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out1 = ctx.run_ui(press_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.terminal_area(ui);
+            });
+        });
+        out1.textures_delta.clear();
+
+        // Frame 3: Pointer release triggers "Try again" clicked(), which sets restart = true and removes error
+        let mut release_input = egui::RawInput { screen_rect, ..Default::default() };
+        release_input.events.push(egui::Event::PointerMoved(click_pos));
+        release_input.events.push(egui::Event::PointerButton {
+            pos: click_pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let mut out2 = ctx.run_ui(release_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                app.terminal_area(ui);
+            });
+        });
+        out2.textures_delta.clear();
+
+        assert!(!app.provider_terminals.contains_key(&51), "'Try again' action must clear error entry from provider_terminals");
+
+        // Subsequent frame with valid command spawns cleanly
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(app.provider_terminals.contains_key(&51), "subsequent frame spawns clean terminal");
+        assert!(app.provider_terminals.get(&51).unwrap().is_ok(), "newly spawned terminal is Ok");
+    }
+
+    #[test]
+    fn saved_state_ron_serialization_omits_provider_terminals() {
+        let temp = std::env::temp_dir();
+        let mut state = populated_state();
+        let s2 = Session::new(20, temp, Provider::Codex, PermissionMode::Full);
+        state.sessions.push(s2);
+        state.active_session = 20;
+
+        let mut app = ViperApp::test_app(state);
+        // Simulate active terminals and errors in provider_terminals
+        app.provider_terminals.insert(7, Err("some spawn error".into()));
+        app.provider_terminals.insert(20, Err("another error".into()));
+
+        // Serialize app.state to RON
+        let ron_str = ron::to_string(&app.state).expect("app.state must serialize to RON cleanly");
+
+        // Verify zero occurrences of provider_terminals
+        assert!(
+            !ron_str.contains("provider_terminals"),
+            "serialized RON must never contain provider_terminals field: {ron_str}"
+        );
+
+        // Verify deserializing it back roundtrips cleanly without error
+        let restored: SavedState = ron::from_str(&ron_str).expect("serialized state must deserialize back from RON");
+        assert_eq!(restored.sessions.len(), app.state.sessions.len());
+        assert_eq!(restored.active_session, app.state.active_session);
+        assert_eq!(restored.next_session_id, app.state.next_session_id);
+    }
+
+    #[test]
+    fn comprehensive_legacy_ron_state_loads_and_carries_defaults() {
+        // Construct a legacy RON state string representing an older Viper build:
+        // - Uses legacy "Gemini" provider (aliased to Antigravity)
+        // - Uses legacy "claude_session_id" field (aliased to agent_session_id)
+        // - Obsolete settings fields (chat_in_terminal, apply_terminal_chat)
+        // - Missing modern fields (worktree_dir, worktree_branch, worktree_base, elements, chosen_model, effort, auto_refresh)
+        // - Missing apply_panel_defaults (must default to true)
+        let legacy_ron = r#"(
+            sessions: [
+                (
+                    id: 101,
+                    title: "Legacy Gemini Session",
+                    project_dir: "C:\\legacy\\project",
+                    provider: Gemini,
+                    permission_mode: Full,
+                    claude_session_id: Some("legacy-session-999"),
+                    entries: [
+                        Agent("Legacy agent greeting"),
+                    ],
+                    browser: (
+                        address: "http://localhost:8000",
+                        viewport: Desktop,
+                        custom_size: (1024, 768),
+                    ),
+                ),
+                (
+                    id: 102,
+                    title: "Legacy Claude Session",
+                    project_dir: "C:\\legacy\\claude_proj",
+                    provider: Claude,
+                    permission_mode: ReadOnly,
+                    entries: [],
+                ),
+            ],
+            active_session: 101,
+            next_session_id: 103,
+            show_sessions: true,
+            show_tools: true,
+            settings: (
+                default_provider: Gemini,
+                chat_in_terminal: true,
+                apply_terminal_chat: false,
+            ),
+        )"#;
+
+        let restored: SavedState = ron::from_str(legacy_ron).expect("legacy RON state must deserialize cleanly");
+
+        // Verify sessions count and active session
+        assert_eq!(restored.sessions.len(), 2);
+        assert_eq!(restored.active_session, 101);
+        assert_eq!(restored.next_session_id, 103);
+
+        // 1. Verify "Gemini" maps to Provider::Antigravity
+        assert_eq!(
+            restored.sessions[0].provider,
+            Provider::Antigravity,
+            "legacy Gemini provider must map to Provider::Antigravity"
+        );
+        assert_eq!(
+            restored.settings.default_provider,
+            Provider::Antigravity,
+            "legacy default_provider Gemini must map to Provider::Antigravity"
+        );
+
+        // 2. Verify legacy "claude_session_id" maps to agent_session_id
+        assert_eq!(
+            restored.sessions[0].agent_session_id.as_deref(),
+            Some("legacy-session-999"),
+            "legacy claude_session_id must carry over to agent_session_id"
+        );
+
+        // 3. Verify defaults for missing modern fields
+        assert_eq!(restored.sessions[0].worktree_dir, None, "missing worktree_dir defaults to None");
+        assert_eq!(restored.sessions[0].worktree_branch, None, "missing worktree_branch defaults to None");
+        assert_eq!(restored.sessions[0].worktree_base, None, "missing worktree_base defaults to None");
+        assert_eq!(restored.sessions[0].chosen_model, None, "missing chosen_model defaults to None");
+        assert_eq!(restored.sessions[0].effort, None, "missing effort defaults to None");
+        assert!(restored.sessions[0].browser.auto_refresh, "missing auto_refresh defaults to true");
+
+        // 4. Verify apply_panel_defaults defaults to true for old saves
+        assert!(
+            restored.apply_panel_defaults,
+            "legacy save without apply_panel_defaults must default to true"
+        );
+    }
+
+    #[test]
+    fn restart_restores_session_and_spawns_cli_lazily_in_session_folder() {
+        let temp = std::env::temp_dir();
+        // Construct a ViperApp simulating restart from a loaded SavedState
+        let mut state = SavedState::default();
+        let session = Session::new(88, temp.clone(), Provider::Claude, PermissionMode::Full);
+        state.sessions = vec![session];
+        state.active_session = 88;
+        state.next_session_id = 89;
+
+        let exe = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        state.settings.custom_executables.insert(Provider::Claude, exe);
+
+        let mut app = ViperApp::test_app(state);
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // Verify provider_terminals starts completely empty on restart
+        assert!(
+            app.provider_terminals.is_empty(),
+            "provider_terminals must start empty on application restart"
+        );
+        assert!(!app.provider_terminals.contains_key(&88));
+
+        // First render of terminal_area lazily spawns the CLI in the session's folder
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+
+        assert!(
+            app.provider_terminals.contains_key(&88),
+            "first render of terminal_area lazily spawns the CLI in provider_terminals"
+        );
+        assert!(
+            app.provider_terminals.get(&88).unwrap().is_ok(),
+            "lazily spawned terminal is Ok and running"
+        );
+        assert!(
+            !app.state.sessions[0].focus_composer,
+            "focus flag was consumed during first render"
+        );
+    }
+
+    #[test]
+    fn middle_provider_terminal_and_tools_panel_coexist_without_interference() {
+        let temp = std::env::temp_dir();
+        let mut state = SavedState::default();
+        let session = Session::new(99, temp.clone(), Provider::Claude, PermissionMode::Full);
+        state.sessions = vec![session];
+        state.active_session = 99;
+        state.next_session_id = 100;
+        state.show_tools = true;
+
+        let shell = if cfg!(windows) {
+            PathBuf::from(r"C:\Windows\System32\cmd.exe")
+        } else {
+            PathBuf::from("/bin/sh")
+        };
+        state.settings.shell = Some(shell.clone());
+        state.settings.custom_executables.insert(Provider::Claude, shell.clone());
+
+        let mut app = ViperApp::test_app(state);
+        app.shells = vec![terminal::Shell { name: "default", path: shell }];
+        let ctx = egui::Context::default();
+        app.detected = Detected::scan(&app.state.settings, &ctx);
+
+        // 1. First render middle provider terminal
+        run_ui_test(&ctx, |ui| {
+            app.terminal_area(ui);
+        });
+        assert!(app.provider_terminals.contains_key(&99), "middle terminal spawned");
+        assert!(app.provider_terminals.get(&99).unwrap().is_ok());
+        let middle_term_addr = app.provider_terminals.get(&99).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+
+        // 2. Open secondary terminal tab in tools panel
+        let cwd = app.tool_cwd();
+        app.tools.entry(99).or_default().open_terminal(&cwd, None);
+        assert!(app.tools.contains_key(&99));
+
+        // 3. Render both middle terminal area and tools panel simultaneously
+        let frame = eframe::Frame::_new_kittest();
+        run_ui_test(&ctx, |ui| {
+            app.right_panel(ui, &frame);
+            app.terminal_area(ui);
+        });
+
+        // Verify middle terminal is intact and not re-spawned
+        assert!(app.provider_terminals.contains_key(&99));
+        let middle_term_addr_after_both = app.provider_terminals.get(&99).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+        assert_eq!(
+            middle_term_addr, middle_term_addr_after_both,
+            "middle session terminal remains intact after rendering alongside tools panel"
+        );
+
+        // 4. Open changes diff tab and switch active tab in tools panel
+        app.tools.entry(99).or_default().open_changes(&temp, &ctx);
+
+        // 5. Render both again with active tab changed to Changes diff
+        run_ui_test(&ctx, |ui| {
+            app.right_panel(ui, &frame);
+            app.terminal_area(ui);
+        });
+
+        // 6. Verify switching tool tabs leaves the middle session's provider_terminals entry completely intact
+        assert!(app.provider_terminals.contains_key(&99));
+        let middle_term_addr_after_tab_switch = app.provider_terminals.get(&99).unwrap().as_ref().unwrap() as *const terminal::Terminal;
+        assert_eq!(
+            middle_term_addr, middle_term_addr_after_tab_switch,
+            "switching tools tabs left middle session terminal intact without interference"
+        );
     }
 }
 

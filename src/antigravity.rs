@@ -2,7 +2,7 @@
 //! JSON output into events the UI can show. `agy` uses the Antigravity app's
 //! own sign-in, so there is nothing extra to set up.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -60,6 +60,42 @@ pub fn args(turn: &Turn) -> Vec<String> {
     // a command line holds on Windows. start_turn sends the prompt on stdin, and agy
     // runs in print mode when given --output-format stream-json. Passing bare "--print"
     // is rejected by Go's flag parser because -print requires a prompt argument.
+    args
+}
+
+/// Arguments for starting Antigravity interactively inside an embedded terminal.
+///
+/// Unlike print-mode turns, interactive mode omits `--output-format` and runs
+/// directly inside the terminal with the project workspace added via `--add-dir`.
+#[allow(dead_code)] // Wired into central terminal in Milestone 2.
+pub fn interactive_args(
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_id: Option<&str>,
+    permission_mode: PermissionMode,
+) -> Vec<String> {
+    let mut args = vec!["--add-dir".to_owned(), cwd.display().to_string()];
+    match permission_mode {
+        PermissionMode::ReadOnly => {}
+        PermissionMode::AcceptEdits => args.extend(["--mode".to_owned(), "accept-edits".to_owned()]),
+        PermissionMode::Full => args.push("--dangerously-skip-permissions".to_owned()),
+        PermissionMode::Plan => args.extend(["--mode".to_owned(), "plan".to_owned()]),
+    }
+    if let Some(model) = model {
+        args.extend(["--model".to_owned(), model.to_owned()]);
+        let named_level = ["-low", "-medium", "-high"].iter().any(|level| model.ends_with(level));
+        if let Some(effort) = effort
+            && !named_level
+        {
+            args.extend(["--effort".to_owned(), effort.to_owned()]);
+        }
+    } else if let Some(effort) = effort {
+        args.extend(["--effort".to_owned(), effort.to_owned()]);
+    }
+    if let Some(conversation_id) = resume_id {
+        args.extend(["--conversation".to_owned(), conversation_id.to_owned()]);
+    }
     args
 }
 

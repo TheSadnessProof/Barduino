@@ -405,6 +405,29 @@ impl ProcessTree {
     fn kill(&self) {}
 }
 
+/// Builds the executable path and arguments for starting an interactive session terminal.
+///
+/// Unlike headless turns, interactive mode omits streaming JSON flags, stdin prompt tokens,
+/// and headless permission denial shims so the provider CLI renders its full interactive
+/// TUI directly in the terminal.
+#[allow(dead_code)] // Used by tests; wired into session terminals in Milestone 2.
+pub fn build_interactive_command(
+    provider: Provider,
+    exe: &Path,
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_id: Option<&str>,
+    permission_mode: PermissionMode,
+) -> (PathBuf, Vec<String>) {
+    let args = match provider {
+        Provider::Claude => claude::interactive_args(cwd, model, effort, resume_id, permission_mode),
+        Provider::Codex => codex::interactive_args(cwd, model, effort, resume_id, permission_mode),
+        Provider::Antigravity => antigravity::interactive_args(cwd, model, effort, resume_id, permission_mode),
+    };
+    (exe.to_path_buf(), args)
+}
+
 /// Starts one turn of the conversation. `on_event` is called from a background
 /// thread for each event.
 pub fn start_turn(
@@ -1097,6 +1120,500 @@ mod tests {
         assert_eq!(received.len(), THREAD_COUNT, "all responses must arrive");
 
         turn.stop();
+    }
+
+    // =========================================================================
+    // Milestone 1: Interactive Provider Command Builder Tests
+    // =========================================================================
+
+    #[test]
+    fn claude_interactive_omits_headless_flags_and_includes_model_and_effort() {
+        // Interactive Claude runs in a PTY terminal, so headless flags (-p, --verbose,
+        // --output-format stream-json, --permission-prompts none) must not be passed.
+        let exe = PathBuf::from("claude");
+        let cwd = PathBuf::from("/workspace/project");
+        let (prog, args) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            Some("claude-3-7-sonnet"),
+            Some("high"),
+            None,
+            PermissionMode::ReadOnly,
+        );
+
+        assert_eq!(prog, exe, "executable path should be preserved");
+
+        // Headless-only flags must be absent.
+        assert!(!args.iter().any(|a| a == "-p"), "headless flag -p must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "--output-format"), "--output-format must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "stream-json"), "stream-json must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "--verbose"), "--verbose must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "--include-partial-messages"), "--include-partial-messages must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "--permission-prompts"), "--permission-prompts none must be omitted so user can approve interactively: {args:?}");
+
+        // Interactive flags for model and effort must be present.
+        assert!(
+            args.windows(2).any(|w| w == ["--model", "claude-3-7-sonnet"]),
+            "model argument should be present: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--effort", "high"]),
+            "effort argument should be present: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a == "--resume"),
+            "fresh turn must not pass --resume: {args:?}"
+        );
+    }
+
+    #[test]
+    fn claude_interactive_sets_permission_modes() {
+        let exe = PathBuf::from("claude");
+        let cwd = PathBuf::from("/workspace/project");
+
+        // ReadOnly maps to default permissions with Bash tool disallowed.
+        let (_, args_ro) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::ReadOnly,
+        );
+        assert!(
+            args_ro.windows(2).any(|w| w == ["--permission-mode", "default"]),
+            "ReadOnly should use default permission mode: {args_ro:?}"
+        );
+        assert!(
+            args_ro.windows(2).any(|w| w == ["--disallowed-tools", "Bash"]),
+            "ReadOnly should disallow Bash tool: {args_ro:?}"
+        );
+
+        // AcceptEdits maps to acceptEdits.
+        let (_, args_edits) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::AcceptEdits,
+        );
+        assert!(
+            args_edits.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]),
+            "AcceptEdits should use acceptEdits permission mode: {args_edits:?}"
+        );
+
+        // Full maps to dangerously-skip-permissions.
+        let (_, args_full) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Full,
+        );
+        assert!(
+            args_full.windows(2).any(|w| w == ["--permission-mode", "bypassPermissions"])
+                || args_full.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "Full access should bypass permissions: {args_full:?}"
+        );
+
+        // Plan maps to plan.
+        let (_, args_plan) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Plan,
+        );
+        assert!(
+            args_plan.windows(2).any(|w| w == ["--permission-mode", "plan"]),
+            "Plan should use plan permission mode: {args_plan:?}"
+        );
+    }
+
+    #[test]
+    fn claude_interactive_resumes_existing_session() {
+        let exe = PathBuf::from("claude");
+        let cwd = PathBuf::from("/workspace/project");
+        let (_, args) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            None,
+            None,
+            Some("session-xyz-123"),
+            PermissionMode::ReadOnly,
+        );
+
+        assert!(
+            args.windows(2).any(|w| w == ["--resume", "session-xyz-123"]),
+            "resume session id should be passed: {args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_interactive_fresh_session_sets_working_directory_and_omits_exec() {
+        // Fresh interactive Codex launches as `codex -C <cwd> ...` rather than `codex exec`.
+        let exe = PathBuf::from("codex");
+        let cwd = PathBuf::from("/workspace/app");
+        let (prog, args) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            Some("o3-mini"),
+            Some("medium"),
+            None,
+            PermissionMode::AcceptEdits,
+        );
+
+        assert_eq!(prog, exe, "executable path should be preserved");
+
+        // Headless-only flags and subcommands must be absent.
+        assert!(!args.iter().any(|a| a == "exec"), "interactive codex must not use exec subcommand: {args:?}");
+        assert!(!args.iter().any(|a| a == "--json"), "interactive codex must not use --json: {args:?}");
+        assert!(!args.iter().any(|a| a == "-"), "interactive codex does not read prompt from stdin via -: {args:?}");
+        assert!(!args.iter().any(|a| a == "resume"), "fresh session must not pass resume subcommand: {args:?}");
+
+        // Working directory and model flags.
+        let cwd_str = cwd.display().to_string();
+        assert!(
+            args.windows(2).any(|w| (w[0] == "-C" || w[0] == "--cd") && w[1] == cwd_str),
+            "working directory should be set via -C: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-m", "o3-mini"]),
+            "model argument should be present: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-c", "model_reasoning_effort=medium"]),
+            "reasoning effort config override should be present: {args:?}"
+        );
+    }
+
+    #[test]
+    fn codex_interactive_resume_uses_resume_subcommand() {
+        // Resuming a conversation in Codex uses the `resume <thread_id>` subcommand.
+        let exe = PathBuf::from("codex");
+        let cwd = PathBuf::from("/workspace/app");
+        let (_, args) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            Some("thread_abc_987"),
+            PermissionMode::ReadOnly,
+        );
+
+        assert!(
+            args.windows(2).any(|w| w == ["resume", "thread_abc_987"]),
+            "resume subcommand and thread id must be passed: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "exec"), "resume must not be preceded by exec: {args:?}");
+        assert!(!args.iter().any(|a| a == "--json"), "--json must be omitted: {args:?}");
+    }
+
+    #[test]
+    fn codex_interactive_configures_sandbox_modes() {
+        let exe = PathBuf::from("codex");
+        let cwd = PathBuf::from("/workspace/app");
+
+        // ReadOnly maps to read-only sandbox.
+        let (_, args_ro) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::ReadOnly,
+        );
+        assert!(
+            args_ro.windows(2).any(|w| (w[0] == "-s" && w[1] == "read-only") || (w[0] == "-c" && w[1] == "sandbox_mode=read-only")),
+            "ReadOnly should configure read-only sandbox: {args_ro:?}"
+        );
+
+        // AcceptEdits maps to workspace-write sandbox.
+        let (_, args_edits) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::AcceptEdits,
+        );
+        assert!(
+            args_edits.windows(2).any(|w| (w[0] == "-s" && w[1] == "workspace-write") || (w[0] == "-c" && w[1] == "sandbox_mode=workspace-write")),
+            "AcceptEdits should configure workspace-write sandbox: {args_edits:?}"
+        );
+
+        // Plan maps to read-only sandbox (Codex has no native plan mode).
+        let (_, args_plan) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Plan,
+        );
+        assert!(
+            args_plan.windows(2).any(|w| (w[0] == "-s" && w[1] == "read-only") || (w[0] == "-c" && w[1] == "sandbox_mode=read-only")),
+            "Plan should configure read-only sandbox: {args_plan:?}"
+        );
+
+        // Full bypasses sandbox and approvals.
+        let (_, args_full) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Full,
+        );
+        assert!(
+            args_full.iter().any(|a| a == "--dangerously-bypass-approvals-and-sandbox"),
+            "Full access should bypass sandbox and approvals: {args_full:?}"
+        );
+        assert!(
+            !args_full.iter().any(|a| a.contains("sandbox_mode")),
+            "Full access should not specify a restrictive sandbox: {args_full:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_interactive_includes_add_dir_and_omits_stream_json() {
+        // Antigravity does not treat cwd as its workspace automatically, so --add-dir
+        // is always required. Interactive mode omits --output-format stream-json and -p.
+        let exe = PathBuf::from("agy");
+        let cwd = PathBuf::from("/workspace/agy_project");
+        let (prog, args) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            Some("gemini-2.5-pro"),
+            Some("high"),
+            None,
+            PermissionMode::ReadOnly,
+        );
+
+        assert_eq!(prog, exe, "executable path should be preserved");
+
+        // --add-dir must be present.
+        let cwd_str = cwd.display().to_string();
+        assert!(
+            args.windows(2).any(|w| w == ["--add-dir", &cwd_str]),
+            "--add-dir must be present with the session working directory: {args:?}"
+        );
+
+        // Headless stream-json flags must be omitted.
+        assert!(!args.iter().any(|a| a == "--output-format"), "--output-format must be omitted in interactive mode: {args:?}");
+        assert!(!args.iter().any(|a| a == "stream-json"), "stream-json must be omitted: {args:?}");
+        assert!(!args.iter().any(|a| a == "--print" || a == "-p"), "print mode flags must be omitted: {args:?}");
+
+        // Model and effort.
+        assert!(
+            args.windows(2).any(|w| w == ["--model", "gemini-2.5-pro"]),
+            "model flag should be present: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--effort", "high"]),
+            "effort flag should be present: {args:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_interactive_resumes_conversation() {
+        let exe = PathBuf::from("agy");
+        let cwd = PathBuf::from("/workspace/agy_project");
+        let (_, args) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            None,
+            None,
+            Some("conv_777_888"),
+            PermissionMode::ReadOnly,
+        );
+
+        assert!(
+            args.windows(2).any(|w| w == ["--conversation", "conv_777_888"]),
+            "--conversation argument must be present for resumed turns: {args:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_interactive_configures_permission_modes() {
+        let exe = PathBuf::from("agy");
+        let cwd = PathBuf::from("/workspace/agy_project");
+
+        // Full access bypasses permissions.
+        let (_, args_full) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Full,
+        );
+        assert!(
+            args_full.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "Full access should skip permissions: {args_full:?}"
+        );
+
+        // AcceptEdits sets mode accept-edits.
+        let (_, args_edits) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::AcceptEdits,
+        );
+        assert!(
+            args_edits.windows(2).any(|w| w == ["--mode", "accept-edits"]),
+            "AcceptEdits should set mode to accept-edits: {args_edits:?}"
+        );
+
+        // Plan sets mode plan.
+        let (_, args_plan) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::Plan,
+        );
+        assert!(
+            args_plan.windows(2).any(|w| w == ["--mode", "plan"]),
+            "Plan should set mode to plan: {args_plan:?}"
+        );
+
+        // ReadOnly does not bypass permissions.
+        let (_, args_ro) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            None,
+            None,
+            None,
+            PermissionMode::ReadOnly,
+        );
+        assert!(
+            !args_ro.iter().any(|a| a == "--dangerously-skip-permissions"),
+            "ReadOnly should not bypass permissions: {args_ro:?}"
+        );
+    }
+
+    #[test]
+    fn antigravity_interactive_skips_effort_when_model_name_encodes_it() {
+        // When the model name already specifies the level (e.g. gemini-3.8-flash-high),
+        // --effort must not be duplicated.
+        let exe = PathBuf::from("agy");
+        let cwd = PathBuf::from("/workspace/agy_project");
+        let (_, args) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            Some("gemini-3.8-flash-high"),
+            Some("high"),
+            None,
+            PermissionMode::ReadOnly,
+        );
+
+        assert!(!args.iter().any(|a| a == "--effort"), "--effort should be omitted when model name carries it: {args:?}");
+    }
+
+    #[test]
+    fn build_interactive_command_configures_claude_without_headless_flags() {
+        let exe = PathBuf::from("C:\\tools\\claude.exe");
+        let cwd = PathBuf::from("C:\\projects\\demo");
+        let (prog, args) = build_interactive_command(
+            Provider::Claude,
+            &exe,
+            &cwd,
+            Some("claude-opus"),
+            Some("high"),
+            Some("session-123"),
+            PermissionMode::Full,
+        );
+        assert_eq!(prog, exe);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_owned()));
+        assert!(args.windows(2).any(|p| p == ["--model", "claude-opus"]));
+        assert!(args.windows(2).any(|p| p == ["--effort", "high"]));
+        assert!(args.windows(2).any(|p| p == ["--resume", "session-123"]));
+        assert!(!args.iter().any(|a| a == "-p" || a == "--output-format" || a == "--permission-prompts"));
+    }
+
+    #[test]
+    fn build_interactive_command_configures_codex_fresh_and_resume() {
+        let exe = PathBuf::from("C:\\tools\\codex.exe");
+        let cwd = PathBuf::from("C:\\projects\\demo");
+
+        // Fresh session: no "exec" or "resume" subcommand
+        let (prog, fresh_args) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            Some("gpt-5"),
+            Some("high"),
+            None,
+            PermissionMode::ReadOnly,
+        );
+        assert_eq!(prog, exe);
+        assert!(!fresh_args.iter().any(|a| a == "exec" || a == "resume" || a == "--json" || a == "-"));
+        assert!(fresh_args.windows(2).any(|p| p == ["-C", "C:\\projects\\demo"]));
+        assert!(fresh_args.windows(2).any(|p| p == ["-s", "read-only"]));
+        assert!(fresh_args.windows(2).any(|p| p == ["-m", "gpt-5"]));
+        assert!(fresh_args.contains(&"model_reasoning_effort=high".to_owned()));
+
+        // Resume session: starts with "resume <id>"
+        let (_, resume_args) = build_interactive_command(
+            Provider::Codex,
+            &exe,
+            &cwd,
+            None,
+            None,
+            Some("thread-abc"),
+            PermissionMode::Full,
+        );
+        assert_eq!(&resume_args[0..2], &["resume", "thread-abc"]);
+        assert!(resume_args.contains(&"--dangerously-bypass-approvals-and-sandbox".to_owned()));
+        assert!(!resume_args.iter().any(|a| a == "-s"));
+    }
+
+    #[test]
+    fn build_interactive_command_configures_antigravity_workspace_and_conversation() {
+        let exe = PathBuf::from("C:\\tools\\agy.exe");
+        let cwd = PathBuf::from("C:\\projects\\demo");
+        let (prog, args) = build_interactive_command(
+            Provider::Antigravity,
+            &exe,
+            &cwd,
+            Some("gemini-3.8-pro"),
+            Some("low"),
+            Some("conv-xyz"),
+            PermissionMode::AcceptEdits,
+        );
+        assert_eq!(prog, exe);
+        assert!(args.windows(2).any(|p| p == ["--add-dir", "C:\\projects\\demo"]));
+        assert!(args.windows(2).any(|p| p == ["--mode", "accept-edits"]));
+        assert!(args.windows(2).any(|p| p == ["--model", "gemini-3.8-pro"]));
+        assert!(args.windows(2).any(|p| p == ["--effort", "low"]));
+        assert!(args.windows(2).any(|p| p == ["--conversation", "conv-xyz"]));
+        assert!(!args.iter().any(|a| a == "-p" || a == "--print" || a == "--output-format"));
     }
 }
 

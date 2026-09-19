@@ -24,8 +24,8 @@ type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Windows' pseudo-console asks for the cursor position at startup and prints
 /// nothing until it gets an answer.
 #[derive(Default)]
-struct Replies {
-    pending: Vec<u8>,
+pub struct Replies {
+    pub pending: Vec<u8>,
 }
 
 impl vt100::Callbacks for Replies {
@@ -173,20 +173,114 @@ pub struct Terminal {
     selection: Option<Selection>,
 }
 
+#[cfg(windows)]
+pub fn is_batch_script(program: &Path) -> bool {
+    let has_batch_ext = |p: &Path| {
+        p.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"))
+            .unwrap_or(false)
+    };
+    if has_batch_ext(program) {
+        return true;
+    }
+    if program.extension().is_none() {
+        let name = program.to_string_lossy();
+        if let Some(found) = agent::find_on_path(&[&format!("{name}.cmd"), &format!("{name}.bat")]) {
+            return has_batch_ext(&found);
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+pub fn is_batch_script(_program: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn comspec() -> PathBuf {
+    std::env::var_os("ComSpec")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .or_else(|| agent::find_on_path(&["cmd.exe"]))
+        .unwrap_or_else(|| PathBuf::from("cmd.exe"))
+}
+
+/// Wraps Windows `.cmd` or `.bat` batch scripts via `cmd.exe /c` to avoid ConPTY error 193.
+#[allow(dead_code)] // Helper for testing Windows batch wrapping and external command wrapping.
+pub fn wrap_batch_command(program: &Path, args: &[String]) -> (PathBuf, Vec<String>) {
+    #[cfg(windows)]
+    {
+        if is_batch_script(program) {
+            let mut cmd_args = vec!["/c".to_owned(), program.display().to_string()];
+            cmd_args.extend_from_slice(args);
+            return (PathBuf::from("cmd.exe"), cmd_args);
+        }
+    }
+    (program.to_path_buf(), args.to_vec())
+}
+
+/// Prepares a CommandBuilder for running an arbitrary program inside the terminal,
+/// configuring working directory, TrueColor environment variables, and Windows
+/// batch script wrapping to avoid ConPTY error 193.
+#[allow(dead_code)] // Used by start_command and tests; wired into session terminals in Milestone 2.
+pub fn build_command(cwd: &Path, program: &Path, args: &[String]) -> CommandBuilder {
+    #[cfg(windows)]
+    let mut cmd = if is_batch_script(program) {
+        let mut cmd = CommandBuilder::new(comspec());
+        cmd.arg("/c");
+        cmd.arg(program);
+        cmd
+    } else {
+        CommandBuilder::new(program)
+    };
+
+    #[cfg(not(windows))]
+    let mut cmd = CommandBuilder::new(program);
+
+    cmd.args(args);
+    cmd.cwd(cwd);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    cmd
+}
+
 impl Terminal {
+    /// Starts a shell in a pseudo-terminal.
     pub fn start(cwd: &Path, shell: &Path, ctx: egui::Context) -> Result<Self, String> {
+        let mut cmd = CommandBuilder::new(shell);
+        configure(&mut cmd, shell);
+        cmd.cwd(cwd);
+        Self::spawn(cmd, ctx, "Couldn't start the shell")
+    }
+
+    /// Starts an arbitrary command in a pseudo-terminal with TrueColor environment
+    /// and Windows batch file wrapping.
+    #[allow(dead_code)] // Used by tests; wired into session terminals in Milestone 2.
+    pub fn start_command(
+        cwd: &Path,
+        program: &Path,
+        args: &[String],
+        ctx: egui::Context,
+    ) -> Result<Self, String> {
+        if !cwd.is_dir() {
+            return Err(format!("Couldn't start the program: directory {} is not a directory", cwd.display()));
+        }
+        let cmd = build_command(cwd, program, args);
+        Self::spawn(cmd, ctx, "Couldn't start the program")
+    }
+
+    fn spawn(cmd: CommandBuilder, ctx: egui::Context, spawn_err_msg: &str) -> Result<Self, String> {
         let size = (24, 80);
         let pair = portable_pty::native_pty_system()
             .openpty(pty_size(size))
             .map_err(|err| format!("Couldn't open a terminal: {err}"))?;
 
-        let mut cmd = CommandBuilder::new(shell);
-        configure(&mut cmd, shell);
-        cmd.cwd(cwd);
         let child = pair
             .slave
             .spawn_command(cmd)
-            .map_err(|err| format!("Couldn't start the shell: {err}"))?;
+            .map_err(|err| format!("{spawn_err_msg}: {err}"))?;
         drop(pair.slave);
 
         let job = TerminalJob::new(child.process_id());
@@ -229,13 +323,20 @@ impl Terminal {
         Ok(Self { parser, writer, master: pair.master, child, job, size, exited, scroll_remainder: 0.0, selection: None })
     }
 
-    fn parser(&self) -> MutexGuard<'_, Parser> {
+    pub fn parser(&self) -> MutexGuard<'_, Parser> {
         self.parser.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn has_exited(&mut self) -> bool {
+    /// Whether the process running in the terminal has exited.
+    pub fn has_exited(&mut self) -> bool {
         // On Windows the output pipe can stay open after the shell exits, so also ask the process.
         self.exited.load(Ordering::Relaxed) || matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Sends bytes directly to the running process's input.
+    #[allow(dead_code)] // Will send interactive input to terminal sessions in Milestone 2.
+    pub fn write_all(&self, bytes: &[u8]) {
+        write_all(&self.writer, bytes);
     }
 
     /// Draws the terminal. `take_keyboard` gives it the keyboard without waiting
@@ -244,7 +345,7 @@ impl Terminal {
         let mut restart = false;
         if self.has_exited() {
             ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("The shell has exited.").weak());
+                ui.label(egui::RichText::new("The process has exited.").weak());
                 restart = ui.button("Restart").clicked();
             });
         }
@@ -863,5 +964,285 @@ mod tests {
         // A selection that ends on the last column doesn't run off the row.
         let to_the_edge = Selection { anchor: (0, 70), head: (0, 79) };
         assert_eq!(to_the_edge.columns_on(0, cols), Some((70, 80)));
+    }
+
+    #[test]
+    fn build_command_sets_environment_and_working_dir() {
+        let cwd = Path::new("/test/dir");
+        let program = Path::new("claude");
+        let args = vec!["--model".to_owned(), "sonnet".to_owned()];
+        let cmd = build_command(cwd, program, &args);
+        assert_eq!(cmd.get_cwd(), Some(&std::ffi::OsString::from("/test/dir")));
+        assert_eq!(cmd.get_env("TERM"), Some(std::ffi::OsStr::new("xterm-256color")));
+        assert_eq!(cmd.get_env("COLORTERM"), Some(std::ffi::OsStr::new("truecolor")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_command_wraps_batch_scripts_with_cmd_exe() {
+        let cwd = Path::new(r"C:\test\dir");
+        let program = Path::new(r"C:\Users\tester\AppData\Roaming\npm\claude.cmd");
+        let args = vec!["--model".to_owned(), "sonnet".to_owned()];
+        let cmd = build_command(cwd, program, &args);
+        let argv = cmd.get_argv();
+        assert!(argv[0].to_string_lossy().to_lowercase().ends_with("cmd.exe"), "{argv:?}");
+        assert_eq!(argv[1], "/c");
+        assert_eq!(argv[2], program.as_os_str());
+        assert_eq!(argv[3], "--model");
+        assert_eq!(argv[4], "sonnet");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_command_leaves_executables_unwrapped() {
+        let cwd = Path::new(r"C:\test\dir");
+        let program = Path::new(r"C:\Program Files\OpenAI\Codex\bin\codex.exe");
+        let args = vec!["-m".to_owned(), "o3".to_owned()];
+        let cmd = build_command(cwd, program, &args);
+        let argv = cmd.get_argv();
+        assert_eq!(argv[0], program.as_os_str());
+        assert_eq!(argv[1], "-m");
+        assert_eq!(argv[2], "o3");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detects_batch_script_extensions_case_insensitively() {
+        assert!(is_batch_script(Path::new("claude.cmd")));
+        assert!(is_batch_script(Path::new("claude.bat")));
+        assert!(is_batch_script(Path::new("CLAUDE.CMD")));
+        assert!(is_batch_script(Path::new("CLAUDE.BAT")));
+        assert!(!is_batch_script(Path::new("claude.exe")));
+        assert!(!is_batch_script(Path::new("claude.ps1")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cmd_batch_script_is_wrapped_with_cmd_exe() {
+        let batch_path = PathBuf::from(r"C:\Users\tester\AppData\Roaming\npm\claude.cmd");
+        let initial_args = vec!["--model".to_owned(), "sonnet".to_owned()];
+
+        let (program, args) = wrap_batch_command(&batch_path, &initial_args);
+
+        assert_eq!(program, PathBuf::from("cmd.exe"), "batch scripts must be launched via cmd.exe");
+        let [c_flag, target, rest @ ..] = &args[..] else {
+            panic!("batch command arguments must begin with /c followed by the script path: {args:?}");
+        };
+        assert_eq!(c_flag, "/c", "first argument should be /c");
+        assert_eq!(target, &batch_path.display().to_string(), "second argument should be original script path");
+        assert_eq!(rest, &["--model", "sonnet"], "original arguments should follow script path");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_bat_script_is_wrapped_case_insensitively() {
+        let batch_path = PathBuf::from(r"C:\Tools\AGENT.BAT");
+        let initial_args = vec!["--resume".to_owned(), "xyz".to_owned()];
+
+        let (program, args) = wrap_batch_command(&batch_path, &initial_args);
+
+        assert_eq!(program, PathBuf::from("cmd.exe"), ".BAT scripts must be launched via cmd.exe");
+        let [c_flag, target, rest @ ..] = &args[..] else {
+            panic!("arguments must start with /c followed by script path: {args:?}");
+        };
+        assert_eq!(c_flag, "/c");
+        assert_eq!(target, &batch_path.display().to_string());
+        assert_eq!(rest, &["--resume", "xyz"]);
+    }
+
+    #[test]
+    fn executable_binaries_are_not_wrapped_with_cmd_exe() {
+        let exe_path = if cfg!(windows) {
+            PathBuf::from(r"C:\Users\tester\AppData\Local\agy\bin\agy.exe")
+        } else {
+            PathBuf::from("/usr/local/bin/agy")
+        };
+        let initial_args = vec!["--add-dir".to_owned(), "src".to_owned()];
+
+        let (program, args) = wrap_batch_command(&exe_path, &initial_args);
+
+        assert_eq!(program, exe_path, "binary executables must not be replaced with cmd.exe");
+        assert_eq!(args, initial_args, "arguments must be preserved untouched without /c prefix");
+    }
+
+    #[test]
+    fn start_command_fails_gracefully_on_invalid_binary() {
+        let result = Terminal::start_command(
+            &std::env::temp_dir(),
+            Path::new("nonexistent_binary_12345.exe"),
+            &[],
+            egui::Context::default(),
+        );
+        let Err(err) = result else {
+            panic!("spawning nonexistent binary should fail");
+        };
+        assert!(err.contains("Couldn't start the program"), "{err}");
+    }
+
+    #[test]
+    fn terminal_start_command_runs_process_and_captures_output() {
+        let temp = std::env::temp_dir();
+        let (prog, args) = if cfg!(windows) {
+            (PathBuf::from("cmd.exe"), vec!["/c".to_owned(), "echo".to_owned(), "viper_pty_startup_ok".to_owned()])
+        } else {
+            (PathBuf::from("sh"), vec!["-c".to_owned(), "echo viper_pty_startup_ok".to_owned()])
+        };
+
+        let terminal = Terminal::start_command(&temp, &prog, &args, egui::Context::default())
+            .expect("start_command should successfully spawn a process in the PTY");
+
+        assert!(terminal.child.process_id().is_some(), "child process should have a valid PID");
+
+        let mut captured = false;
+        for _ in 0..40 {
+            let screen = terminal.parser().screen().contents();
+            if screen.contains("viper_pty_startup_ok") {
+                captured = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        assert!(captured, "PTY reader thread should deliver process output to parser screen");
+    }
+
+    #[test]
+    fn terminal_start_command_initializes_dimensions_and_cleans_up() {
+        let temp = std::env::temp_dir();
+        let (prog, args) = if cfg!(windows) {
+            (PathBuf::from("cmd.exe"), vec!["/c".to_owned(), "exit".to_owned(), "0".to_owned()])
+        } else {
+            (PathBuf::from("true"), Vec::new())
+        };
+
+        let terminal = Terminal::start_command(&temp, &prog, &args, egui::Context::default())
+            .expect("terminal should start");
+
+        assert_eq!(terminal.size, (24, 80), "terminal should initialize with standard 24x80 grid dimensions");
+
+        drop(terminal);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stress_terminal_receives_term_and_colorterm_in_child_process() {
+        let temp = std::env::temp_dir();
+        let prog = PathBuf::from("cmd.exe");
+        let args = vec![
+            "/c".to_owned(),
+            "echo TERM_VAL=[%TERM%] COLORTERM_VAL=[%COLORTERM%]".to_owned(),
+        ];
+        let terminal = Terminal::start_command(&temp, &prog, &args, egui::Context::default())
+            .expect("terminal should start");
+
+        let mut captured = false;
+        let mut text = String::new();
+        for _ in 0..50 {
+            text = terminal.parser().screen().contents();
+            if text.contains("TERM_VAL=[xterm-256color]") && text.contains("COLORTERM_VAL=[truecolor]") {
+                captured = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(captured, "child process must receive TERM and COLORTERM; got screen: {text}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stress_terminal_cleanly_kills_child_and_grandchild_process_tree() {
+        const MARKER: &str = "-n 4243";
+        let temp = std::env::temp_dir();
+        let prog = PathBuf::from("cmd.exe");
+        let args = vec!["/c".to_owned(), format!("ping {MARKER} 127.0.0.1")];
+
+        let terminal = Terminal::start_command(&temp, &prog, &args, egui::Context::default())
+            .expect("terminal should start");
+
+        let mut running = Vec::new();
+        for _ in 0..40 {
+            running = processes_with(MARKER);
+            if !running.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!running.is_empty(), "ping grandchild process should have started");
+
+        drop(terminal);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let left = processes_with(MARKER);
+        assert!(left.is_empty(), "subprocesses must be cleanly killed on terminal drop: {left:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn stress_terminal_cleanly_kills_batch_script_process_tree() {
+        const MARKER: &str = "-n 4244";
+        let temp = std::env::temp_dir();
+        let bat_path = temp.join(format!("viper_test_{}.bat", std::process::id()));
+        std::fs::write(&bat_path, format!("@echo off\r\nping {MARKER} 127.0.0.1\r\n")).unwrap();
+
+        let terminal = Terminal::start_command(&temp, &bat_path, &[], egui::Context::default())
+            .expect("terminal should start batch script");
+
+        let mut running = Vec::new();
+        for _ in 0..40 {
+            running = processes_with(MARKER);
+            if !running.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(!running.is_empty(), "batch script ping process should have started");
+
+        drop(terminal);
+        std::thread::sleep(std::time::Duration::from_secs(2));
+
+        let left = processes_with(MARKER);
+        let _ = std::fs::remove_file(&bat_path);
+        assert!(left.is_empty(), "batch script process tree must be cleanly killed on terminal drop: {left:?}");
+    }
+
+    #[test]
+    fn stress_terminal_failure_mode_invalid_directory() {
+        let bad_dir = Path::new(r"C:\nonexistent_dir_987654321_viper_test");
+        let prog = if cfg!(windows) { PathBuf::from("cmd.exe") } else { PathBuf::from("sh") };
+        let args = if cfg!(windows) { vec!["/c".to_owned(), "exit 0".to_owned()] } else { vec!["-c".to_owned(), "exit 0".to_owned()] };
+
+        let result = Terminal::start_command(bad_dir, &prog, &args, egui::Context::default());
+        assert!(result.is_err(), "spawning with nonexistent directory must fail gracefully");
+
+        let file_as_dir = Path::new("Cargo.toml");
+        let result2 = Terminal::start_command(file_as_dir, &prog, &args, egui::Context::default());
+        assert!(result2.is_err(), "spawning with a file as cwd must fail gracefully");
+    }
+
+    #[test]
+    fn stress_terminal_failure_mode_nonexistent_executable() {
+        let temp = std::env::temp_dir();
+        let fake_exe = Path::new(r"C:\totally_fake_path_nonexistent_exe_9999.exe");
+        let result = Terminal::start_command(&temp, fake_exe, &[], egui::Context::default());
+        let Err(err) = result else {
+            panic!("spawning nonexistent executable must fail");
+        };
+        assert!(err.contains("Couldn't start the program"), "{err}");
+    }
+
+    #[test]
+    fn stress_terminal_rapid_spawn_and_drop() {
+        let temp = std::env::temp_dir();
+        let (prog, args) = if cfg!(windows) {
+            (PathBuf::from("cmd.exe"), vec!["/c".to_owned(), "echo".to_owned(), "stress_loop".to_owned()])
+        } else {
+            (PathBuf::from("echo"), vec!["stress_loop".to_owned()])
+        };
+
+        for i in 0..20 {
+            let terminal = Terminal::start_command(&temp, &prog, &args, egui::Context::default())
+                .unwrap_or_else(|e| panic!("rapid spawn failed at iteration {i}: {e}"));
+            drop(terminal);
+        }
     }
 }

@@ -1,35 +1,40 @@
 # Sentinel Handoff Report
 
 ## Observation
-The user requested high-level functional code foundations in Viper for three key capabilities:
-1. **Interactive In-App Approvals Foundation (`R1`)**: Event definitions, data models (`ApprovalRequest`, `ApprovalDecision`), and interactive UI widgets in session/chat flow to approve or deny sensitive CLI tool executions mid-turn.
-2. **Git Worktree Session Isolation Foundation (`R2`)**: Dedicated git worktree management (`src/worktree.rs`), session directory resolution under `.viper/worktrees/<session-id>`, branch creation/cleanup, and Changes panel integration.
-3. **Webview Live Preview & Artifact Integration Foundation (`R3`)**: Automatic and one-click previewable web artifact detection (HTML, SVG, templates) via `src/preview.rs`, mount URL resolution, and embedded WebView live preview mounting in the tools panel.
+The user requested replacing the middle chat transcript and composer in Viper with a dedicated interactive terminal experience that launches the selected AI provider's CLI directly inside an embedded PTY:
+1. **Dedicated Provider Terminal View (`R1`)**: Replaced `chat.rs` transcript and composer in the middle panel with an embedded terminal widget (`terminal.rs`) that directly hosts the active AI session.
+2. **Direct Interactive Provider CLI Execution (`R2`)**: Implemented `Terminal::start_command` with Windows `.cmd`/`.bat` script wrapping via `cmd.exe /c` (resolving ConPTY error 193), TrueColor/xterm-256color environment injection, Win32 Job Object process tree termination, dynamic viewport resizing, and focus lock filter. Provider interactive command builders implemented for Claude, Codex, and Antigravity.
+3. **Per-Session Terminal State and Lifecycle Management (`R3`)**: Added ephemeral per-session terminal state in `ViperApp.provider_terminals: BTreeMap<u64, Result<Terminal, String>>`. Switching sessions in the sidebar switches view and keyboard focus immediately. Deleting a session cleanly drops the terminal and terminates the underlying process tree. `SavedState` in `app.rs` preserves 100% RON backward compatibility (zero PTY handles stored).
+4. **Sidebar and Auxiliary Tools Integration (`R4`)**: Preserved left sidebar (projects, sessions, settings) and right tools panel (secondary shells, git diffs, browser live preview) with disjoint egui widget IDs.
 
-Integrity requirements mandated 0 errors on `cargo check`, 0 failures on `cargo test`, 0 warnings on `cargo clippy --all-targets -- -D warnings`, no unauthorized new dependencies in `Cargo.toml`, no unrequested reformatting, and backward-compatible session serialization.
+Integrity requirements strictly preserved: 0 errors on `cargo check`, 0 failures on `cargo test`, 0 warnings on `cargo clippy --all-targets -- -D warnings`, no new dependencies in `Cargo.toml`, no unrequested reformatting, no auto-commits, and backward-compatible session serialization.
 
 ## Logic Chain
-1. **Request Intake & Routing**: Recorded the request verbatim in `.agents/ORIGINAL_REQUEST.md` under `## 2026-09-18T20:52:15Z`. Evaluated task routing rules: routed multi-part architectural feature implementation to `teamwork_preview_orchestrator`.
-2. **Monitoring**: Scheduled progress reporting (`*/8 * * * *`) and liveness monitoring (`*/10 * * * *`) background crons.
+1. **Request Intake & Routing**: Recorded user request verbatim in `.agents/ORIGINAL_REQUEST.md` under `## 2026-09-19T00:31:41Z`. Evaluated task routing rules: routed multi-part architectural feature implementation to `teamwork_preview_orchestrator`.
+2. **Monitoring**: Scheduled progress reporting (`task-22`, `*/8`) and liveness monitoring (`task-24`, `*/10`) background crons.
 3. **Execution & Gate Review**:
-   - Orchestrator performed initial survey across 3 parallel explorers.
-   - **Milestone 1 (Approvals)**: Implemented in `src/agent.rs`, `src/session.rs`, `src/chat.rs`, and `src/app.rs`. Passed gate verification (2 reviewers, 2 challengers, 1 forensic auditor, 182 unit tests).
-   - **Milestone 2 (Worktrees)**: Implemented in `src/worktree.rs`, `src/git_diff.rs`, `src/changes.rs`, `src/sidebar.rs`, and `src/session.rs`. Passed gate verification (199 unit tests).
-   - **Milestone 3 (Live Preview)**: Implemented in `src/preview.rs`, `src/browser.rs`, and `src/tools.rs`. Challenger M3-1 identified a path tokenization issue on multi-word descriptions; orchestrator rejected the gate and dispatched `worker_m3_remediation`. Remediation passed re-check gate on Iteration 2 (231 unit tests).
-   - **Milestone 4 (Acceptance Audit)**: Orchestrator ran final end-to-end integration audit cleanly.
-4. **Independent Victory Audit**: Spawned `teamwork_preview_victory_auditor` (`e41a97d8-7d6f-4da8-9906-64f0411235b0`) to independently verify codebase integrity, absence of stubs, dependency purity, and compilation/test results. Verdict: **VICTORY CONFIRMED**.
-5. **Cleanup**: Cancelled both crons and killed all subagents.
+   - Orchestrator performed initial survey across 3 parallel explorers (`survey_explorer_1`, `survey_explorer_2`, `survey_explorer_3`), producing `PROJECT.md`.
+   - **Milestone 1 (PTY Spawning & Command Builders)**: Implemented in `src/terminal.rs`, `src/claude.rs`, `src/codex.rs`, `src/antigravity.rs`, and `src/agent.rs`. Passed gate verification (2 reviewers, 2 challengers, 1 forensic auditor; 266 unit tests passing).
+   - **Milestone 2 (Middle Panel UI Terminal Area)**: Implemented in `src/app.rs` and `src/chat.rs`. Handled test contamination resolution cleanly. Passed gate verification (276 unit tests passing).
+   - **Milestone 3 (Per-Session Lifecycle, Switching & State)**: Implemented per-session PTY lifecycle, deletion cleanup, and saved state compatibility. Passed gate verification (284 unit tests passing).
+   - **Milestone 4 (Final Integration Verification & Integrity Audit)**: Orchestrator ran end-to-end integration audit with unanimous approvals.
+4. **Independent Post-Victory Audit**:
+   - Spawned independent `teamwork_preview_victory_auditor` (`a4747580-2c6d-423f-896a-ba4f4fde82b6`) with zero shared context from the implementation swarm.
+   - Auditor performed 3-phase audit: Timeline, Anti-cheating & Integrity Forensics, and Independent Test Execution.
+   - Verdict: **VICTORY CONFIRMED**.
+5. **Cleanup**: Cancelled both monitoring crons via `manage_task(action="kill")` and terminated all subagents via `manage_subagents(action="kill_all")`.
 
 ## Caveats
-- Per `AGENTS.md` Rule 3.2, 8 pre-existing machine-dependent/paid CLI tests remain ignored (`runs_the_real_antigravity_cli`, `runs_the_real_codex_cli`, etc.). Zero new ignored tests were introduced.
+- Per `AGENTS.md` Rule 3.2, 8 historical machine-dependent/paid CLI tests remain ignored (`runs_the_real_antigravity_cli`, `runs_the_real_codex_cli`, etc.). Zero new ignored tests were introduced.
 - Per `AGENTS.md` Rule 3.1, visual UI appearance must be inspected by the human user in the running GUI application; no full-screen capture or global input driver was executed.
 
 ## Conclusion
-High-level functional code foundations for mid-turn interactive approvals, git worktree session isolation, and embedded webview live preview are completely implemented, verified, and audited. The implementation preserves all repository invariants.
+The dedicated interactive provider terminal experience is fully implemented, verified, and audited in Viper, meeting all requirements R1–R4 and all acceptance criteria with 0 errors, 0 test failures, and 0 clippy warnings.
 
 ## Verification Method
-- `cargo check`: 0 errors
-- `cargo test`: 231 passed, 0 failed, 8 pre-existing ignored
-- `cargo clippy --all-targets -- -D warnings`: 0 warnings
-- `git diff Cargo.toml Cargo.lock`: empty (zero dependency modifications)
-- Backward compatibility: Verified RON deserialization across existing session save formats
+- `cargo check`: 0 errors (0.34s)
+- `cargo test`: 284 passed, 0 failed, 8 historical ignored (3.57s)
+- `cargo test -- --ignored closing_a_terminal --nocapture`: passed (grandchild process termination confirmed)
+- `cargo clippy --all-targets -- -D warnings`: 0 warnings (0.33s)
+- `git diff Cargo.toml Cargo.lock`: empty (zero dependency additions)
+- SavedState RON compatibility: verified across legacy session formats

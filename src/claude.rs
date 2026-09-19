@@ -1,7 +1,7 @@
 //! Runs the Claude Code CLI in headless mode and turns its streaming JSON
 //! output into events the UI can show.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -54,6 +54,47 @@ pub fn args(turn: &Turn) -> Vec<String> {
     }
     if let Some(session_id) = &turn.resume_session {
         args.extend(["--resume".to_owned(), session_id.clone()]);
+    }
+    args
+}
+
+/// Arguments for starting Claude Code interactively inside an embedded terminal.
+///
+/// Unlike headless turns, interactive mode omits `-p`, `--output-format`, and
+/// permission suppression flags so Claude Code renders its full terminal interface
+/// and interactive prompts.
+#[allow(dead_code)] // Wired into central terminal in Milestone 2.
+pub fn interactive_args(
+    _cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_id: Option<&str>,
+    permission_mode: PermissionMode,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    match permission_mode {
+        PermissionMode::ReadOnly => {
+            args.extend(["--permission-mode".to_owned(), "default".to_owned()]);
+            args.extend(["--disallowed-tools".to_owned(), "Bash".to_owned()]);
+        }
+        PermissionMode::AcceptEdits => {
+            args.extend(["--permission-mode".to_owned(), "acceptEdits".to_owned()]);
+        }
+        PermissionMode::Full => {
+            args.push("--dangerously-skip-permissions".to_owned());
+        }
+        PermissionMode::Plan => {
+            args.extend(["--permission-mode".to_owned(), "plan".to_owned()]);
+        }
+    }
+    if let Some(model) = model {
+        args.extend(["--model".to_owned(), model.to_owned()]);
+    }
+    if let Some(effort) = effort {
+        args.extend(["--effort".to_owned(), effort.to_owned()]);
+    }
+    if let Some(session_id) = resume_id {
+        args.extend(["--resume".to_owned(), session_id.to_owned()]);
     }
     args
 }

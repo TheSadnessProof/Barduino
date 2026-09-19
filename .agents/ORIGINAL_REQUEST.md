@@ -59,3 +59,53 @@ Provide high-level integration between agent-generated web artifacts (HTML, SVG,
 - [ ] `cargo test` passes all unit tests with 0 failures and nothing newly ignored.
 - [ ] `cargo clippy --all-targets -- -D warnings` passes with 0 warnings.
 - [ ] Repository invariants are preserved: zero unauthorized new dependencies in `Cargo.toml`, no unrequested reformatting, and backward-compatible session serialization.
+
+## 2026-09-19T00:31:41Z
+
+Replace the middle chat transcript and composer in Viper with a dedicated interactive terminal experience that launches the selected AI provider's CLI directly inside an embedded PTY.
+
+Working directory: c:\Users\ditob\Documents\viper
+Integrity mode: development
+
+## Requirements
+
+### R1. Dedicated Provider Terminal View
+Replace the middle panel's custom chat transcript and message composer (`chat.rs`) with an embedded terminal widget (`terminal.rs`) that directly hosts the active AI session. The middle area must serve as a full, interactive terminal interface for the AI CLI rather than a custom markdown/chat GUI.
+
+### R2. Direct Interactive Provider CLI Execution
+When a session is created or opened, the embedded terminal in the middle panel must spawn the selected provider's CLI executable (`claude`, `codex`, or `agy` / `antigravity`) directly in interactive mode inside a pseudo-terminal (PTY) using `portable-pty` and `vt100`:
+- The process must run in the session's active working directory (`session.working_dir()`).
+- All native interactive TUI features of the CLIs (ANSI escapes, full-screen redrawing, cursor positioning, interactive permission and approval prompts, arrow keys, and keybindings) must work seamlessly without interference from chat stream parsers.
+- Terminal resize events (window dimensions changing) must propagate to the underlying PTY so lines wrap and layout dynamically.
+
+### R3. Per-Session Terminal State and Lifecycle Management
+- Each session in the left sidebar must own its dedicated terminal process and vt100 parser state.
+- Switching between sessions in the sidebar must switch the middle view to that session's active terminal buffer and hand over keyboard focus immediately.
+- Deleting or closing a session must terminate the associated CLI process group cleanly without leaving orphan processes or hanging handles.
+- Saved state must gracefully handle sessions across restarts, restarting the provider CLI in the session directory when reopened.
+
+### R4. Sidebar and Auxiliary Tools Integration
+- Preserve the left sidebar (project folders, session creation, renaming, deleting).
+- Preserve the right-side tools panel (secondary shell terminals, git branch/working tree changes diffing, embedded browser live preview, and panel toggle controls).
+- Provider selection (Claude Code, Codex, Antigravity) must determine which CLI executable is launched in the session's middle terminal.
+
+## Acceptance Criteria
+
+### Terminal Integration & UI
+- [ ] The middle panel renders the embedded terminal running the AI provider's CLI instead of the chat bubble/composer UI.
+- [ ] Typing into the middle panel sends keystrokes (including Enter, Backspace, Ctrl combinations, and arrow keys) directly to the running CLI.
+- [ ] ANSI escape codes, colored text, bold/dim text, and cursor positioning render accurately via the embedded terminal emulator.
+- [ ] Resizing the main application window or collapsing/expanding the sidebars dynamically resizes the PTY dimensions (columns and rows) of the active CLI session.
+
+### Multi-Session Management
+- [ ] Creating a new session spawns a fresh interactive CLI instance for the chosen provider in that session's working directory.
+- [ ] Switching sessions in the sidebar switches the middle view to the corresponding session's terminal display and routes keyboard input to it.
+- [ ] Deleting a session stops its underlying CLI process and frees system resources.
+
+### Stability & Codebase Invariants
+- [ ] `cargo check` passes cleanly without compilation errors.
+- [ ] `cargo test` passes for the entire test suite with new tests covering session terminal lifecycle.
+- [ ] `cargo clippy --all-targets` passes with 0 warnings.
+- [ ] No forbidden dependencies added (conforms to `AGENTS.md` Rule 3.4).
+- [ ] Backward compatibility of saved state is preserved (conforms to `AGENTS.md` Rule 3.5).
+

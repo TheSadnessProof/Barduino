@@ -2,7 +2,7 @@
 //! event stream into events the UI can show. Codex signs in through the ChatGPT
 //! account the `codex` command already uses, so there is nothing extra to set up.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -68,6 +68,44 @@ pub fn args(turn: &Turn) -> Vec<String> {
     // "-" makes Codex read the prompt from stdin, which start_turn writes and then closes.
     // Prompts can carry a whole page of HTML, far more than a command line holds on Windows.
     args.push("-".to_owned());
+    args
+}
+
+/// Arguments for starting Codex CLI interactively inside an embedded terminal.
+///
+/// Unlike headless `codex exec`, interactive mode launches the interactive CLI
+/// (or `codex resume <id>`) with the project root set via `-C` and sandbox policy
+/// configured directly via `-s`.
+#[allow(dead_code)] // Wired into central terminal in Milestone 2.
+pub fn interactive_args(
+    cwd: &Path,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_id: Option<&str>,
+    permission_mode: PermissionMode,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session_id) = resume_id {
+        args.extend(["resume".to_owned(), session_id.to_owned()]);
+    }
+    args.extend(["-C".to_owned(), cwd.display().to_string()]);
+    match permission_mode {
+        PermissionMode::ReadOnly | PermissionMode::Plan => {
+            args.extend(["-s".to_owned(), "read-only".to_owned()]);
+        }
+        PermissionMode::AcceptEdits => {
+            args.extend(["-s".to_owned(), "workspace-write".to_owned()]);
+        }
+        PermissionMode::Full => {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_owned());
+        }
+    }
+    if let Some(model) = model {
+        args.extend(["-m".to_owned(), model.to_owned()]);
+    }
+    if let Some(effort) = effort {
+        args.extend(["-c".to_owned(), format!("model_reasoning_effort={effort}")]);
+    }
     args
 }
 
