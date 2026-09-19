@@ -327,7 +327,7 @@ impl ProcessTree {
 
         let job = unsafe { CreateJobObjectW(None, windows::core::PCWSTR::null()) }.ok();
         let job = job.filter(|job| {
-            // Configure the job so that if Barduino terminates or crashes,
+            // Configure the job so that if Viper terminates or crashes,
             // the Windows kernel automatically terminates all child processes in the job.
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -750,7 +750,7 @@ mod tests {
     #[test]
     #[ignore]
     fn runs_the_real_antigravity_cli() {
-        let dir = std::env::temp_dir().join("barduino-agy-test");
+        let dir = std::env::temp_dir().join("viper-agy-test");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.txt"), "the secret word is pineapple\n").unwrap();
 
@@ -841,7 +841,7 @@ mod tests {
             };
             let (tx, rx) = std::sync::mpsc::channel();
             let turn = Turn {
-                prompt: "Run the shell command `echo barduino-full-access` and reply with its output only.".into(),
+                prompt: "Run the shell command `echo viper-full-access` and reply with its output only.".into(),
                 cwd: std::env::temp_dir(),
                 resume_session: None,
                 permission_mode: PermissionMode::Full,

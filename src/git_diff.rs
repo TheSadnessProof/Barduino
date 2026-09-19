@@ -437,7 +437,7 @@ Binary files /dev/null and b/logo.png differ
             eprintln!("git isn't installed; skipping");
             return;
         };
-        let dir = std::env::temp_dir().join(format!("barduino-git-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("viper-git-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("src")).unwrap();
         let git_in = |args: &[&str]| run_git(&git, &dir, args).unwrap();
@@ -464,7 +464,7 @@ Binary files /dev/null and b/logo.png differ
         assert_eq!(compared.len(), 1);
         assert!(compared[0].added() == 3 && compared[0].removed() == 1, "{compared:?}");
 
-        let outside = std::env::temp_dir().join(format!("barduino-no-repo-{}", std::process::id()));
+        let outside = std::env::temp_dir().join(format!("viper-no-repo-{}", std::process::id()));
         std::fs::create_dir_all(&outside).unwrap();
         // The temp folder itself could be inside a repo on some machines, so only check it doesn't panic.
         let _ = working_tree_changes(&outside);

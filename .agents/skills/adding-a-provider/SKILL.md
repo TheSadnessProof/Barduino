@@ -1,6 +1,6 @@
 ---
 name: adding-a-provider
-description: Add support for a new agent CLI (a new Provider) to Barduino. Use when adding, wiring up or removing a provider such as Claude Code, Codex or Antigravity, or when touching Provider::ALL. Covers the 68 dispatch sites across 9 files and the traps the compiler does not catch.
+description: Add support for a new agent CLI (a new Provider) to Viper. Use when adding, wiring up or removing a provider such as Claude Code, Codex or Antigravity, or when touching Provider::ALL. Covers the 68 dispatch sites across 9 files and the traps the compiler does not catch.
 ---
 
 # Playbook: adding a new agent CLI
@@ -30,7 +30,7 @@ You need to know, concretely:
   in `agent.rs::start_turn` about quoting and length limits.
 - How a **session is resumed** (the flag, and where the id appears in the output).
 - How **permissions** are expressed, and what happens when the CLI wants to ask
-  the user something it cannot ask in headless mode. Barduino's contract is that
+  the user something it cannot ask in headless mode. Viper's contract is that
   anything needing approval is *denied* rather than left hanging.
 - Whether it reports **token usage** and **plan/rate limits**, and where.
 - How it reports **models** and **effort levels**, if at all.

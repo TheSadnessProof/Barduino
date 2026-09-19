@@ -1,4 +1,4 @@
-# Barduino — working agreement for coding agents
+# Viper — working agreement for coding agents
 
 This file is the canonical instruction set for **every** agent working in this
 repository: Claude Code, Codex, Antigravity, Gemini CLI, Cursor, or whatever
@@ -11,7 +11,7 @@ is checkable — no "write clean code" filler.
 
 ## 1. What this is
 
-Barduino is a **desktop GUI for agentic coding**. It wraps the Claude Code,
+Viper is a **desktop GUI for agentic coding**. It wraps the Claude Code,
 Codex and Antigravity CLIs behind one interface, so you can drive any of them
 from the same window: sessions, chat, diffs, a terminal, an embedded browser,
 plan/usage tracking.
@@ -141,7 +141,7 @@ to inspect.
 
 ```
 main.rs        window setup, global text sizes
-app.rs         BarduinoApp — owns all state, routes panel actions
+app.rs         ViperApp — owns all state, routes panel actions
 agent.rs       the shared surface: Provider, AgentEvent, PermissionMode,
                Turn, and spawning one turn as a child process
 claude.rs  ┐

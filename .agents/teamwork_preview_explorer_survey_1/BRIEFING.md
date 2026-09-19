@@ -1,7 +1,7 @@
 # BRIEFING — 2026-09-19T00:56:15Z
 
 ## Mission
-Investigate Requirement R1 (Interactive In-App Approvals Foundation) for Barduino/Viper and produce an architecture and implementation plan in handoff.md.
+Investigate Requirement R1 (Interactive In-App Approvals Foundation) for Viper and produce an architecture and implementation plan in handoff.md.
 
 ## 🔒 My Identity
 - Archetype: explorer

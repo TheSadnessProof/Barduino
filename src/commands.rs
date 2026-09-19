@@ -488,7 +488,7 @@ pub enum SlashAction {
 const PERMISSION_ALIASES: &[(&str, PermissionMode)] =
     &[("acceptedits", PermissionMode::AcceptEdits), ("bypasspermissions", PermissionMode::Full)];
 
-/// Reads a typed message as a command Barduino should carry out rather than send.
+/// Reads a typed message as a command Viper should carry out rather than send.
 ///
 /// Returns `None` when it isn't one of ours and should go to the CLI as written,
 /// and `Err` with a sentence for the user when it is ours but the argument isn't.
@@ -621,7 +621,7 @@ mod tests {
 
     #[test]
     fn skills_are_discovered_from_directory() {
-        let temp = std::env::temp_dir().join("barduino_test_skills");
+        let temp = std::env::temp_dir().join("viper_test_skills");
         let skill_dir = temp.join(".agents").join("skills").join("my-skill");
         let _ = std::fs::create_dir_all(&skill_dir);
         let skill_content = "---\nname: my-skill\ndescription: A helpful skill for automated workflows\n---\n# My Skill\n";
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn claude_custom_commands_are_discovered() {
-        let temp = std::env::temp_dir().join("barduino_test_claude_cmds");
+        let temp = std::env::temp_dir().join("viper_test_claude_cmds");
         let cmd_dir = temp.join(".claude").join("commands");
         let _ = std::fs::create_dir_all(&cmd_dir);
         let cmd_content = "# Run all unit tests and lint checks\ncargo test\n";
@@ -795,7 +795,7 @@ mod tests {
     }
 
     #[test]
-    fn live_barduino_skills_discovered() {
+    fn live_viper_skills_discovered() {
         let project_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let commands = discover(Provider::Antigravity, project_dir);
         let names: HashSet<&str> = commands.iter().map(|c| c.name.as_str()).collect();

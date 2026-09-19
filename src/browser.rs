@@ -759,7 +759,7 @@ mod native {
     impl NativeBrowser {
         pub fn create(ctx: &egui::Context, frame: &eframe::Frame, url: &str) -> Result<Self, String> {
             let window = frame.winit_window().ok_or("The app window isn't ready for a browser yet.")?;
-            let data_dir = eframe::storage_dir("Barduino").map(|dir| dir.join("webview"));
+            let data_dir = eframe::storage_dir("Viper").map(|dir| dir.join("webview"));
             let mut context = WebContext::new(data_dir);
             let messages = Rc::new(RefCell::new(Vec::new()));
 
@@ -853,7 +853,7 @@ mod native {
                         let _ = self.webview.focus();
                     }
                     self.webview.evaluate_script(&format!(
-                        "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).pick({on})"
+                        "window.__viper && window.__viper.pick({on})"
                     ))
                 }
                 Command::Comment(on, from) => {
@@ -861,15 +861,15 @@ mod native {
                         let _ = self.webview.focus();
                     }
                     self.webview.evaluate_script(&format!(
-                        "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).comment({on}, {from})"
+                        "window.__viper && window.__viper.comment({on}, {from})"
                     ))
                 }
                 Command::RemovePin(number) => self.webview.evaluate_script(&format!(
-                    "(window.__viper || window.__barduino) && (window.__viper || window.__barduino).removePin({number})"
+                    "window.__viper && window.__viper.removePin({number})"
                 )),
                 Command::ClearPins => self
                     .webview
-                    .evaluate_script("(window.__viper || window.__barduino) && (window.__viper || window.__barduino).clearPins()"),
+                    .evaluate_script("window.__viper && window.__viper.clearPins()"),
             };
         }
     }

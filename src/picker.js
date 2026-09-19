@@ -6,7 +6,7 @@
 // where the user clicked, pins a numbered marker on the element, and sends the
 // note back to the session.
 (() => {
-  if (window.__viper || window.__barduino) return;
+  if (window.__viper) return;
 
   let mode = null; // null, "pick" or "comment"
   let box = null;
@@ -363,5 +363,4 @@
     clearPins,
     removePin,
   };
-  window.__barduino = window.__viper;
 })();

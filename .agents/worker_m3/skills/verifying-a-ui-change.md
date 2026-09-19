@@ -1,11 +1,11 @@
 ---
 name: verifying-a-ui-change
-description: Verify a change to Barduino's egui interface without being able to see it. Use for any change a user would see on screen, and before claiming a UI change works. Covers moving logic out of rendering so it can be tested, the invisible egui bugs to read for, and how to report honestly.
+description: Verify a change to Viper's egui interface without being able to see it. Use for any change a user would see on screen, and before claiming a UI change works. Covers moving logic out of rendering so it can be tested, the invisible egui bugs to read for, and how to report honestly.
 ---
 
 # Playbook: verifying a change you cannot see
 
-Barduino is a desktop GUI. There is no screenshot path in this codebase, and
+Viper is a desktop GUI. There is no screenshot path in this codebase, and
 **a human is using this computer while you work.** Taking over their mouse,
 keyboard or screen is not a testing strategy; it is an interruption, and it can
 click something real.

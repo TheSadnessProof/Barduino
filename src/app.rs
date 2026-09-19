@@ -77,14 +77,14 @@ fn write_backup_to_dir(dir: &std::path::Path, state: &SavedState) -> bool {
 /// Atomically writes a backup of the saved state to disk, so unexpected crashes
 /// or corrupted writes never destroy the user's session history.
 fn atomic_backup_state(state: &SavedState) {
-    let Some(dir) = eframe::storage_dir("Viper").or_else(|| eframe::storage_dir("Barduino")) else { return };
+    let Some(dir) = eframe::storage_dir("Viper") else { return };
     write_backup_to_dir(&dir, state);
 }
 
 /// Copies a save that couldn't be read somewhere safe, before eframe writes over
 /// it. Returns what to tell the user, when there is anything to tell.
 fn keep_unreadable_save(raw: String) -> Option<String> {
-    let backup = eframe::storage_dir("Viper").or_else(|| eframe::storage_dir("Barduino"))?.join("app.ron.corrupt");
+    let backup = eframe::storage_dir("Viper")?.join("app.ron.corrupt");
     std::fs::write(&backup, raw).ok()?;
     Some(format!(
         "Your saved sessions couldn't be read, so Viper has started empty. The old file was kept at {} — \
@@ -165,24 +165,22 @@ impl ViperApp {
         // aside first, and the user is told where it went.
         let mut notice = None;
         let mut state = stored.unwrap_or_else(|| {
-            for app_name in ["Viper", "Barduino"] {
-                if let Some(storage_dir) = eframe::storage_dir(app_name) {
-                    let backup = storage_dir.join("app.ron.bak");
-                    if let Ok(raw) = std::fs::read_to_string(&backup)
-                        && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
-                    {
-                        if let Some(unreadable) = cc.storage.and_then(|storage| storage.get_string(eframe::APP_KEY)) {
-                            let _ = keep_unreadable_save(unreadable);
-                        }
-                        notice = Some("Recovered your saved sessions from the backup copy.".into());
-                        return recovered;
+            if let Some(storage_dir) = eframe::storage_dir("Viper") {
+                let backup = storage_dir.join("app.ron.bak");
+                if let Ok(raw) = std::fs::read_to_string(&backup)
+                    && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
+                {
+                    if let Some(unreadable) = cc.storage.and_then(|storage| storage.get_string(eframe::APP_KEY)) {
+                        let _ = keep_unreadable_save(unreadable);
                     }
-                    let primary = storage_dir.join("app.ron");
-                    if let Ok(raw) = std::fs::read_to_string(&primary)
-                        && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
-                    {
-                        return recovered;
-                    }
+                    notice = Some("Recovered your saved sessions from the backup copy.".into());
+                    return recovered;
+                }
+                let primary = storage_dir.join("app.ron");
+                if let Ok(raw) = std::fs::read_to_string(&primary)
+                    && let Ok(recovered) = ron::from_str::<SavedState>(&raw)
+                {
+                    return recovered;
                 }
             }
             notice = cc
@@ -394,7 +392,7 @@ impl ViperApp {
         // that failure — so every save from then on would quietly do nothing.
         if dir.to_str().is_none() {
             self.notice = Some(format!(
-                "Barduino can't work in {} — the folder name has characters it can't save.",
+                "Viper can't work in {} — the folder name has characters it can't save.",
                 dir.display()
             ));
             return;
@@ -403,7 +401,7 @@ impl ViperApp {
             let id = session.id;
             session.project_dir = dir;
             // The panel's terminals were started in the old folder — before one was
-            // chosen, that is Barduino's own — and its Changes tab watches it. Left
+            // chosen, that is Viper's own — and its Changes tab watches it. Left
             // alone they would quietly be about the wrong project, so they go.
             self.tools.remove(&id);
         } else {
@@ -606,7 +604,7 @@ impl ViperApp {
         }
     }
 
-    /// Carries out a slash command that belongs to Barduino rather than to the CLI.
+    /// Carries out a slash command that belongs to Viper rather than to the CLI.
     /// The CLIs do these from their own interactive session; a headless run has no
     /// such session, so `/model opus` would otherwise just be words in a prompt.
     fn apply_setting(&mut self, setting: SlashAction) {

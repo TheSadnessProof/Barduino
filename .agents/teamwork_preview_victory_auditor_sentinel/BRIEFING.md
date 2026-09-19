@@ -1,7 +1,7 @@
 # BRIEFING — 2026-09-18T20:41:00Z
 
 ## Mission
-Conduct independent victory audit for Barduino fixes across R1 (Antigravity bare --print Go flag parser issue), R2 (Codex planning mode guidance and denial telemetry alignment), and R3 (Claude read-only mode command tool restriction without failing turns).
+Conduct independent victory audit for Viper fixes across R1 (Antigravity bare --print Go flag parser issue), R2 (Codex planning mode guidance and denial telemetry alignment), and R3 (Claude read-only mode command tool restriction without failing turns).
 
 ## 🔒 My Identity
 - Archetype: victory_auditor
@@ -23,7 +23,7 @@ Conduct independent victory audit for Barduino fixes across R1 (Antigravity bare
 
 ## Audit Scope
 - **Work product**: Full git working tree and commits on C:\Users\ditob\Documents\viper
-- **Profile loaded**: General Project (with Barduino AGENTS.md rules)
+- **Profile loaded**: General Project (with Viper AGENTS.md rules)
 - **Audit type**: victory audit
 
 ## Audit Progress

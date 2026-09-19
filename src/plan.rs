@@ -468,7 +468,7 @@ mod tests {
 
     #[test]
     fn takes_the_last_limits_in_a_session_file() {
-        let dir = std::env::temp_dir().join("barduino-plan-test");
+        let dir = std::env::temp_dir().join("viper-plan-test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("2026").join("09").join("17")).unwrap();
         let path = dir.join("2026").join("09").join("17").join("rollout-test.jsonl");

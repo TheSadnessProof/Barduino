@@ -1971,21 +1971,21 @@ mod tests {
 
     #[test]
     fn only_the_details_that_hold_a_path_get_shortened() {
-        let project = Path::new(r"C:\work\barduino");
+        let project = Path::new(r"C:\work\viper");
         let shorten = |kind, detail| readable_detail(kind, detail, project);
 
-        assert_eq!(shorten(Some(ToolKind::Read), r"C:\work\barduino\src\app.rs"), "src/app.rs");
+        assert_eq!(shorten(Some(ToolKind::Read), r"C:\work\viper\src\app.rs"), "src/app.rs");
         // A read of part of a file carries the range alongside the path.
         assert_eq!(
-            shorten(Some(ToolKind::Read), r"C:\work\barduino\src\app.rs · lines 40–90"),
+            shorten(Some(ToolKind::Read), r"C:\work\viper\src\app.rs · lines 40–90"),
             "src/app.rs · lines 40–90"
         );
         // A search carries the pattern first and the folder second.
-        assert_eq!(shorten(Some(ToolKind::Search), r"note.txt · C:\work\barduino\src"), "note.txt · src");
+        assert_eq!(shorten(Some(ToolKind::Search), r"note.txt · C:\work\viper\src"), "note.txt · src");
 
         // A command is never touched: backslashes in it are the command's own, and
         // rewriting them would change what the row says was run.
-        let command = r"cargo run -- --path C:\work\barduino\src";
+        let command = r"cargo run -- --path C:\work\viper\src";
         assert_eq!(shorten(Some(ToolKind::Run), command), command);
         // Nor is a tool we don't recognise, whose detail could be anything.
         assert_eq!(shorten(None, command), command);

@@ -196,11 +196,11 @@ mod tests {
 
     #[test]
     fn a_path_is_shown_relative_to_the_project() {
-        let project = Path::new(r"C:\Users\ditob\Documents\Barduino");
-        assert_eq!(short_path(r"C:\Users\ditob\Documents\Barduino\src\app.rs", project, 40), "src/app.rs");
+        let project = Path::new(r"C:\Users\ditob\Documents\Viper");
+        assert_eq!(short_path(r"C:\Users\ditob\Documents\Viper\src\app.rs", project, 40), "src/app.rs");
         // The casing a CLI reports isn't always the casing the folder was opened
         // with, and on Windows both name the same file.
-        assert_eq!(short_path(r"c:\users\ditob\documents\barduino\src\app.rs", project, 40), "src/app.rs");
+        assert_eq!(short_path(r"c:\users\ditob\documents\viper\src\app.rs", project, 40), "src/app.rs");
         // Outside the project it is left exactly as it came: that it is somewhere
         // else is the point, and it is not ours to tidy.
         let elsewhere = short_path(r"C:\Windows\System32\drivers\etc\hosts", project, 60);
@@ -211,7 +211,7 @@ mod tests {
         // A session with no folder yet can't have anything under it.
         assert_eq!(short_path(r"C:\x\y.rs", Path::new(""), 40), r"C:\x\y.rs");
         // Too long to fit is cut at the front, because the end names the file.
-        let cut = short_path(r"C:\Users\ditob\Documents\Barduino\src\very\deep\nested\module.rs", project, 20);
+        let cut = short_path(r"C:\Users\ditob\Documents\Viper\src\very\deep\nested\module.rs", project, 20);
         assert!(cut.ends_with("module.rs"), "{cut}");
         assert!(cut.starts_with('…'), "{cut}");
         assert!(cut.chars().count() <= 21, "{cut} is {} chars", cut.chars().count());

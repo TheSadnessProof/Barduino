@@ -388,8 +388,8 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
             if name == "Shell" && detail.contains("Get-Content"))));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, is_error: false }
-            if text.contains("hello from barduino"))));
-        assert!(events.contains(&AgentEvent::Text("hello from barduino".into())));
+            if text.contains("hello from viper"))));
+        assert!(events.contains(&AgentEvent::Text("hello from viper".into())));
         assert_eq!(
             events.last(),
             Some(&AgentEvent::Finished {
@@ -407,7 +407,7 @@ mod tests {
     fn parses_recorded_file_change() {
         let events = events(include_str!("../testdata/codex_edit_file.jsonl"));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolUse { name, detail, .. }
-            if name == "Edit" && detail == "update C:\\Users\\ditob\\Documents\\barduino-codex-probe\\notes.txt")));
+            if name == "Edit" && detail == "update C:\\Users\\ditob\\Documents\\viper-codex-probe\\notes.txt")));
         assert!(events.iter().any(|e| matches!(e, AgentEvent::ToolResult { text, is_error: false }
             if text.ends_with("notes.txt"))));
 
@@ -692,7 +692,7 @@ mod tests {
     #[test]
     #[ignore]
     fn runs_the_real_codex_cli() {
-        let dir = std::env::temp_dir().join("barduino-codex-test");
+        let dir = std::env::temp_dir().join("viper-codex-test");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("note.txt"), "the secret word is pineapple\n").unwrap();
 
